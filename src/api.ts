@@ -12,6 +12,7 @@ export interface Provider {
   enabled: boolean;
   timeout_ms: number;
   has_api_key: boolean;
+  api_key_error: string | null;
 }
 
 export interface HealthProbeSample {
@@ -42,6 +43,7 @@ export interface RouterSettings {
   local_token: string;
   probe_interval_sec: number;
   log_retention_days: number;
+  usage_retention_days: number;
   gateway_running: boolean;
   gateway_listening: boolean;
   gateway_error: string | null;
@@ -102,8 +104,10 @@ export interface ConfigurationSnapshot {
 }
 
 export interface ConfigurationInput {
+  port: number;
   probe_interval_sec: number;
   log_retention_days: number;
+  usage_retention_days: number;
   routing_policy: RoutingPolicy;
   autostart_enabled: boolean;
 }
@@ -148,12 +152,134 @@ export interface BackupPreview {
 export interface BackupExportResult {
   file_name: string;
   provider_count: number;
+  warning_messages: string[];
 }
 
 export interface BackupImportResult {
   created_count: number;
   updated_count: number;
   removed_count: number;
+  warning_messages: string[];
+}
+
+export type UsageQueryMode = "today" | "range" | "month";
+
+export interface UsageQuery {
+  mode: UsageQueryMode;
+  start_date?: string;
+  end_date?: string;
+  month?: string;
+}
+
+export interface TokenMetric {
+  value: number;
+  reported_count: number;
+}
+
+export interface UsageMetrics {
+  input_tokens: TokenMetric;
+  output_tokens: TokenMetric;
+  cached_tokens: TokenMetric;
+  reasoning_tokens: TokenMetric;
+  total_tokens: TokenMetric;
+}
+
+export interface UsagePeriod {
+  mode: UsageQueryMode;
+  start_date: string;
+  end_date: string;
+  label: string;
+  resolution: "hour" | "day";
+}
+
+export interface ProviderUsageStatistics {
+  provider_id: string;
+  provider_name: string;
+  deleted: boolean;
+  completed_requests: number;
+  reported_requests: number;
+  coverage_percent: number;
+  metrics: UsageMetrics;
+}
+
+export interface UsageSeriesPoint {
+  key: string;
+  label: string;
+  completed_requests: number;
+  reported_requests: number;
+  metrics: UsageMetrics;
+}
+
+export interface UsageStatistics {
+  period: UsagePeriod;
+  totals: UsageMetrics;
+  providers: ProviderUsageStatistics[];
+  series: UsageSeriesPoint[];
+  completed_requests: number;
+  reported_requests: number;
+  coverage_percent: number;
+}
+
+export type CodexConnectionMode = "official" | "gateway" | "external";
+export type CodexLoginStatus =
+  | "logged_in"
+  | "logged_out"
+  | "cli_unavailable"
+  | "unknown";
+
+export interface CodexIntegrationState {
+  detected_mode: CodexConnectionMode;
+  config_path: string;
+  config_exists: boolean;
+  login_status: CodexLoginStatus;
+  gateway_configuration_current: boolean;
+  shared_provider_current: boolean;
+  official_features_available: boolean;
+  history_unified: boolean;
+  history_provider_counts: HistoryProviderCount[];
+  history_migration_required: boolean;
+  external_provider_id: string | null;
+  config_error: string | null;
+  last_switched_at: string | null;
+  last_history_migration_at: string | null;
+}
+
+export interface HistoryProviderCount {
+  provider: string;
+  count: number;
+}
+
+export interface CodexHistoryMigrationPreview {
+  preview_id: string;
+  fingerprint: string;
+  normal_session_count: number;
+  archived_session_count: number;
+  migration_required_count: number;
+  provider_counts: HistoryProviderCount[];
+  indexed_record_count: number;
+  encrypted_content_session_count: number;
+  warning_messages: string[];
+  can_restore_latest: boolean;
+}
+
+export interface CodexHistoryMigrationResult {
+  migrated_session_count: number;
+  updated_index_count: number;
+  backup_name: string;
+  warning_messages: string[];
+}
+
+export interface CodexHistoryRestoreResult {
+  restored_session_count: number;
+  restored_index_count: number;
+  warning_messages: string[];
+}
+
+export interface SwitchCodexModeResult {
+  previous_mode: CodexConnectionMode;
+  current_mode: CodexConnectionMode;
+  changed: boolean;
+  restart_required: boolean;
   warning_messages: string[];
 }
 
@@ -206,6 +332,34 @@ export async function getConfiguration() {
   return invoke<ConfigurationSnapshot>("get_configuration");
 }
 
+export async function getCodexIntegrationState() {
+  return invoke<CodexIntegrationState>("get_codex_integration_state");
+}
+
+export async function switchCodexConnectionMode(mode: "official" | "gateway") {
+  return invoke<SwitchCodexModeResult>("switch_codex_connection_mode", { mode });
+}
+
+export async function refreshCodexLoginStatus() {
+  return invoke<CodexIntegrationState>("refresh_codex_login_status");
+}
+
+export async function repairCodexGatewayConfiguration() {
+  return invoke<SwitchCodexModeResult>("repair_codex_gateway_configuration");
+}
+
+export async function previewCodexHistoryMigration() {
+  return invoke<CodexHistoryMigrationPreview>("preview_codex_history_migration");
+}
+
+export async function applyCodexHistoryMigration(previewId: string) {
+  return invoke<CodexHistoryMigrationResult>("apply_codex_history_migration", { previewId });
+}
+
+export async function restoreCodexHistoryMigration() {
+  return invoke<CodexHistoryRestoreResult>("restore_codex_history_migration");
+}
+
 export async function saveConfiguration(input: ConfigurationInput) {
   return invoke<ConfigurationSnapshot>("save_configuration", { input });
 }
@@ -243,6 +397,10 @@ export async function updateRouteGroup(
 
 export async function getRuntimeStats() {
   return invoke<RuntimeStats>("get_runtime_stats");
+}
+
+export async function getUsageStatistics(query: UsageQuery) {
+  return invoke<UsageStatistics>("get_usage_statistics", { query });
 }
 
 export async function getRecentLogs() {

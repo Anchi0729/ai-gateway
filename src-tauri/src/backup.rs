@@ -1,6 +1,8 @@
 use super::{
-    push_log, routing_policy_values, sanitize_base_url, validate_probe_interval,
-    validate_routing_policy, AppState, ProviderConfig, ProviderSecretStore, RoutingPolicy,
+    codex_integration, gateway_codex_configuration, persist_codex_management_metadata, push_log,
+    routing_policy_values, sanitize_base_url, save_and_verify_provider_secret,
+    validate_probe_interval, validate_routing_policy, AppState, ProviderConfig,
+    ProviderSecretStore, RoutingPolicy,
 };
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -53,6 +55,7 @@ impl From<BackupProvider> for ProviderConfig {
             enabled: provider.enabled,
             timeout_ms: provider.timeout_ms,
             api_key: provider.api_key,
+            api_key_error: None,
         }
     }
 }
@@ -114,6 +117,7 @@ pub(crate) struct BackupPreview {
 pub(crate) struct BackupExportResult {
     file_name: String,
     provider_count: usize,
+    warning_messages: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -131,21 +135,40 @@ fn validate_password(password: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn build_payload(state: &AppState) -> Result<BackupPayloadData, String> {
+fn build_payload(state: &AppState) -> Result<(BackupPayloadData, Vec<String>), String> {
     let providers = state.config.read().unwrap().clone();
     if providers.len() > MAX_BACKUP_PROVIDERS {
         return Err(format!("中转数量不能超过 {MAX_BACKUP_PROVIDERS} 个"));
     }
 
     let mut backup_providers = Vec::with_capacity(providers.len());
+    let mut warnings = Vec::new();
     for provider in providers {
-        // 导出必须重新读取系统密钥库，不能依赖可能过期的运行时副本。
-        let api_key = state
-            .secrets
-            .get(&provider.id)
-            .map_err(|error| format!("无法读取「{}」的 API Key：{error}", provider.name))?
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| format!("「{}」没有可导出的 API Key", provider.name))?;
+        // 系统密钥库是首选来源；当前路由正在使用的内存密钥只在凭据缺失或暂时不可读时兜底。
+        let stored = state.secrets.get(&provider.id);
+        let api_key = match stored {
+            Ok(Some(value)) if !value.is_empty() => value,
+            missing_or_failed if !provider.api_key.is_empty() => {
+                if save_and_verify_provider_secret(
+                    state.secrets.as_ref(),
+                    &provider.id,
+                    &provider.api_key,
+                )
+                .is_err()
+                {
+                    warnings.push(format!(
+                        "「{}」的系统凭据无法自动修复；备份已包含当前运行时密钥，请重新保存该中转的 API Key",
+                        provider.name
+                    ));
+                }
+                let _ = missing_or_failed;
+                provider.api_key.clone()
+            }
+            Err(error) => {
+                return Err(format!("无法读取「{}」的 API Key：{error}", provider.name));
+            }
+            _ => return Err(format!("「{}」没有可导出的 API Key", provider.name)),
+        };
         backup_providers.push(BackupProvider {
             id: provider.id,
             name: provider.name,
@@ -159,16 +182,19 @@ fn build_payload(state: &AppState) -> Result<BackupPayloadData, String> {
     }
 
     let settings = state.settings.read().unwrap().clone();
-    Ok(BackupPayloadData {
-        format_version: BACKUP_FORMAT_VERSION,
-        exported_at: Utc::now(),
-        app_version: env!("CARGO_PKG_VERSION").to_string(),
-        providers: backup_providers,
-        probe_interval_sec: settings.probe_interval_sec,
-        routing_policy: state.policy.read().unwrap().clone(),
-        locked_provider_id: state.locked_provider_id.read().unwrap().clone(),
-        local_token: settings.local_token,
-    })
+    Ok((
+        BackupPayloadData {
+            format_version: BACKUP_FORMAT_VERSION,
+            exported_at: Utc::now(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            providers: backup_providers,
+            probe_interval_sec: settings.probe_interval_sec,
+            routing_policy: state.policy.read().unwrap().clone(),
+            locked_provider_id: state.locked_provider_id.read().unwrap().clone(),
+            local_token: settings.local_token,
+        },
+        warnings,
+    ))
 }
 
 fn derive_key(password: &str, kdf: &BackupKdf, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>, String> {
@@ -453,7 +479,7 @@ fn restore_secrets(
     let mut warnings = Vec::new();
     for (id, previous) in originals.iter().rev() {
         let result = match previous {
-            Some(value) => secrets.set(id, value),
+            Some(value) => save_and_verify_provider_secret(secrets, id, value),
             None => secrets.delete(id),
         };
         if result.is_err() {
@@ -532,7 +558,7 @@ fn apply_import(
             .get(id)
             .map_err(|error| format!("无法读取现有密钥，导入已取消：{error}"))?;
         originals.push((id.to_string(), previous));
-        if let Err(error) = state.secrets.set(id, api_key) {
+        if let Err(error) = save_and_verify_provider_secret(state.secrets.as_ref(), id, api_key) {
             let rollback_warnings = restore_secrets(state.secrets.as_ref(), &originals);
             return Err(format!(
                 "无法写入系统密钥库，导入已取消：{error}{}",
@@ -645,7 +671,7 @@ pub(crate) async fn export_configuration_backup(
 ) -> Result<BackupExportResult, String> {
     validate_password(&password)?;
     let path = export_path(path)?;
-    let payload = build_payload(&state)?;
+    let (payload, warning_messages) = build_payload(&state)?;
     let provider_count = payload.providers.len();
     let password = Zeroizing::new(password);
     let file_name = path
@@ -668,6 +694,7 @@ pub(crate) async fn export_configuration_backup(
     Ok(BackupExportResult {
         file_name,
         provider_count,
+        warning_messages,
     })
 }
 
@@ -722,7 +749,43 @@ pub(crate) async fn import_configuration_backup(
     })
     .await
     .map_err(|error| format!("备份导入任务异常结束：{error}"))??;
-    apply_import(&state, payload, mode)
+    let old_codex = gateway_codex_configuration(&state.settings.read().unwrap());
+    let next_codex = codex_integration::GatewayCodexConfiguration {
+        port: old_codex.port,
+        local_token: if matches!(mode, BackupImportMode::Replace) {
+            payload.local_token.clone()
+        } else {
+            old_codex.local_token.clone()
+        },
+    };
+    // 完整覆盖会恢复本地令牌；若 Codex 当前由网关接管，必须同步请求头。
+    // 先更新可补偿的 config.toml，导入失败时再恢复旧令牌配置。
+    let codex_changed = if old_codex.local_token != next_codex.local_token {
+        codex_integration::update_managed_gateway_configuration(&old_codex, &next_codex)?.is_some()
+    } else {
+        false
+    };
+    match apply_import(&state, payload, mode) {
+        Ok(mut result) => {
+            if codex_changed {
+                if let Err(error) = persist_codex_management_metadata(&state, false) {
+                    result.warning_messages.push(format!(
+                        "Codex 接入配置已同步，但本地管理元数据保存失败：{error}"
+                    ));
+                }
+            }
+            Ok(result)
+        }
+        Err(error) => {
+            if codex_changed {
+                let _ = codex_integration::update_managed_gateway_configuration(
+                    &next_codex,
+                    &old_codex,
+                );
+            }
+            Err(error)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -733,6 +796,22 @@ mod tests {
     use rusqlite::Connection;
     use std::collections::VecDeque;
     use std::sync::{atomic::AtomicBool, Arc, Mutex, RwLock};
+
+    struct UnavailableSecretStore;
+
+    impl ProviderSecretStore for UnavailableSecretStore {
+        fn get(&self, _id: &str) -> Result<Option<String>, String> {
+            Err("credential backend unavailable".to_string())
+        }
+
+        fn set(&self, _id: &str, _value: &str) -> Result<(), String> {
+            Err("credential backend unavailable".to_string())
+        }
+
+        fn delete(&self, _id: &str) -> Result<(), String> {
+            Err("credential backend unavailable".to_string())
+        }
+    }
 
     fn sample_payload() -> BackupPayloadData {
         BackupPayloadData {
@@ -815,6 +894,7 @@ mod tests {
                 local_token: "target-local-token-123456".to_string(),
                 probe_interval_sec: 30,
                 log_retention_days: 7,
+                usage_retention_days: 365,
                 gateway_running: true,
                 gateway_listening: true,
                 gateway_error: None,
@@ -828,6 +908,10 @@ mod tests {
             logs: Arc::new(Mutex::new(VecDeque::new())),
             policy: Arc::new(RwLock::new(RoutingPolicy::default())),
             secrets: secrets.clone(),
+            gateway: Arc::new(crate::GatewayController::default()),
+            codex_config_fingerprint: Arc::new(Mutex::new(None)),
+            codex_history_preview: Arc::new(Mutex::new(None)),
+            codex_login_status: Arc::new(Mutex::new(codex_integration::CodexLoginStatus::Unknown)),
             app_handle: None,
         };
         (state, secrets)
@@ -843,6 +927,7 @@ mod tests {
             enabled: true,
             timeout_ms: 30_000,
             api_key: format!("current-key-{id}"),
+            api_key_error: None,
         }
     }
 
@@ -858,6 +943,52 @@ mod tests {
         let restored = decrypt_payload(&encrypted, "correct-password").unwrap();
         assert_eq!(restored.providers[0].api_key, "secret-provider-key");
         assert_eq!(restored.local_token, "local-access-token-123456");
+    }
+
+    #[test]
+    fn export_repairs_missing_credential_from_runtime_secret() {
+        let provider = current_provider("provider-1", 1);
+        let expected = provider.api_key.clone();
+        let (state, secrets) = import_test_state(vec![provider], true);
+        secrets.delete("provider-1").unwrap();
+
+        let (payload, warnings) = build_payload(&state).unwrap();
+
+        assert!(warnings.is_empty());
+        assert_eq!(payload.providers[0].api_key, expected);
+        assert_eq!(
+            secrets.get("provider-1").unwrap().as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn export_uses_runtime_secret_and_warns_when_credential_repair_fails() {
+        let provider = current_provider("provider-1", 1);
+        let expected = provider.api_key.clone();
+        let (mut state, _) = import_test_state(vec![provider], true);
+        state.secrets = Arc::new(UnavailableSecretStore);
+
+        let (payload, warnings) = build_payload(&state).unwrap();
+
+        assert_eq!(payload.providers[0].api_key, expected);
+        assert_eq!(warnings.len(), 1);
+        assert!(!warnings[0].contains(&expected));
+    }
+
+    #[test]
+    fn export_rejects_provider_without_stored_or_runtime_secret() {
+        let mut provider = current_provider("provider-1", 1);
+        provider.api_key.clear();
+        let (state, secrets) = import_test_state(vec![provider], true);
+        secrets.delete("provider-1").unwrap();
+
+        let error = match build_payload(&state) {
+            Ok(_) => panic!("缺少密钥时不应生成备份"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("没有可导出的 API Key"));
     }
 
     #[test]
@@ -903,6 +1034,7 @@ mod tests {
         );
         assert!(secrets.get("old").unwrap().is_none());
         assert_eq!(state.settings.read().unwrap().probe_interval_sec, 60);
+        assert_eq!(state.settings.read().unwrap().port, 8765);
         assert_eq!(
             state.settings.read().unwrap().local_token,
             "local-access-token-123456"
@@ -954,6 +1086,7 @@ mod tests {
         );
         drop(providers);
         assert_eq!(state.settings.read().unwrap().probe_interval_sec, 30);
+        assert_eq!(state.settings.read().unwrap().port, 8765);
         assert_eq!(
             state.settings.read().unwrap().local_token,
             "target-local-token-123456"

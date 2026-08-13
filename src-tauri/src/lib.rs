@@ -1,23 +1,26 @@
 mod backup;
+mod codex_integration;
 
 use axum::{
-    body::Body,
+    body::{to_bytes, Body},
     extract::State,
-    http::{header, HeaderMap, HeaderName, Method, StatusCode, Uri},
+    http::{header, HeaderMap, HeaderName, Method, Request, StatusCode},
     response::Response,
     routing::{any, get},
     Router,
 };
 use bytes::Bytes;
-use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use chrono::{
+    DateTime, Datelike, Duration, Local, NaiveDate, SecondsFormat, TimeZone, Timelike, Utc,
+};
 use futures_util::{Stream, StreamExt};
-use keyring::Entry;
+use keyring::{credential::CredentialPersistence, default, Entry};
 use reqwest::Client;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
-    net::SocketAddr,
+    error::Error as StdError,
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -32,17 +35,26 @@ use tauri::{
     Emitter, Manager, State as TauriState,
 };
 use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
-use tokio::time::{sleep, timeout};
+use tokio::{
+    sync::oneshot,
+    time::{sleep, timeout},
+};
 use tracing::{error, info, warn};
 use url::Url;
 use uuid::Uuid;
 
 const DEFAULT_BIND: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8765;
+const MIN_CONFIGURABLE_PORT: u16 = 1024;
 const KEYRING_SERVICE: &str = "ai-gateway-provider";
 const MAX_EVENT_LOGS: usize = 2_000;
 const DEFAULT_LOG_RETENTION_DAYS: u16 = 7;
 const MAX_LOG_RETENTION_DAYS: u16 = 365;
+const DEFAULT_USAGE_RETENTION_DAYS: u16 = 365;
+const MIN_USAGE_RETENTION_DAYS: u16 = 30;
+const MAX_USAGE_RETENTION_DAYS: u16 = 3_650;
+const MAX_USAGE_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_LOCAL_REQUEST_BODY_BYTES: usize = 200 * 1024 * 1024;
 const MAX_HEALTH_PROBES: usize = 24;
 const MAX_ERROR_BODY_BYTES: usize = 1024 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 256 * 1024;
@@ -59,9 +71,11 @@ pub struct ProviderConfig {
     pub timeout_ms: u64,
     #[serde(skip)]
     pub api_key: String,
+    #[serde(skip)]
+    pub api_key_error: Option<String>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ProviderDto {
     pub id: String,
     pub name: String,
@@ -71,6 +85,7 @@ pub struct ProviderDto {
     pub enabled: bool,
     pub timeout_ms: u64,
     pub has_api_key: bool,
+    pub api_key_error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +129,7 @@ pub struct RouterSettings {
     pub local_token: String,
     pub probe_interval_sec: u64,
     pub log_retention_days: u16,
+    pub usage_retention_days: u16,
     pub gateway_running: bool,
     pub gateway_listening: bool,
     pub gateway_error: Option<String>,
@@ -128,10 +144,107 @@ pub struct ConfigurationSnapshot {
 
 #[derive(Clone, Deserialize)]
 pub struct ConfigurationInput {
+    pub port: u16,
     pub probe_interval_sec: u64,
     pub log_retention_days: u16,
+    pub usage_retention_days: u16,
     pub routing_policy: RoutingPolicy,
     pub autostart_enabled: bool,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageQueryMode {
+    Today,
+    Range,
+    Month,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct UsageQuery {
+    pub mode: UsageQueryMode,
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
+    pub month: Option<String>,
+}
+
+#[derive(Clone, Serialize, Default)]
+pub struct TokenMetric {
+    pub value: u64,
+    pub reported_count: u64,
+}
+
+#[derive(Clone, Serialize, Default)]
+pub struct UsageMetrics {
+    pub input_tokens: TokenMetric,
+    pub output_tokens: TokenMetric,
+    pub cached_tokens: TokenMetric,
+    pub reasoning_tokens: TokenMetric,
+    pub total_tokens: TokenMetric,
+}
+
+#[derive(Clone, Serialize)]
+pub struct UsagePeriod {
+    pub mode: String,
+    pub start_date: String,
+    pub end_date: String,
+    pub label: String,
+    pub resolution: String,
+}
+
+#[derive(Clone, Serialize)]
+pub struct ProviderUsageStatistics {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub deleted: bool,
+    pub completed_requests: u64,
+    pub reported_requests: u64,
+    pub coverage_percent: f64,
+    pub metrics: UsageMetrics,
+}
+
+#[derive(Clone, Serialize)]
+pub struct UsageSeriesPoint {
+    pub key: String,
+    pub label: String,
+    pub completed_requests: u64,
+    pub reported_requests: u64,
+    pub metrics: UsageMetrics,
+}
+
+#[derive(Clone, Serialize)]
+pub struct UsageStatistics {
+    pub period: UsagePeriod,
+    pub totals: UsageMetrics,
+    pub providers: Vec<ProviderUsageStatistics>,
+    pub series: Vec<UsageSeriesPoint>,
+    pub completed_requests: u64,
+    pub reported_requests: u64,
+    pub coverage_percent: f64,
+}
+
+#[derive(Clone, Default)]
+struct CapturedUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cached_tokens: Option<u64>,
+    reasoning_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+}
+
+impl CapturedUsage {
+    fn is_reported(&self) -> bool {
+        self.input_tokens.is_some() || self.output_tokens.is_some() || self.total_tokens.is_some()
+    }
+}
+
+struct UsageRecord {
+    completed_at: DateTime<Utc>,
+    provider_id: String,
+    provider_name: String,
+    model: Option<String>,
+    request_path: String,
+    usage: CapturedUsage,
 }
 
 #[derive(Clone, Serialize)]
@@ -284,6 +397,22 @@ trait ProviderSecretStore: Send + Sync {
 
 struct SystemProviderSecretStore;
 
+fn validate_system_secret_store() -> Result<(), String> {
+    // keyring 没有默认平台 feature；若错误构建退回 Mock，它只会保存到 Entry 生命周期内。
+    // 启动前强制检查持久性，防止再次出现“保存成功但重启丢失”的静默数据损坏。
+    if matches!(
+        default::default_credential_builder().persistence(),
+        CredentialPersistence::UntilDelete
+    ) {
+        Ok(())
+    } else {
+        Err(
+            "Windows 凭据后端不可用：当前程序未连接到可持久化的 Windows Credential Manager"
+                .to_string(),
+        )
+    }
+}
+
 impl ProviderSecretStore for SystemProviderSecretStore {
     fn get(&self, id: &str) -> Result<Option<String>, String> {
         let entry = Entry::new(KEYRING_SERVICE, id).map_err(|error| error.to_string())?;
@@ -308,6 +437,43 @@ impl ProviderSecretStore for SystemProviderSecretStore {
             Err(error) => Err(error.to_string()),
         }
     }
+}
+
+fn save_and_verify_provider_secret(
+    secrets: &dyn ProviderSecretStore,
+    id: &str,
+    value: &str,
+) -> Result<(), String> {
+    secrets.set(id, value)?;
+    // 写入后立即回读，避免界面显示“已配置”但凭据项实际上无法用于重启或导出。
+    match secrets.get(id)? {
+        Some(saved) if saved == value => Ok(()),
+        Some(_) => Err("系统密钥库回读结果与刚保存的 API Key 不一致".to_string()),
+        None => Err("系统密钥库写入后未找到对应的 API Key".to_string()),
+    }
+}
+
+fn restore_provider_secret(
+    secrets: &dyn ProviderSecretStore,
+    id: &str,
+    previous: Option<&str>,
+) -> Result<(), String> {
+    match previous {
+        Some(value) => save_and_verify_provider_secret(secrets, id, value),
+        None => secrets.delete(id),
+    }
+}
+
+#[derive(Default)]
+struct GatewayRuntime {
+    generation: u64,
+    port: Option<u16>,
+    shutdown: Option<oneshot::Sender<()>>,
+}
+
+#[derive(Default)]
+struct GatewayController {
+    runtime: Mutex<GatewayRuntime>,
 }
 
 #[cfg(test)]
@@ -348,6 +514,13 @@ struct AppState {
     logs: Arc<Mutex<VecDeque<EventLog>>>,
     policy: Arc<RwLock<RoutingPolicy>>,
     secrets: Arc<dyn ProviderSecretStore>,
+    gateway: Arc<GatewayController>,
+    // 仅跟踪 config.toml 的内容指纹，用于识别 CC-Switch 或用户的外部修改。
+    codex_config_fingerprint: Arc<Mutex<Option<String>>>,
+    // 迁移预览只在当前进程内有效；执行时还会重新扫描磁盘并核对完整指纹。
+    codex_history_preview: Arc<Mutex<Option<codex_integration::HistoryPreviewSnapshot>>>,
+    // 登录检测是显式操作，轮询状态时复用最近结果，避免反复启动 CLI。
+    codex_login_status: Arc<Mutex<codex_integration::CodexLoginStatus>>,
     // 单元测试不启动 Tauri runtime，因此事件发送句柄允许为空。
     app_handle: Option<tauri::AppHandle>,
 }
@@ -372,6 +545,7 @@ struct RouteGroupInput {
 
 impl AppState {
     fn new(app: &tauri::AppHandle) -> Result<Self, String> {
+        validate_system_secret_store()?;
         let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
         std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
         let db_path = data_dir.join("gateway.sqlite3");
@@ -406,7 +580,25 @@ impl AppState {
                     event_type TEXT,
                     routing_event_json TEXT
                 );
-                CREATE INDEX IF NOT EXISTS idx_event_logs_timestamp ON event_logs(timestamp);",
+                CREATE INDEX IF NOT EXISTS idx_event_logs_timestamp ON event_logs(timestamp);
+                CREATE TABLE IF NOT EXISTS usage_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    completed_at TEXT NOT NULL,
+                    provider_id TEXT NOT NULL,
+                    provider_name TEXT NOT NULL,
+                    model TEXT,
+                    request_path TEXT NOT NULL,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cached_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    total_tokens INTEGER,
+                    usage_reported INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_usage_records_completed_at
+                    ON usage_records(completed_at);
+                CREATE INDEX IF NOT EXISTS idx_usage_records_provider_time
+                    ON usage_records(provider_id, completed_at);",
             )
             .map_err(|e| e.to_string())?;
         let store = Arc::new(Store {
@@ -419,12 +611,18 @@ impl AppState {
         let probe_interval_sec = setting(&store, "probe_interval_sec")?
             .and_then(|v| v.parse().ok())
             .unwrap_or(30);
+        let port = load_port(&store)?;
         let log_retention_days = setting(&store, "log_retention_days")?
             .and_then(|value| value.parse().ok())
             .filter(|days| (1..=MAX_LOG_RETENTION_DAYS).contains(days))
             .unwrap_or(DEFAULT_LOG_RETENTION_DAYS);
-        // 启动时先清理过期记录，再恢复内存缓存，确保页面不会短暂看到已过保留期的日志。
+        let usage_retention_days = setting(&store, "usage_retention_days")?
+            .and_then(|value| value.parse().ok())
+            .filter(|days| (MIN_USAGE_RETENTION_DAYS..=MAX_USAGE_RETENTION_DAYS).contains(days))
+            .unwrap_or(DEFAULT_USAGE_RETENTION_DAYS);
+        // 启动时先清理过期记录，避免页面短暂看到已超过本机保留策略的数据。
         prune_expired_logs(&store, log_retention_days)?;
+        prune_expired_usage(&store, usage_retention_days)?;
         let logs = load_recent_logs(&store)?;
         let policy = load_routing_policy(&store)?;
         let providers = load_providers(&store, secrets.as_ref())?;
@@ -432,10 +630,11 @@ impl AppState {
             setting(&store, "locked_provider_id")?.filter(|value| !value.is_empty());
         let settings = RouterSettings {
             bind_address: DEFAULT_BIND.to_string(),
-            port: DEFAULT_PORT,
+            port,
             local_token: token,
             probe_interval_sec,
             log_retention_days,
+            usage_retention_days,
             gateway_running: true,
             gateway_listening: false,
             gateway_error: None,
@@ -451,9 +650,23 @@ impl AppState {
             logs: Arc::new(Mutex::new(logs)),
             policy: Arc::new(RwLock::new(policy)),
             secrets,
+            gateway: Arc::new(GatewayController::default()),
+            codex_config_fingerprint: Arc::new(Mutex::new(
+                codex_integration::config_fingerprint().ok(),
+            )),
+            codex_history_preview: Arc::new(Mutex::new(None)),
+            // 启动时只调用一次 Codex CLI，页面首次打开即可显示登录状态；轮询不会重复启动进程。
+            codex_login_status: Arc::new(Mutex::new(codex_integration::login_status())),
             app_handle: Some(app.clone()),
         })
     }
+}
+
+fn load_port(store: &Store) -> Result<u16, String> {
+    Ok(setting(store, "port")?
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|value| *value >= MIN_CONFIGURABLE_PORT)
+        .unwrap_or(DEFAULT_PORT))
 }
 
 fn setting(store: &Store, key: &str) -> Result<Option<String>, String> {
@@ -569,6 +782,25 @@ fn validate_log_retention_days(log_retention_days: u16) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_usage_retention_days(usage_retention_days: u16) -> Result<(), String> {
+    if !(MIN_USAGE_RETENTION_DAYS..=MAX_USAGE_RETENTION_DAYS).contains(&usage_retention_days) {
+        return Err(format!(
+            "用量数据保留天数必须在 {MIN_USAGE_RETENTION_DAYS} 到 {MAX_USAGE_RETENTION_DAYS} 天之间"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_port(port: u16) -> Result<(), String> {
+    if port < MIN_CONFIGURABLE_PORT {
+        return Err(format!(
+            "监听端口必须在 {MIN_CONFIGURABLE_PORT} 到 {} 之间",
+            u16::MAX
+        ));
+    }
+    Ok(())
+}
+
 fn routing_policy_values(policy: &RoutingPolicy) -> Vec<(&'static str, String)> {
     vec![
         ("retry_count", policy.retry_count.to_string()),
@@ -629,8 +861,10 @@ fn persist_routing_policy(store: &Store, policy: &RoutingPolicy) -> Result<(), S
 
 fn persist_configuration(
     store: &Store,
+    port: u16,
     probe_interval_sec: u64,
     log_retention_days: u16,
+    usage_retention_days: u16,
     policy: &RoutingPolicy,
 ) -> Result<(), String> {
     let mut conn = store
@@ -639,12 +873,14 @@ fn persist_configuration(
         .map_err(|_| "数据库锁已损坏".to_string())?;
     let transaction = conn.transaction().map_err(|error| error.to_string())?;
     let mut values = vec![
+        ("port", port.to_string()),
         ("probe_interval_sec", probe_interval_sec.to_string()),
         ("log_retention_days", log_retention_days.to_string()),
+        ("usage_retention_days", usage_retention_days.to_string()),
     ];
     values.extend(routing_policy_values(policy));
 
-    // 探测间隔和路由规则属于同一份运行配置，必须一起提交，避免保存成功一半。
+    // 监听端口、探测间隔和路由规则属于同一份运行配置，必须一起提交，避免保存成功一半。
     for (key, value) in values {
         transaction
             .execute(
@@ -676,18 +912,21 @@ fn load_providers(
                 enabled: row.get::<_, i64>(5)? != 0,
                 timeout_ms: row.get::<_, i64>(6)? as u64,
                 api_key: String::new(),
+                api_key_error: None,
             })
         })
         .map_err(|e| e.to_string())?;
     let mut result = Vec::new();
     for item in rows {
         let mut provider = item.map_err(|e| e.to_string())?;
-        // 系统密钥库临时不可用时仍允许桌面端启动；路由会把缺少密钥的中转视为不可用，
-        // 导出和编辑操作则继续返回明确错误，避免静默生成不完整备份。
-        provider.api_key = secrets
-            .get(&provider.id)
-            .unwrap_or_default()
-            .unwrap_or_default();
+        // 凭据不存在是可修复的配置状态，系统读取失败则保留诊断信息；两者不能都伪装成空 Key。
+        match secrets.get(&provider.id) {
+            Ok(Some(value)) if !value.is_empty() => provider.api_key = value,
+            Ok(_) => {}
+            Err(error) => {
+                provider.api_key_error = Some(format!("Windows 凭据读取失败：{error}"));
+            }
+        }
         result.push(provider);
     }
     Ok(result)
@@ -702,6 +941,7 @@ fn dto(provider: &ProviderConfig) -> ProviderDto {
         enabled: provider.enabled,
         timeout_ms: provider.timeout_ms,
         has_api_key: !provider.api_key.is_empty(),
+        api_key_error: provider.api_key_error.clone(),
     }
 }
 
@@ -813,6 +1053,360 @@ fn prune_expired_logs(store: &Store, retention_days: u16) -> Result<usize, Strin
         params![log_timestamp(cutoff)],
     )
     .map_err(|error| format!("无法清理过期日志：{error}"))
+}
+
+fn sqlite_token(value: Option<u64>) -> Result<Option<i64>, String> {
+    value
+        .map(|token| {
+            i64::try_from(token).map_err(|_| "上游返回的 Token 数量超出可保存范围".to_string())
+        })
+        .transpose()
+}
+
+fn persist_usage_record(store: &Store, record: &UsageRecord) -> Result<(), String> {
+    let conn = store
+        .connection
+        .lock()
+        .map_err(|_| "数据库锁已损坏".to_string())?;
+    conn.execute(
+        "INSERT INTO usage_records(
+            completed_at,provider_id,provider_name,model,request_path,
+            input_tokens,output_tokens,cached_tokens,reasoning_tokens,total_tokens,usage_reported
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        params![
+            log_timestamp(record.completed_at),
+            record.provider_id,
+            record.provider_name,
+            record.model,
+            record.request_path,
+            sqlite_token(record.usage.input_tokens)?,
+            sqlite_token(record.usage.output_tokens)?,
+            sqlite_token(record.usage.cached_tokens)?,
+            sqlite_token(record.usage.reasoning_tokens)?,
+            sqlite_token(record.usage.total_tokens)?,
+            i64::from(record.usage.is_reported()),
+        ],
+    )
+    .map(|_| ())
+    .map_err(|error| format!("无法保存 Token 用量：{error}"))
+}
+
+fn prune_expired_usage(store: &Store, retention_days: u16) -> Result<usize, String> {
+    let cutoff = Utc::now() - Duration::days(i64::from(retention_days));
+    let conn = store
+        .connection
+        .lock()
+        .map_err(|_| "数据库锁已损坏".to_string())?;
+    conn.execute(
+        "DELETE FROM usage_records WHERE completed_at < ?1",
+        params![log_timestamp(cutoff)],
+    )
+    .map_err(|error| format!("无法清理过期用量数据：{error}"))
+}
+
+#[derive(Default)]
+struct UsageAggregate {
+    metrics: UsageMetrics,
+    completed_requests: u64,
+    reported_requests: u64,
+}
+
+impl UsageAggregate {
+    fn add_metric(metric: &mut TokenMetric, value: Option<u64>) {
+        if let Some(value) = value {
+            metric.value = metric.value.saturating_add(value);
+            metric.reported_count = metric.reported_count.saturating_add(1);
+        }
+    }
+
+    fn add(&mut self, usage: &CapturedUsage) {
+        self.completed_requests = self.completed_requests.saturating_add(1);
+        if usage.is_reported() {
+            self.reported_requests = self.reported_requests.saturating_add(1);
+        }
+        Self::add_metric(&mut self.metrics.input_tokens, usage.input_tokens);
+        Self::add_metric(&mut self.metrics.output_tokens, usage.output_tokens);
+        Self::add_metric(&mut self.metrics.cached_tokens, usage.cached_tokens);
+        Self::add_metric(&mut self.metrics.reasoning_tokens, usage.reasoning_tokens);
+        Self::add_metric(&mut self.metrics.total_tokens, usage.total_tokens);
+    }
+}
+
+fn coverage_percent(reported: u64, completed: u64) -> f64 {
+    if completed == 0 {
+        return 0.0;
+    }
+    ((reported as f64 / completed as f64) * 1_000.0).round() / 10.0
+}
+
+fn local_midnight(date: NaiveDate) -> Result<DateTime<Utc>, String> {
+    let local = Local
+        .from_local_datetime(
+            &date
+                .and_hms_opt(0, 0, 0)
+                .ok_or_else(|| "无法构造本地日期边界".to_string())?,
+        )
+        .earliest()
+        .ok_or_else(|| format!("本机时区无法表示日期 {date}"))?;
+    Ok(local.with_timezone(&Utc))
+}
+
+fn usage_period_bounds(
+    query: &UsageQuery,
+) -> Result<
+    (
+        UsagePeriod,
+        NaiveDate,
+        NaiveDate,
+        DateTime<Utc>,
+        DateTime<Utc>,
+    ),
+    String,
+> {
+    let today = Local::now().date_naive();
+    let (start, end, mode, label, resolution) = match query.mode {
+        UsageQueryMode::Today => (today, today, "today", "今天".to_string(), "hour"),
+        UsageQueryMode::Range => {
+            let start = NaiveDate::parse_from_str(
+                query
+                    .start_date
+                    .as_deref()
+                    .ok_or_else(|| "日期范围缺少开始日期".to_string())?,
+                "%Y-%m-%d",
+            )
+            .map_err(|_| "开始日期格式必须为 YYYY-MM-DD".to_string())?;
+            let end = NaiveDate::parse_from_str(
+                query
+                    .end_date
+                    .as_deref()
+                    .ok_or_else(|| "日期范围缺少结束日期".to_string())?,
+                "%Y-%m-%d",
+            )
+            .map_err(|_| "结束日期格式必须为 YYYY-MM-DD".to_string())?;
+            if start > end {
+                return Err("开始日期不能晚于结束日期".to_string());
+            }
+            if (end - start).num_days() + 1 > 30 {
+                return Err("自定义日期范围最多查询 30 个自然日".to_string());
+            }
+            (start, end, "range", format!("{start} 至 {end}"), "day")
+        }
+        UsageQueryMode::Month => {
+            let month = query
+                .month
+                .as_deref()
+                .ok_or_else(|| "月份查询缺少月份".to_string())?;
+            let start = NaiveDate::parse_from_str(&format!("{month}-01"), "%Y-%m-%d")
+                .map_err(|_| "月份格式必须为 YYYY-MM".to_string())?;
+            let next_month = if start.month() == 12 {
+                NaiveDate::from_ymd_opt(start.year() + 1, 1, 1)
+            } else {
+                NaiveDate::from_ymd_opt(start.year(), start.month() + 1, 1)
+            }
+            .ok_or_else(|| "无法计算月份结束日期".to_string())?;
+            (
+                start,
+                next_month - Duration::days(1),
+                "month",
+                format!("{}年{}月", start.year(), start.month()),
+                "day",
+            )
+        }
+    };
+    let queries_future = match query.mode {
+        // 当前月份需要展示完整自然月，其中尚未到来的日期只会返回零值。
+        UsageQueryMode::Month => start > today,
+        UsageQueryMode::Today | UsageQueryMode::Range => start > today || end > today,
+    };
+    if queries_future {
+        return Err("不能查询未来日期或未来月份".to_string());
+    }
+    let end_exclusive_date = end
+        .checked_add_signed(Duration::days(1))
+        .ok_or_else(|| "查询结束日期超出支持范围".to_string())?;
+    let start_at = local_midnight(start)?;
+    let end_at = local_midnight(end_exclusive_date)?;
+    Ok((
+        UsagePeriod {
+            mode: mode.to_string(),
+            start_date: start.to_string(),
+            end_date: end.to_string(),
+            label,
+            resolution: resolution.to_string(),
+        },
+        start,
+        end,
+        start_at,
+        end_at,
+    ))
+}
+
+fn usage_from_columns(
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cached_tokens: Option<i64>,
+    reasoning_tokens: Option<i64>,
+    total_tokens: Option<i64>,
+) -> CapturedUsage {
+    let nonnegative = |value: Option<i64>| value.and_then(|item| u64::try_from(item).ok());
+    CapturedUsage {
+        input_tokens: nonnegative(input_tokens),
+        output_tokens: nonnegative(output_tokens),
+        cached_tokens: nonnegative(cached_tokens),
+        reasoning_tokens: nonnegative(reasoning_tokens),
+        total_tokens: nonnegative(total_tokens),
+    }
+}
+
+fn query_usage_statistics(state: &AppState, query: &UsageQuery) -> Result<UsageStatistics, String> {
+    let (period, start, end, start_at, end_at) = usage_period_bounds(query)?;
+    // 中转写操作固定按“配置锁 → 数据库锁”执行；查询沿用同一顺序避免并发保存时锁顺序反转。
+    let configured_names = state
+        .config
+        .read()
+        .unwrap()
+        .iter()
+        .map(|provider| (provider.id.clone(), provider.name.clone()))
+        .collect::<HashMap<_, _>>();
+    let conn = state
+        .store
+        .connection
+        .lock()
+        .map_err(|_| "数据库锁已损坏".to_string())?;
+    let mut statement = conn
+        .prepare(
+            "SELECT completed_at,provider_id,provider_name,
+                    input_tokens,output_tokens,cached_tokens,reasoning_tokens,total_tokens
+             FROM usage_records
+             WHERE completed_at >= ?1 AND completed_at < ?2
+             ORDER BY completed_at ASC",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(
+            params![log_timestamp(start_at), log_timestamp(end_at)],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                ))
+            },
+        )
+        .map_err(|error| error.to_string())?;
+
+    let mut provider_aggregates = configured_names
+        .iter()
+        .map(|(id, name)| (id.clone(), (name.clone(), UsageAggregate::default())))
+        .collect::<HashMap<_, _>>();
+    let mut series_aggregates: HashMap<String, UsageAggregate> = HashMap::new();
+    let mut totals = UsageAggregate::default();
+
+    for row in rows {
+        let (timestamp, provider_id, stored_name, input, output, cached, reasoning, total) =
+            row.map_err(|error| error.to_string())?;
+        let completed_at = match DateTime::parse_from_rfc3339(&timestamp) {
+            Ok(value) => value.with_timezone(&Utc),
+            Err(error) => {
+                warn!(%error, "invalid usage timestamp ignored");
+                continue;
+            }
+        };
+        let usage = usage_from_columns(input, output, cached, reasoning, total);
+        totals.add(&usage);
+        let provider = provider_aggregates
+            .entry(provider_id.clone())
+            .or_insert_with(|| (stored_name.clone(), UsageAggregate::default()));
+        if let Some(current_name) = configured_names.get(&provider_id) {
+            provider.0 = current_name.clone();
+        } else {
+            // 已删除中转可能有多次改名，按时间顺序保留最后一次请求时的名称。
+            provider.0 = stored_name;
+        }
+        provider.1.add(&usage);
+
+        let local = completed_at.with_timezone(&Local);
+        let bucket = if period.resolution == "hour" {
+            format!("{:02}", local.hour())
+        } else {
+            local.date_naive().to_string()
+        };
+        series_aggregates.entry(bucket).or_default().add(&usage);
+    }
+    drop(statement);
+    drop(conn);
+
+    let mut providers = provider_aggregates
+        .into_iter()
+        .map(
+            |(provider_id, (provider_name, aggregate))| ProviderUsageStatistics {
+                deleted: !configured_names.contains_key(&provider_id),
+                provider_id,
+                provider_name,
+                completed_requests: aggregate.completed_requests,
+                reported_requests: aggregate.reported_requests,
+                coverage_percent: coverage_percent(
+                    aggregate.reported_requests,
+                    aggregate.completed_requests,
+                ),
+                metrics: aggregate.metrics,
+            },
+        )
+        .collect::<Vec<_>>();
+    providers.sort_by(|left, right| {
+        right
+            .metrics
+            .total_tokens
+            .value
+            .cmp(&left.metrics.total_tokens.value)
+            .then_with(|| left.provider_name.cmp(&right.provider_name))
+    });
+
+    let mut series = Vec::new();
+    if period.resolution == "hour" {
+        for hour in 0..24 {
+            let key = format!("{hour:02}");
+            let aggregate = series_aggregates.remove(&key).unwrap_or_default();
+            series.push(UsageSeriesPoint {
+                key,
+                label: format!("{hour:02}:00"),
+                completed_requests: aggregate.completed_requests,
+                reported_requests: aggregate.reported_requests,
+                metrics: aggregate.metrics,
+            });
+        }
+    } else {
+        let mut date = start;
+        while date <= end {
+            let key = date.to_string();
+            let aggregate = series_aggregates.remove(&key).unwrap_or_default();
+            series.push(UsageSeriesPoint {
+                key,
+                label: format!("{:02}-{:02}", date.month(), date.day()),
+                completed_requests: aggregate.completed_requests,
+                reported_requests: aggregate.reported_requests,
+                metrics: aggregate.metrics,
+            });
+            date = date
+                .checked_add_signed(Duration::days(1))
+                .ok_or_else(|| "无法生成用量趋势日期".to_string())?;
+        }
+    }
+
+    Ok(UsageStatistics {
+        period,
+        totals: totals.metrics,
+        providers,
+        series,
+        completed_requests: totals.completed_requests,
+        reported_requests: totals.reported_requests,
+        coverage_percent: coverage_percent(totals.reported_requests, totals.completed_requests),
+    })
 }
 
 fn append_event_log(state: &AppState, entry: EventLog) {
@@ -1144,10 +1738,15 @@ fn sanitize_base_url(value: &str) -> Result<String, String> {
     Ok(cleaned)
 }
 fn auth_valid(headers: &HeaderMap, token: &str) -> bool {
-    headers
+    let authorization_valid = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|value| value == format!("Bearer {token}") || value == token)
+        .is_some_and(|value| value == format!("Bearer {token}") || value == token);
+    let gateway_header_valid = headers
+        .get("x-ai-gateway-token")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == token);
+    authorization_valid || gateway_header_valid
 }
 fn should_retry_status(status: StatusCode) -> bool {
     status == StatusCode::REQUEST_TIMEOUT
@@ -1164,14 +1763,16 @@ fn retry_after_seconds(headers: &HeaderMap) -> Option<u64> {
         .ok()
         .map(|at| (at.with_timezone(&Utc) - Utc::now()).num_seconds().max(0) as u64)
 }
+#[derive(Deserialize)]
+struct RequestMetadata {
+    model: Option<String>,
+}
+
 fn request_model(body: &Bytes) -> Option<String> {
-    serde_json::from_slice::<serde_json::Value>(body)
+    // 路由只需要 model；忽略其余字段可避免为大型 prompt 再构造一份完整 JSON Value。
+    serde_json::from_slice::<RequestMetadata>(body)
         .ok()
-        .and_then(|json| {
-            json.get("model")
-                .and_then(|v| v.as_str())
-                .map(ToOwned::to_owned)
-        })
+        .and_then(|metadata| metadata.model)
 }
 
 #[derive(Clone, Debug)]
@@ -1284,6 +1885,15 @@ fn is_hop_by_hop_header(name: &HeaderName) -> bool {
     )
 }
 
+fn is_official_identity_header(name: &HeaderName) -> bool {
+    let name = name.as_str();
+    matches!(
+        name,
+        "cookie" | "chatgpt-account-id" | "openai-organization" | "openai-project"
+    ) || name.starts_with("x-openai-")
+        || name.starts_with("x-chatgpt-")
+}
+
 fn upstream_request(
     state: &AppState,
     provider: &ProviderConfig,
@@ -1295,10 +1905,13 @@ fn upstream_request(
     let mut builder = state.client.request(method.clone(), url).body(body.clone());
     for (name, value) in headers {
         if name != header::AUTHORIZATION
+            && name.as_str() != "x-ai-gateway-token"
             && name != header::HOST
             && name != header::CONTENT_LENGTH
             && name != header::ACCEPT_ENCODING
             && !is_hop_by_hop_header(name)
+            // Codex 保持 ChatGPT 登录后会携带官方身份信息；第三方上游只能收到中转自己的 API Key。
+            && !is_official_identity_header(name)
         {
             builder = builder.header(name, value);
         }
@@ -1333,6 +1946,126 @@ async fn send_upstream_request(
 type GatewayByteStream =
     Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static>>;
 
+#[derive(Clone, Copy)]
+enum UsageResponseKind {
+    Json,
+    Sse,
+    Unsupported,
+}
+
+fn json_token(object: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<u64> {
+    object.get(key)?.as_u64()
+}
+
+fn usage_from_object(value: &serde_json::Value) -> Option<CapturedUsage> {
+    let object = value.as_object()?;
+    let input_tokens =
+        json_token(object, "input_tokens").or_else(|| json_token(object, "prompt_tokens"));
+    let output_tokens =
+        json_token(object, "output_tokens").or_else(|| json_token(object, "completion_tokens"));
+    let cached_tokens = object
+        .get("input_tokens_details")
+        .or_else(|| object.get("prompt_tokens_details"))
+        .and_then(serde_json::Value::as_object)
+        .and_then(|details| json_token(details, "cached_tokens"));
+    let reasoning_tokens = object
+        .get("output_tokens_details")
+        .or_else(|| object.get("completion_tokens_details"))
+        .and_then(serde_json::Value::as_object)
+        .and_then(|details| json_token(details, "reasoning_tokens"));
+    let total_tokens = json_token(object, "total_tokens")
+        .or_else(|| Some(input_tokens?.saturating_add(output_tokens?)));
+    let usage = CapturedUsage {
+        input_tokens,
+        output_tokens,
+        cached_tokens,
+        reasoning_tokens,
+        total_tokens,
+    };
+    usage.is_reported().then_some(usage)
+}
+
+fn usage_from_response_json(value: &serde_json::Value) -> Option<CapturedUsage> {
+    let usage =
+        if value.get("type").and_then(serde_json::Value::as_str) == Some("response.completed") {
+            value.get("response")?.get("usage")?
+        } else {
+            value.get("usage")?
+        };
+    usage_from_object(usage)
+}
+
+struct UsageCollector {
+    kind: UsageResponseKind,
+    buffer: Vec<u8>,
+    disabled: bool,
+    captured: Option<CapturedUsage>,
+}
+
+impl UsageCollector {
+    fn new(kind: UsageResponseKind) -> Self {
+        Self {
+            kind,
+            buffer: Vec::new(),
+            disabled: false,
+            captured: None,
+        }
+    }
+
+    fn observe(&mut self, chunk: &Bytes) {
+        if self.disabled {
+            return;
+        }
+        match self.kind {
+            UsageResponseKind::Json => {
+                if self.buffer.len().saturating_add(chunk.len()) > MAX_USAGE_CAPTURE_BYTES {
+                    self.buffer.clear();
+                    self.disabled = true;
+                } else {
+                    self.buffer.extend_from_slice(chunk);
+                }
+            }
+            UsageResponseKind::Sse => {
+                self.buffer.extend_from_slice(chunk);
+                while let Some(frame_end) = next_sse_frame_end(&self.buffer) {
+                    if frame_end > MAX_USAGE_CAPTURE_BYTES {
+                        self.buffer.clear();
+                        self.disabled = true;
+                        return;
+                    }
+                    let frame = self.buffer.drain(..frame_end).collect::<Vec<_>>();
+                    let Some(data) = sse_frame_data(&frame) else {
+                        continue;
+                    };
+                    if data == b"[DONE]" {
+                        continue;
+                    }
+                    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&data) {
+                        if let Some(usage) = usage_from_response_json(&value) {
+                            self.captured = Some(usage);
+                        }
+                    }
+                }
+                if self.buffer.len() > MAX_USAGE_CAPTURE_BYTES {
+                    self.buffer.clear();
+                    self.disabled = true;
+                }
+            }
+            UsageResponseKind::Unsupported => {}
+        }
+    }
+
+    fn finish(&mut self) -> CapturedUsage {
+        if !self.disabled && matches!(self.kind, UsageResponseKind::Json) {
+            self.captured = serde_json::from_slice::<serde_json::Value>(&self.buffer)
+                .ok()
+                .as_ref()
+                .and_then(usage_from_response_json);
+        }
+        self.captured.take().unwrap_or_default()
+    }
+}
+
 struct PreparedUpstreamResponse {
     status: StatusCode,
     headers: HeaderMap,
@@ -1360,6 +2093,22 @@ impl PreparedUpstreamResponse {
             .get(header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.to_ascii_lowercase().starts_with("text/event-stream"))
+    }
+
+    fn usage_response_kind(&self) -> UsageResponseKind {
+        let content_type = self
+            .headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if content_type.starts_with("text/event-stream") {
+            UsageResponseKind::Sse
+        } else if content_type.contains("json") {
+            UsageResponseKind::Json
+        } else {
+            UsageResponseKind::Unsupported
+        }
     }
 
     fn into_stream(self) -> GatewayByteStream {
@@ -1464,20 +2213,117 @@ async fn inspect_sse_before_output(mut response: PreparedUpstreamResponse) -> Ss
     SsePreflightResult::Forward(response)
 }
 
-async fn proxy_request(
-    State(state): State<AppState>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response<Body> {
+fn local_request_body_limit_label(limit: usize) -> String {
+    const MIB: usize = 1024 * 1024;
+    if limit % MIB == 0 {
+        format!("{} MiB（{limit} 字节）", limit / MIB)
+    } else {
+        format!("{limit} 字节")
+    }
+}
+
+fn local_request_body_too_large_response(limit: usize) -> Response<Body> {
+    let label = local_request_body_limit_label(limit);
+    let body = serde_json::json!({
+        "error": {
+            "message": format!("AI Gateway 本地请求体超过 {label} 限制"),
+            "type": "local_request_body_too_large",
+            "code": "local_request_body_too_large",
+            "limit_bytes": limit,
+        }
+    });
+    Response::builder()
+        .status(StatusCode::PAYLOAD_TOO_LARGE)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+fn is_request_body_limit_error(error: &axum::Error) -> bool {
+    let mut current: Option<&(dyn StdError + 'static)> = Some(error);
+    while let Some(source) = current {
+        if source.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        current = source.source();
+    }
+    false
+}
+
+async fn read_local_request_body(
+    state: &AppState,
+    request_path: &str,
+    headers: &HeaderMap,
+    body: Body,
+    limit: usize,
+) -> Result<Bytes, Response<Body>> {
+    let declared_size = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if let Some(size) = declared_size.filter(|size| *size > limit as u64) {
+        let label = local_request_body_limit_label(limit);
+        push_log(
+            state,
+            "warning",
+            format!("本地请求体被拒绝（{request_path}）：声明 {size} 字节，超过 {label} 限制"),
+            None,
+        );
+        return Err(local_request_body_too_large_response(limit));
+    }
+
+    match to_bytes(body, limit).await {
+        Ok(body) => Ok(body),
+        Err(error) if is_request_body_limit_error(&error) => {
+            let label = local_request_body_limit_label(limit);
+            push_log(
+                state,
+                "warning",
+                format!("本地请求体被拒绝（{request_path}）：实际读取超过 {label} 限制"),
+                None,
+            );
+            Err(local_request_body_too_large_response(limit))
+        }
+        Err(error) => {
+            // 正文传输损坏属于客户端请求错误，与本地大小上限和真实上游故障都无关。
+            let detail: String = error.to_string().chars().take(180).collect();
+            push_log(
+                state,
+                "warning",
+                format!("无法读取本地请求体（{request_path}）：{detail}"),
+                None,
+            );
+            Err(json_error(StatusCode::BAD_REQUEST, "无法读取请求体"))
+        }
+    }
+}
+
+async fn proxy_request(State(state): State<AppState>, request: Request<Body>) -> Response<Body> {
     if !state.running.load(Ordering::Relaxed) {
         return json_error(StatusCode::SERVICE_UNAVAILABLE, "本地网关已停止");
     }
+    let (parts, request_body) = request.into_parts();
+    let method = parts.method;
+    let uri = parts.uri;
+    let headers = parts.headers;
     let token = state.settings.read().unwrap().local_token.clone();
     if !auth_valid(&headers, &token) {
         return json_error(StatusCode::UNAUTHORIZED, "本地访问令牌无效");
     }
+    let request_path = uri.path().to_string();
+    // 鉴权完成后才允许分配大请求缓冲区，避免未授权的本机进程消耗最多 200 MiB 内存。
+    let body = match read_local_request_body(
+        &state,
+        &request_path,
+        &headers,
+        request_body,
+        MAX_LOCAL_REQUEST_BODY_BYTES,
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     let model = request_model(&body);
     let body_bytes = body.len();
     // 每个请求固定使用进入网关时的策略快照；页面保存的新规则只影响后续请求。
@@ -1505,8 +2351,6 @@ async fn proxy_request(
     let mut first_failed_provider = None;
     let mut first_failure_reason = None;
     let mut attempts = Vec::new();
-    let request_path = uri.path().to_string();
-
     for provider in candidates {
         let (available, payload_allowed) = {
             let mut health = state.health.lock().unwrap();
@@ -1836,9 +2680,11 @@ async fn proxy_request(
                         let observation = status.is_success().then(|| ResponseStreamContext {
                             state: state.clone(),
                             provider_id: provider.id.clone(),
+                            provider_name: provider.name.clone(),
                             model: model.clone(),
                             request_path: request_path.clone(),
                             policy: policy.clone(),
+                            usage_kind: prepared.usage_response_kind(),
                         });
                         return response_to_axum(prepared, observation);
                     }
@@ -1937,9 +2783,11 @@ async fn proxy_request(
 struct ResponseStreamContext {
     state: AppState,
     provider_id: String,
+    provider_name: String,
     model: Option<String>,
     request_path: String,
     policy: RoutingPolicy,
+    usage_kind: UsageResponseKind,
 }
 
 struct ObservedResponseStream {
@@ -1947,15 +2795,18 @@ struct ObservedResponseStream {
     context: ResponseStreamContext,
     finished: bool,
     failed: bool,
+    usage: UsageCollector,
 }
 
 impl ObservedResponseStream {
     fn new(stream: GatewayByteStream, context: ResponseStreamContext) -> Self {
+        let usage = UsageCollector::new(context.usage_kind);
         Self {
             inner: stream,
             context,
             finished: false,
             failed: false,
+            usage,
         }
     }
 }
@@ -1965,7 +2816,10 @@ impl Stream for ObservedResponseStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.inner.as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(chunk))) => Poll::Ready(Some(Ok(chunk))),
+            Poll::Ready(Some(Ok(chunk))) => {
+                self.usage.observe(&chunk);
+                Poll::Ready(Some(Ok(chunk)))
+            }
             Poll::Ready(Some(Err(error))) => {
                 if !self.failed {
                     self.failed = true;
@@ -1993,8 +2847,34 @@ impl Stream for ObservedResponseStream {
                 Poll::Ready(Some(Err(std::io::Error::other("上游流式响应中途断开"))))
             }
             Poll::Ready(None) => {
-                self.finished = true;
-                mark_response_completed(&self.context.state, &self.context.provider_id);
+                if !self.finished {
+                    self.finished = true;
+                    mark_response_completed(&self.context.state, &self.context.provider_id);
+                    let usage = self.usage.finish();
+                    let record = UsageRecord {
+                        completed_at: Utc::now(),
+                        provider_id: self.context.provider_id.clone(),
+                        provider_name: self.context.provider_name.clone(),
+                        model: self.context.model.clone(),
+                        request_path: self.context.request_path.clone(),
+                        usage,
+                    };
+                    // 每个完成响应只有一次短事务写入；失败只影响统计，绝不能中断已经完成的代理响应。
+                    match persist_usage_record(&self.context.state.store, &record) {
+                        Ok(()) => {
+                            if let Some(app) = self.context.state.app_handle.as_ref() {
+                                let _ = app.emit(
+                                    "usage-updated",
+                                    serde_json::json!({
+                                        "provider_id": record.provider_id,
+                                        "completed_at": record.completed_at,
+                                    }),
+                                );
+                            }
+                        }
+                        Err(error) => warn!(%error, "usage persistence failed"),
+                    }
+                }
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
@@ -2127,6 +3007,38 @@ async fn log_cleanup_loop(state: AppState) {
         if let Err(error) = prune_state_logs(&state, retention_days) {
             warn!(%error, "scheduled event log cleanup failed");
         }
+        let usage_retention_days = state.settings.read().unwrap().usage_retention_days;
+        if let Err(error) = prune_expired_usage(&state.store, usage_retention_days) {
+            warn!(%error, "scheduled usage cleanup failed");
+        }
+    }
+}
+
+async fn codex_config_watch_loop(state: AppState) {
+    loop {
+        sleep(StdDuration::from_secs(3)).await;
+        let fingerprint = match codex_integration::config_fingerprint() {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(%error, "Codex config fingerprint check failed");
+                continue;
+            }
+        };
+        let changed = {
+            let mut observed = state.codex_config_fingerprint.lock().unwrap();
+            if observed.as_ref() == Some(&fingerprint) {
+                false
+            } else {
+                *observed = Some(fingerprint);
+                true
+            }
+        };
+        if changed {
+            // 外部写入只触发重新识别，不自动覆盖 CC-Switch 或用户选择的 Provider。
+            if let Some(app) = state.app_handle.as_ref() {
+                let _ = app.emit("codex-config-changed", ());
+            }
+        }
     }
 }
 
@@ -2163,28 +3075,231 @@ fn configuration_snapshot(state: &AppState, autostart_enabled: bool) -> Configur
     }
 }
 
+fn gateway_codex_configuration(
+    settings: &RouterSettings,
+) -> codex_integration::GatewayCodexConfiguration {
+    codex_integration::GatewayCodexConfiguration {
+        port: settings.port,
+        local_token: settings.local_token.clone(),
+    }
+}
+
+fn codex_last_switched_at(state: &AppState) -> Option<String> {
+    setting(&state.store, "codex_last_switched_at")
+        .ok()
+        .flatten()
+        .filter(|value| !value.is_empty())
+}
+
+fn codex_last_history_migration_at(state: &AppState) -> Option<String> {
+    setting(&state.store, "codex_last_history_migration_at")
+        .ok()
+        .flatten()
+        .filter(|value| !value.is_empty())
+}
+
+fn observe_codex_config_fingerprint(state: &AppState, fingerprint: String) {
+    *state.codex_config_fingerprint.lock().unwrap() = Some(fingerprint);
+}
+
+fn persist_codex_management_metadata(
+    state: &AppState,
+    update_switched_at: bool,
+) -> Result<Option<String>, String> {
+    let fingerprint = codex_integration::config_fingerprint()?;
+    let switched_at =
+        update_switched_at.then(|| Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
+    let mut conn = state
+        .store
+        .connection
+        .lock()
+        .map_err(|_| "数据库锁已损坏".to_string())?;
+    let transaction = conn.transaction().map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "INSERT INTO settings(key,value) VALUES('codex_managed_config_hash',?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![fingerprint],
+        )
+        .map_err(|error| error.to_string())?;
+    if let Some(value) = switched_at.as_ref() {
+        transaction
+            .execute(
+                "INSERT INTO settings(key,value) VALUES('codex_last_switched_at',?1)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![value],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    observe_codex_config_fingerprint(state, fingerprint);
+    Ok(switched_at)
+}
+
+#[tauri::command]
+fn get_codex_integration_state(
+    state: TauriState<'_, AppState>,
+) -> codex_integration::CodexIntegrationState {
+    let configuration = gateway_codex_configuration(&state.settings.read().unwrap());
+    let login = state.codex_login_status.lock().unwrap().clone();
+    codex_integration::integration_state(
+        &configuration,
+        codex_last_switched_at(&state),
+        codex_last_history_migration_at(&state),
+        login,
+    )
+}
+
+#[tauri::command]
+fn refresh_codex_login_status(
+    state: TauriState<'_, AppState>,
+) -> codex_integration::CodexIntegrationState {
+    let configuration = gateway_codex_configuration(&state.settings.read().unwrap());
+    let login = codex_integration::login_status();
+    *state.codex_login_status.lock().unwrap() = login.clone();
+    codex_integration::integration_state(
+        &configuration,
+        codex_last_switched_at(&state),
+        codex_last_history_migration_at(&state),
+        login,
+    )
+}
+
+#[tauri::command]
+fn preview_codex_history_migration(
+    state: TauriState<'_, AppState>,
+) -> Result<codex_integration::CodexHistoryMigrationPreview, String> {
+    let snapshot = codex_integration::scan_history()?;
+    let preview = snapshot.preview.clone();
+    *state.codex_history_preview.lock().unwrap() = Some(snapshot);
+    Ok(preview)
+}
+
+#[tauri::command]
+fn apply_codex_history_migration(
+    preview_id: String,
+    state: TauriState<'_, AppState>,
+) -> Result<codex_integration::CodexHistoryMigrationResult, String> {
+    let snapshot = state
+        .codex_history_preview
+        .lock()
+        .unwrap()
+        .take()
+        .ok_or_else(|| "迁移预览已失效，请重新扫描会话".to_string())?;
+    if snapshot.preview.preview_id != preview_id {
+        return Err("迁移预览不匹配，请重新扫描会话".to_string());
+    }
+    let result = codex_integration::apply_history_migration(&snapshot)?;
+    save_setting(
+        &state.store,
+        "codex_last_history_migration_at",
+        &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+    )?;
+    push_log(
+        &state,
+        "info",
+        "Codex 本地会话 Provider 已统一为 custom",
+        None,
+    );
+    Ok(result)
+}
+
+#[tauri::command]
+fn restore_codex_history_migration(
+    state: TauriState<'_, AppState>,
+) -> Result<codex_integration::CodexHistoryRestoreResult, String> {
+    let result = codex_integration::restore_latest_history_migration()?;
+    *state.codex_history_preview.lock().unwrap() = None;
+    push_log(&state, "info", "已恢复最近一次 Codex 会话迁移", None);
+    Ok(result)
+}
+
+#[tauri::command]
+fn switch_codex_connection_mode(
+    mode: codex_integration::CodexConnectionMode,
+    state: TauriState<'_, AppState>,
+) -> Result<codex_integration::SwitchCodexModeResult, String> {
+    let configuration = gateway_codex_configuration(&state.settings.read().unwrap());
+    let mut result = codex_integration::switch_mode(mode, &configuration)?;
+    if result.changed {
+        if let Err(error) = persist_codex_management_metadata(&state, true) {
+            // config.toml 已完成可靠替换时不谎报切换失败；元数据可在后续修复时重建。
+            result.warning_messages.push(format!(
+                "Codex 模式已切换，但本地管理元数据保存失败：{error}"
+            ));
+        }
+        push_log(
+            &state,
+            "info",
+            match result.current_mode {
+                codex_integration::CodexConnectionMode::Official => {
+                    "Codex 已切换为 OpenAI 官方直连模式"
+                }
+                codex_integration::CodexConnectionMode::Gateway => {
+                    "Codex 已切换为 AI Gateway 第三方模式"
+                }
+                codex_integration::CodexConnectionMode::External => unreachable!(),
+            },
+            None,
+        );
+        if let Some(app) = state.app_handle.as_ref() {
+            let _ = app.emit("codex-config-changed", ());
+        }
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+fn repair_codex_gateway_configuration(
+    state: TauriState<'_, AppState>,
+) -> Result<codex_integration::SwitchCodexModeResult, String> {
+    let configuration = gateway_codex_configuration(&state.settings.read().unwrap());
+    let mut result = codex_integration::repair_gateway_configuration(&configuration)?;
+    if result.changed {
+        if let Err(error) = persist_codex_management_metadata(&state, true) {
+            result.warning_messages.push(format!(
+                "Codex 配置已修复，但本地管理元数据保存失败：{error}"
+            ));
+        }
+        push_log(&state, "info", "Codex 的 AI Gateway 接入配置已修复", None);
+        if let Some(app) = state.app_handle.as_ref() {
+            let _ = app.emit("codex-config-changed", ());
+        }
+    }
+    Ok(result)
+}
+
 fn save_configuration_state(state: &AppState, input: &ConfigurationInput) -> Result<(), String> {
+    validate_port(input.port)?;
     validate_probe_interval(input.probe_interval_sec)?;
     validate_log_retention_days(input.log_retention_days)?;
+    validate_usage_retention_days(input.usage_retention_days)?;
     validate_routing_policy(&input.routing_policy)?;
     persist_configuration(
         &state.store,
+        input.port,
         input.probe_interval_sec,
         input.log_retention_days,
+        input.usage_retention_days,
         &input.routing_policy,
     )?;
 
     // 同时持有两把写锁后再替换快照，确保事务成功前运行时永远看不到新配置。
     let mut settings = state.settings.write().unwrap();
     let mut policy = state.policy.write().unwrap();
+    settings.port = input.port;
     settings.probe_interval_sec = input.probe_interval_sec;
     settings.log_retention_days = input.log_retention_days;
+    settings.usage_retention_days = input.usage_retention_days;
     *policy = input.routing_policy.clone();
     drop(policy);
     drop(settings);
     // 缩短保留期限时立即清理；清理失败不回滚已提交配置，后台任务会在下一小时重试。
     if let Err(error) = prune_state_logs(state, input.log_retention_days) {
         warn!(%error, "event log cleanup after configuration save failed");
+    }
+    if let Err(error) = prune_expired_usage(&state.store, input.usage_retention_days) {
+        warn!(%error, "usage cleanup after configuration save failed");
     }
     Ok(())
 }
@@ -2201,39 +3316,110 @@ fn get_configuration(
     Ok(configuration_snapshot(&state, autostart_enabled))
 }
 
+async fn apply_configuration(
+    input: ConfigurationInput,
+    app: &tauri::AppHandle,
+    state: &AppState,
+) -> Result<ConfigurationSnapshot, String> {
+    validate_port(input.port)?;
+    validate_probe_interval(input.probe_interval_sec)?;
+    validate_log_retention_days(input.log_retention_days)?;
+    validate_usage_retention_days(input.usage_retention_days)?;
+    validate_routing_policy(&input.routing_policy)?;
+
+    // 新端口必须在任何持久化之前完成预绑定；失败时旧监听和全部配置保持不变。
+    let listener = prepare_gateway_listener(state, input.port).await?;
+    let previous_settings = state.settings.read().unwrap().clone();
+    let previous_port = previous_settings.port;
+    let previous_codex = gateway_codex_configuration(&previous_settings);
+    let next_codex = codex_integration::GatewayCodexConfiguration {
+        port: input.port,
+        local_token: previous_settings.local_token.clone(),
+    };
+    let autolaunch = app.autolaunch();
+    let current_autostart = autolaunch
+        .is_enabled()
+        .map_err(|error| format!("无法读取开机启动状态：{error}"))?;
+    let set_autostart = |enabled: bool| {
+        if enabled {
+            autolaunch.enable()
+        } else {
+            autolaunch.disable()
+        }
+    };
+    if current_autostart != input.autostart_enabled {
+        set_autostart(input.autostart_enabled)
+            .map_err(|error| format!("开机启动更新失败，未保存其他配置：{error}"))?;
+    }
+    let actual_autostart = autolaunch
+        .is_enabled()
+        .map_err(|error| format!("无法确认开机启动状态，未保存其他配置：{error}"))?;
+    if actual_autostart != input.autostart_enabled {
+        let _ = set_autostart(current_autostart);
+        return Err("开机启动状态未按预期生效，未保存其他配置".to_string());
+    }
+
+    // 第三方接管时，Codex Provider 与监听端口是一份配置。所有外部状态都先保留旧值，
+    // 后续任一步失败都会补偿恢复，确保旧监听、SQLite 与 Codex 配置仍指向同一端口。
+    let codex_configuration_changed = if previous_codex.port != next_codex.port {
+        match codex_integration::update_managed_gateway_configuration(&previous_codex, &next_codex)
+        {
+            Ok(result) => result.is_some(),
+            Err(error) => {
+                if current_autostart != input.autostart_enabled {
+                    let _ = set_autostart(current_autostart);
+                }
+                return Err(error);
+            }
+        }
+    } else {
+        false
+    };
+    if let Err(error) = save_configuration_state(state, &input) {
+        if codex_configuration_changed {
+            let _ = codex_integration::update_managed_gateway_configuration(
+                &next_codex,
+                &previous_codex,
+            );
+        }
+        if current_autostart != input.autostart_enabled {
+            let _ = set_autostart(current_autostart);
+        }
+        return Err(error);
+    }
+    if codex_configuration_changed {
+        // SQLite 主配置提交成功后再记录受管指纹，避免失败事务被误认为当前有效配置。
+        if let Err(error) = persist_codex_management_metadata(state, false) {
+            warn!(%error, "Codex managed configuration metadata update failed");
+        }
+    }
+    if let Some(listener) = listener {
+        activate_gateway_listener(state.clone(), listener, input.port);
+    }
+
+    if previous_port != input.port {
+        push_log(
+            state,
+            "info",
+            format!(
+                "本地网关已从 {DEFAULT_BIND}:{previous_port} 切换到 {DEFAULT_BIND}:{}",
+                input.port
+            ),
+            None,
+        );
+    } else {
+        push_log(state, "info", "配置中心设置已更新", None);
+    }
+    Ok(configuration_snapshot(state, actual_autostart))
+}
+
 #[tauri::command]
-fn save_configuration(
+async fn save_configuration(
     input: ConfigurationInput,
     app: tauri::AppHandle,
     state: TauriState<'_, AppState>,
 ) -> Result<ConfigurationSnapshot, String> {
-    save_configuration_state(&state, &input)?;
-
-    let autolaunch = app.autolaunch();
-    let current_autostart = autolaunch
-        .is_enabled()
-        .map_err(|error| format!("网关与路由配置已保存，但无法读取开机启动状态：{error}"))?;
-    // Windows 插件删除不存在的注册表值会返回 os error 2；目标状态已经满足时必须视为成功。
-    let autostart_result = if current_autostart == input.autostart_enabled {
-        Ok(())
-    } else if input.autostart_enabled {
-        autolaunch.enable()
-    } else {
-        autolaunch.disable()
-    };
-    if let Err(error) = autostart_result {
-        return Err(format!("网关与路由配置已保存，但开机启动更新失败：{error}"));
-    }
-
-    let actual_autostart = autolaunch
-        .is_enabled()
-        .map_err(|error| format!("网关与路由配置已保存，但无法确认开机启动状态：{error}"))?;
-    if actual_autostart != input.autostart_enabled {
-        return Err("网关与路由配置已保存，但开机启动状态未按预期生效".to_string());
-    }
-
-    push_log(&state, "info", "配置中心设置已更新", None);
-    Ok(configuration_snapshot(&state, actual_autostart))
+    apply_configuration(input, &app, &state).await
 }
 
 #[tauri::command]
@@ -2369,6 +3555,14 @@ fn get_runtime_stats(state: TauriState<'_, AppState>) -> Result<RuntimeStats, St
 }
 
 #[tauri::command]
+fn get_usage_statistics(
+    query: UsageQuery,
+    state: TauriState<'_, AppState>,
+) -> Result<UsageStatistics, String> {
+    query_usage_statistics(&state, &query)
+}
+
+#[tauri::command]
 fn get_recent_logs(state: TauriState<'_, AppState>) -> Result<Vec<EventLog>, String> {
     Ok(state
         .logs
@@ -2392,28 +3586,42 @@ fn reload_config(state: TauriState<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 #[tauri::command]
-fn save_router_settings(
+async fn save_router_settings(
     port: u16,
     probe_interval_sec: u64,
+    app: tauri::AppHandle,
     state: TauriState<'_, AppState>,
 ) -> Result<RouterSettings, String> {
-    if port != DEFAULT_PORT {
-        return Err(format!("当前版本固定监听端口 {DEFAULT_PORT}"));
-    }
-    validate_probe_interval(probe_interval_sec)?;
-    save_setting(
-        &state.store,
-        "probe_interval_sec",
-        &probe_interval_sec.to_string(),
-    )?;
-    state.settings.write().unwrap().probe_interval_sec = probe_interval_sec;
-    Ok(state.settings.read().unwrap().clone())
+    let current = state.settings.read().unwrap().clone();
+    let routing_policy = state.policy.read().unwrap().clone();
+    let autostart_enabled = app
+        .autolaunch()
+        .is_enabled()
+        .map_err(|error| format!("无法读取开机启动状态：{error}"))?;
+    let snapshot = apply_configuration(
+        ConfigurationInput {
+            port,
+            probe_interval_sec,
+            log_retention_days: current.log_retention_days,
+            usage_retention_days: current.usage_retention_days,
+            routing_policy,
+            autostart_enabled,
+        },
+        &app,
+        &state,
+    )
+    .await?;
+    Ok(snapshot.router_settings)
 }
 #[tauri::command]
 fn save_provider(
     input: ProviderInput,
     state: TauriState<'_, AppState>,
 ) -> Result<ProviderDto, String> {
+    save_provider_inner(input, &state)
+}
+
+fn save_provider_inner(input: ProviderInput, state: &AppState) -> Result<ProviderDto, String> {
     let id = input.id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let mut providers = state.config.write().unwrap();
     let old = providers.iter().find(|item| item.id == id).cloned();
@@ -2426,23 +3634,50 @@ fn save_provider(
     if !(1000..=600000).contains(&timeout_ms) {
         return Err("请求超时必须在 1000 到 600000 毫秒之间".to_string());
     }
-    // 编辑时允许留空以保留原密钥；数据库事务中永远不会出现密钥明文。
-    let api_key = match input.api_key.filter(|value| !value.trim().is_empty()) {
-        Some(value) => {
-            let value = value.trim().to_string();
-            state
-                .secrets
-                .set(&id, &value)
-                .map_err(|error| format!("API Key 无法保存到系统密钥库：{error}"))?;
-            value
-        }
-        None => old
-            .as_ref()
-            .map(|item| item.api_key.clone())
-            .unwrap_or_default(),
-    };
+    let previous_secret = state
+        .secrets
+        .get(&id)
+        .map_err(|error| format!("无法读取现有 Windows 凭据，未保存任何修改：{error}"))?;
+    let submitted_secret = input
+        .api_key
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string());
+    let runtime_secret = old
+        .as_ref()
+        .map(|item| item.api_key.clone())
+        .unwrap_or_default();
+
+    // 留空时优先保留系统凭据；凭据缺失但旧请求仍持有内存密钥时主动修复。
+    // 只有真正写过凭据才需要在数据库失败时执行补偿。
+    let api_key = submitted_secret
+        .clone()
+        .or_else(|| previous_secret.clone().filter(|value| !value.is_empty()))
+        .unwrap_or(runtime_secret);
     if api_key.is_empty() {
-        return Err("API Key 不能为空".to_string());
+        return Err(old
+            .and_then(|item| item.api_key_error)
+            .unwrap_or_else(|| "API Key 不能为空；旧版已丢失的密钥需要重新填写一次".to_string()));
+    }
+    let should_write_secret = submitted_secret.is_some()
+        || previous_secret
+            .as_ref()
+            .map(|value| value.is_empty())
+            .unwrap_or(true);
+    if should_write_secret {
+        if let Err(error) = save_and_verify_provider_secret(state.secrets.as_ref(), &id, &api_key) {
+            return match restore_provider_secret(
+                state.secrets.as_ref(),
+                &id,
+                previous_secret.as_deref(),
+            ) {
+                Ok(()) => Err(format!(
+                    "API Key 无法保存到 Windows 凭据管理器，原密钥已恢复：{error}"
+                )),
+                Err(rollback_error) => Err(format!(
+                    "API Key 保存和原密钥恢复均失败：{error}；{rollback_error}"
+                )),
+            };
+        }
     }
     let provider = ProviderConfig {
         id: id.clone(),
@@ -2458,13 +3693,34 @@ fn save_provider(
         enabled: input.enabled.unwrap_or(true),
         timeout_ms,
         api_key,
+        api_key_error: None,
     };
-    let conn = state
+    let models_json = serde_json::to_string(&provider.models).map_err(|error| error.to_string())?;
+    let database_result = state
         .store
         .connection
         .lock()
-        .map_err(|_| "数据库锁已损坏".to_string())?;
-    conn.execute("INSERT INTO providers(id,name,base_url,models_json,priority,enabled,timeout_ms,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,datetime('now')) ON CONFLICT(id) DO UPDATE SET name=excluded.name,base_url=excluded.base_url,models_json=excluded.models_json,priority=excluded.priority,enabled=excluded.enabled,timeout_ms=excluded.timeout_ms", params![provider.id, provider.name, provider.base_url, serde_json::to_string(&provider.models).unwrap(), provider.priority, provider.enabled as i64, provider.timeout_ms as i64]).map_err(|e| e.to_string())?;
+        .map_err(|_| "数据库锁已损坏".to_string())
+        .and_then(|conn| {
+            conn.execute("INSERT INTO providers(id,name,base_url,models_json,priority,enabled,timeout_ms,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,datetime('now')) ON CONFLICT(id) DO UPDATE SET name=excluded.name,base_url=excluded.base_url,models_json=excluded.models_json,priority=excluded.priority,enabled=excluded.enabled,timeout_ms=excluded.timeout_ms", params![provider.id, provider.name, provider.base_url, models_json, provider.priority, provider.enabled as i64, provider.timeout_ms as i64])
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        });
+    if let Err(error) = database_result {
+        if should_write_secret {
+            return match restore_provider_secret(
+                state.secrets.as_ref(),
+                &id,
+                previous_secret.as_deref(),
+            ) {
+                Ok(()) => Err(format!("中转配置保存失败，API Key 已恢复：{error}")),
+                Err(rollback_error) => Err(format!(
+                    "中转配置保存失败，且旧 API Key 无法自动恢复：{error}；{rollback_error}"
+                )),
+            };
+        }
+        return Err(format!("中转配置保存失败：{error}"));
+    }
     if let Some(existing) = providers.iter_mut().find(|item| item.id == id) {
         *existing = provider.clone();
     } else {
@@ -2583,6 +3839,99 @@ async fn test_provider(
             Ok(serde_json::json!({"ok": false, "message": error.to_string()}))
         }
     }
+}
+
+fn gateway_router(state: AppState) -> Router {
+    Router::new()
+        .route("/healthz", get(|| async { "ok" }))
+        .route("/v1/*path", any(proxy_request))
+        .with_state(state)
+}
+
+async fn prepare_gateway_listener(
+    state: &AppState,
+    port: u16,
+) -> Result<Option<tokio::net::TcpListener>, String> {
+    validate_port(port)?;
+    if state.gateway.runtime.lock().unwrap().port == Some(port) {
+        return Ok(None);
+    }
+    let address = format!("{DEFAULT_BIND}:{port}");
+    tokio::net::TcpListener::bind(&address)
+        .await
+        .map(Some)
+        .map_err(|error| format!("本地端口 {address} 无法监听，可能已被占用或无权使用：{error}"))
+}
+
+fn record_gateway_bind_failure(state: &AppState, port: u16, message: String) {
+    state.running.store(false, Ordering::Relaxed);
+    let mut settings = state.settings.write().unwrap();
+    settings.port = port;
+    settings.gateway_running = false;
+    settings.gateway_listening = false;
+    settings.gateway_error = Some(message.clone());
+    drop(settings);
+    push_log(state, "error", message, None);
+}
+
+fn activate_gateway_listener(state: AppState, listener: tokio::net::TcpListener, port: u16) {
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (previous_shutdown, generation) = {
+        let mut runtime = state.gateway.runtime.lock().unwrap();
+        runtime.generation = runtime.generation.wrapping_add(1);
+        let generation = runtime.generation;
+        let previous_shutdown = runtime.shutdown.replace(shutdown_tx);
+        runtime.port = Some(port);
+        (previous_shutdown, generation)
+    };
+    {
+        let mut settings = state.settings.write().unwrap();
+        // 端口占用导致的启动失败在用户选到可用端口后自动恢复；手动暂停状态则保持不变。
+        if !settings.gateway_listening && settings.gateway_error.is_some() {
+            state.running.store(true, Ordering::Relaxed);
+            settings.gateway_running = true;
+        }
+        settings.port = port;
+        settings.gateway_listening = true;
+        settings.gateway_error = None;
+    }
+
+    let server_state = state.clone();
+    tokio::spawn(async move {
+        let result = axum::serve(listener, gateway_router(server_state.clone()))
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+        let is_current = {
+            let mut runtime = server_state.gateway.runtime.lock().unwrap();
+            if runtime.generation == generation {
+                runtime.port = None;
+                runtime.shutdown = None;
+                true
+            } else {
+                false
+            }
+        };
+        if !is_current {
+            return;
+        }
+        let message = result.err().map(|error| format!("本地网关已停止：{error}"));
+        let mut settings = server_state.settings.write().unwrap();
+        settings.gateway_listening = false;
+        settings.gateway_error = message.clone();
+        drop(settings);
+        if let Some(message) = message {
+            push_log(&server_state, "error", message.clone(), None);
+            error!(%message, "gateway stopped");
+        }
+    });
+
+    // 新端口已经绑定并进入服务任务后才关闭旧监听；旧连接由 Axum 优雅结束。
+    if let Some(shutdown) = previous_shutdown {
+        let _ = shutdown.send(());
+    }
+    info!(address = %format!("{DEFAULT_BIND}:{port}"), "local gateway started");
 }
 
 #[tauri::command]
@@ -2718,6 +4067,7 @@ pub fn run() {
             app.manage(state);
             let monitor_state = gateway_state.clone();
             let log_cleanup_state = gateway_state.clone();
+            let codex_watch_state = gateway_state.clone();
             tauri::async_runtime::spawn(async move {
                 health_loop(monitor_state).await;
             });
@@ -2725,40 +4075,19 @@ pub fn run() {
                 log_cleanup_loop(log_cleanup_state).await;
             });
             tauri::async_runtime::spawn(async move {
-                let router = Router::new()
-                    .route("/healthz", get(|| async { "ok" }))
-                    .route("/v1/*path", any(proxy_request))
-                    .with_state(gateway_state.clone());
-                let address: SocketAddr = format!("{DEFAULT_BIND}:{DEFAULT_PORT}").parse().unwrap();
-                let listener = match tokio::net::TcpListener::bind(address).await {
-                    Ok(listener) => listener,
-                    Err(error) => {
-                        let message = format!("本地端口 {address} 监听失败：{error}");
-                        gateway_state.running.store(false, Ordering::Relaxed);
-                        let mut settings = gateway_state.settings.write().unwrap();
-                        settings.gateway_running = false;
-                        settings.gateway_listening = false;
-                        settings.gateway_error = Some(message.clone());
-                        drop(settings);
-                        push_log(&gateway_state, "error", message.clone(), None);
-                        error!(%error, "gateway bind failed");
-                        return;
+                codex_config_watch_loop(codex_watch_state).await;
+            });
+            tauri::async_runtime::spawn(async move {
+                let port = gateway_state.settings.read().unwrap().port;
+                match prepare_gateway_listener(&gateway_state, port).await {
+                    Ok(Some(listener)) => {
+                        activate_gateway_listener(gateway_state.clone(), listener, port)
                     }
-                };
-                {
-                    let mut settings = gateway_state.settings.write().unwrap();
-                    settings.gateway_listening = true;
-                    settings.gateway_error = None;
-                }
-                info!(%address, "local gateway started");
-                if let Err(error) = axum::serve(listener, router).await {
-                    let message = format!("本地网关已停止：{error}");
-                    let mut settings = gateway_state.settings.write().unwrap();
-                    settings.gateway_listening = false;
-                    settings.gateway_error = Some(message.clone());
-                    drop(settings);
-                    push_log(&gateway_state, "error", message, None);
-                    error!(%error, "gateway stopped");
+                    Ok(None) => {}
+                    Err(message) => {
+                        record_gateway_bind_failure(&gateway_state, port, message.clone());
+                        error!(%message, "gateway bind failed");
+                    }
                 }
             });
             let show = MenuItem::with_id(app, "show", "显示控制台", true, None::<&str>)?;
@@ -2808,10 +4137,18 @@ pub fn run() {
             get_routing_policy,
             get_configuration,
             save_configuration,
+            get_codex_integration_state,
+            switch_codex_connection_mode,
+            refresh_codex_login_status,
+            repair_codex_gateway_configuration,
+            preview_codex_history_migration,
+            apply_codex_history_migration,
+            restore_codex_history_migration,
             save_routing_policy,
             list_route_groups,
             update_route_group,
             get_runtime_stats,
+            get_usage_statistics,
             get_recent_logs,
             reload_config,
             save_router_settings,
@@ -2840,6 +4177,53 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use tower::ServiceExt;
 
+    struct VolatileProviderSecretStore {
+        value: Mutex<Option<String>>,
+    }
+
+    impl ProviderSecretStore for VolatileProviderSecretStore {
+        fn get(&self, _id: &str) -> Result<Option<String>, String> {
+            // 模拟旧版 Mock 后端：写入对象销毁后，新读取对象看不到任何凭据。
+            Ok(None)
+        }
+
+        fn set(&self, _id: &str, value: &str) -> Result<(), String> {
+            *self.value.lock().unwrap() = Some(value.to_string());
+            Ok(())
+        }
+
+        fn delete(&self, _id: &str) -> Result<(), String> {
+            *self.value.lock().unwrap() = None;
+            Ok(())
+        }
+    }
+
+    struct OneTimeUnreadableSecretStore {
+        value: Mutex<Option<String>>,
+        rejected: AtomicBool,
+    }
+
+    impl ProviderSecretStore for OneTimeUnreadableSecretStore {
+        fn get(&self, _id: &str) -> Result<Option<String>, String> {
+            let value = self.value.lock().unwrap().clone();
+            if value.as_deref() == Some("new-secret") && !self.rejected.swap(true, Ordering::SeqCst)
+            {
+                return Ok(None);
+            }
+            Ok(value)
+        }
+
+        fn set(&self, _id: &str, value: &str) -> Result<(), String> {
+            *self.value.lock().unwrap() = Some(value.to_string());
+            Ok(())
+        }
+
+        fn delete(&self, _id: &str) -> Result<(), String> {
+            *self.value.lock().unwrap() = None;
+            Ok(())
+        }
+    }
+
     fn test_provider(id: &str, base_url: String, priority: i64) -> ProviderConfig {
         ProviderConfig {
             id: id.to_string(),
@@ -2850,6 +4234,7 @@ mod tests {
             enabled: true,
             timeout_ms: 2_000,
             api_key: "test-key".to_string(),
+            api_key_error: None,
         }
     }
 
@@ -2864,6 +4249,7 @@ mod tests {
                 local_token: "local-test-token".to_string(),
                 probe_interval_sec: 30,
                 log_retention_days: DEFAULT_LOG_RETENTION_DAYS,
+                usage_retention_days: DEFAULT_USAGE_RETENTION_DAYS,
                 gateway_running: true,
                 gateway_listening: true,
                 gateway_error: None,
@@ -2877,6 +4263,10 @@ mod tests {
             logs: Arc::new(Mutex::new(VecDeque::new())),
             policy: Arc::new(RwLock::new(RoutingPolicy::default())),
             secrets: Arc::new(MemoryProviderSecretStore::default()),
+            gateway: Arc::new(GatewayController::default()),
+            codex_config_fingerprint: Arc::new(Mutex::new(None)),
+            codex_history_preview: Arc::new(Mutex::new(None)),
+            codex_login_status: Arc::new(Mutex::new(codex_integration::CodexLoginStatus::Unknown)),
             app_handle: None,
         }
     }
@@ -2901,9 +4291,162 @@ mod tests {
                     model TEXT,
                     event_type TEXT,
                     routing_event_json TEXT
+                );
+                CREATE TABLE usage_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    completed_at TEXT NOT NULL,
+                    provider_id TEXT NOT NULL,
+                    provider_name TEXT NOT NULL,
+                    model TEXT,
+                    request_path TEXT NOT NULL,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cached_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    total_tokens INTEGER,
+                    usage_reported INTEGER NOT NULL
                 );",
             )
             .unwrap();
+    }
+
+    #[test]
+    fn configured_keyring_backend_is_persistent() {
+        assert!(matches!(
+            default::default_credential_builder().persistence(),
+            CredentialPersistence::UntilDelete
+        ));
+        assert!(validate_system_secret_store().is_ok());
+    }
+
+    #[test]
+    fn secret_verification_rejects_non_persistent_store() {
+        let secrets = VolatileProviderSecretStore {
+            value: Mutex::new(None),
+        };
+
+        let error = save_and_verify_provider_secret(&secrets, "provider", "secret")
+            .expect_err("回读不到刚写入的密钥时必须拒绝保存");
+
+        assert!(error.contains("写入后未找到"));
+    }
+
+    #[test]
+    fn restoring_provider_secret_reinstates_previous_value_or_deletes_new_entry() {
+        let secrets = MemoryProviderSecretStore::default();
+        secrets.set("provider", "new-secret").unwrap();
+        restore_provider_secret(&secrets, "provider", Some("old-secret")).unwrap();
+        assert_eq!(
+            secrets.get("provider").unwrap().as_deref(),
+            Some("old-secret")
+        );
+
+        restore_provider_secret(&secrets, "provider", None).unwrap();
+        assert!(secrets.get("provider").unwrap().is_none());
+    }
+
+    #[test]
+    fn provider_verification_failure_restores_previous_secret() {
+        let provider = test_provider("provider", "https://example.com/v1".to_string(), 1);
+        let mut state = test_state(vec![provider]);
+        let secrets = Arc::new(OneTimeUnreadableSecretStore {
+            value: Mutex::new(Some("old-secret".to_string())),
+            rejected: AtomicBool::new(false),
+        });
+        state.secrets = secrets.clone();
+
+        let error = save_provider_inner(
+            ProviderInput {
+                id: Some("provider".to_string()),
+                name: "更新后的中转".to_string(),
+                base_url: "https://example.com/v1".to_string(),
+                models: Vec::new(),
+                priority: Some(1),
+                enabled: Some(true),
+                timeout_ms: Some(120_000),
+                api_key: Some("new-secret".to_string()),
+            },
+            &state,
+        )
+        .expect_err("凭据回读失败时必须取消保存");
+
+        assert!(error.contains("原密钥已恢复"));
+        assert_eq!(
+            secrets.get("provider").unwrap().as_deref(),
+            Some("old-secret")
+        );
+        assert_eq!(state.config.read().unwrap()[0].name, "provider");
+    }
+
+    #[test]
+    fn provider_database_failure_restores_previous_secret() {
+        let provider = test_provider("provider", "https://example.com/v1".to_string(), 1);
+        let mut state = test_state(vec![provider]);
+        let secrets = Arc::new(MemoryProviderSecretStore::default());
+        secrets.set("provider", "old-secret").unwrap();
+        state.secrets = secrets.clone();
+
+        let error = save_provider_inner(
+            ProviderInput {
+                id: Some("provider".to_string()),
+                name: "更新后的中转".to_string(),
+                base_url: "https://example.com/v1".to_string(),
+                models: Vec::new(),
+                priority: Some(1),
+                enabled: Some(true),
+                timeout_ms: Some(120_000),
+                api_key: Some("new-secret".to_string()),
+            },
+            &state,
+        )
+        .expect_err("未创建 providers 表时数据库写入必须失败");
+
+        assert!(error.contains("API Key 已恢复"));
+        assert_eq!(
+            secrets.get("provider").unwrap().as_deref(),
+            Some("old-secret")
+        );
+        assert_eq!(state.config.read().unwrap()[0].name, "provider");
+    }
+
+    #[test]
+    fn new_provider_database_failure_removes_orphan_secret() {
+        let mut state = test_state(Vec::new());
+        let secrets = Arc::new(MemoryProviderSecretStore::default());
+        state.secrets = secrets.clone();
+
+        let error = save_provider_inner(
+            ProviderInput {
+                id: Some("new-provider".to_string()),
+                name: "新中转".to_string(),
+                base_url: "https://example.com/v1".to_string(),
+                models: Vec::new(),
+                priority: Some(1),
+                enabled: Some(true),
+                timeout_ms: Some(120_000),
+                api_key: Some("new-secret".to_string()),
+            },
+            &state,
+        )
+        .expect_err("未创建 providers 表时数据库写入必须失败");
+
+        assert!(error.contains("API Key 已恢复"));
+        assert!(secrets.get("new-provider").unwrap().is_none());
+        assert!(state.config.read().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_credential_manager_round_trips_across_new_entries() {
+        let id = format!("ai-gateway-test-{}", Uuid::new_v4());
+        let secret = format!("test-secret-{}", Uuid::new_v4());
+        let store = SystemProviderSecretStore;
+
+        save_and_verify_provider_secret(&store, &id, &secret)
+            .expect("真实 Windows 凭据应能由新 Entry 回读");
+        assert_eq!(store.get(&id).unwrap().as_deref(), Some(secret.as_str()));
+        store.delete(&id).expect("测试凭据应被清理");
+        assert!(store.get(&id).unwrap().is_none());
     }
 
     async fn mock_upstream(status: StatusCode, body: &'static str) -> String {
@@ -2963,6 +4506,39 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (format!("http://{address}/v1"), calls)
+    }
+
+    async fn mock_exact_request_body(
+        expected: Bytes,
+    ) -> (String, Arc<AtomicUsize>, Arc<AtomicBool>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let body_matches = Arc::new(AtomicBool::new(false));
+        let expected = Arc::new(expected);
+        let app = Router::new().fallback(any({
+            let calls = calls.clone();
+            let body_matches = body_matches.clone();
+            move |request: Request<Body>| {
+                let calls = calls.clone();
+                let body_matches = body_matches.clone();
+                let expected = expected.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let received = request.into_body().collect().await.unwrap().to_bytes();
+                    body_matches.store(received == *expected, Ordering::SeqCst);
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"ok":true}"#))
+                        .unwrap()
+                }
+            }
+        }));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}/v1"), calls, body_matches)
     }
 
     async fn mock_delayed_stream(delay: StdDuration) -> String {
@@ -3042,45 +4618,53 @@ mod tests {
         format!("http://{address}/v1")
     }
 
-    async fn call_test_gateway(state: AppState) -> Response<Body> {
-        Router::new()
-            .route("/v1/*path", any(proxy_request))
-            .with_state(state)
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/v1/responses")
-                    .header(header::AUTHORIZATION, "Bearer local-test-token")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"model":"gpt-test","input":"hello"}"#))
-                    .unwrap(),
-            )
+    async fn call_test_gateway_request(
+        state: AppState,
+        body: Body,
+        authorization: &str,
+        content_length: Option<u64>,
+        extra_headers: &[(&str, &str)],
+    ) -> Response<Body> {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/responses")
+            .header(header::AUTHORIZATION, authorization)
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(content_length) = content_length {
+            request = request.header(header::CONTENT_LENGTH, content_length);
+        }
+        for (name, value) in extra_headers {
+            request = request.header(*name, *value);
+        }
+        gateway_router(state)
+            .oneshot(request.body(body).unwrap())
             .await
             .unwrap()
+    }
+
+    async fn call_test_gateway(state: AppState) -> Response<Body> {
+        call_test_gateway_request(
+            state,
+            Body::from(r#"{"model":"gpt-test","input":"hello"}"#),
+            "Bearer local-test-token",
+            None,
+            &[],
+        )
+        .await
     }
 
     async fn call_test_gateway_with_headers(
         state: AppState,
         extra_headers: &[(&str, &str)],
     ) -> Response<Body> {
-        let mut request = Request::builder()
-            .method(Method::POST)
-            .uri("/v1/responses")
-            .header(header::AUTHORIZATION, "Bearer local-test-token")
-            .header(header::CONTENT_TYPE, "application/json");
-        for (name, value) in extra_headers {
-            request = request.header(*name, *value);
-        }
-        Router::new()
-            .route("/v1/*path", any(proxy_request))
-            .with_state(state)
-            .oneshot(
-                request
-                    .body(Body::from(r#"{"model":"gpt-test","input":"hello"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap()
+        call_test_gateway_request(
+            state,
+            Body::from(r#"{"model":"gpt-test","input":"hello"}"#),
+            "Bearer local-test-token",
+            None,
+            extra_headers,
+        )
+        .await
     }
     #[test]
     fn normalizes_v1_url_without_duplicate_path() {
@@ -3108,6 +4692,122 @@ mod tests {
         assert!(should_retry_status(StatusCode::BAD_GATEWAY));
         assert!(!should_retry_status(StatusCode::UNAUTHORIZED));
         assert!(!should_retry_status(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn extracts_model_without_materializing_other_request_fields() {
+        let body = Bytes::from(format!(
+            r#"{{"model":"gpt-large","input":"{}"}}"#,
+            "x".repeat(3 * 1024 * 1024)
+        ));
+
+        assert_eq!(request_model(&body).as_deref(), Some("gpt-large"));
+    }
+
+    #[tokio::test]
+    async fn request_larger_than_axum_default_limit_reaches_upstream_unchanged() {
+        let expected = Bytes::from(format!(
+            r#"{{"model":"gpt-test","input":"{}"}}"#,
+            "x".repeat(3 * 1024 * 1024)
+        ));
+        let (upstream, calls, body_matches) = mock_exact_request_body(expected.clone()).await;
+        let state = test_state(vec![test_provider("primary", upstream, 1)]);
+
+        let response = call_test_gateway_request(
+            state,
+            Body::from(expected.clone()),
+            "Bearer local-test-token",
+            Some(expected.len() as u64),
+            &[],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.into_body().collect().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(body_matches.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn declared_body_over_local_limit_is_rejected_without_routing() {
+        let (upstream, calls) =
+            mock_counted_sequence(vec![(StatusCode::OK, r#"{"ok":true}"#, "application/json")])
+                .await;
+        let state = test_state(vec![test_provider("primary", upstream, 1)]);
+        initialize_test_settings(&state);
+
+        let response = call_test_gateway_request(
+            state.clone(),
+            Body::from(r#"{"model":"gpt-test"}"#),
+            "Bearer local-test-token",
+            Some(MAX_LOCAL_REQUEST_BODY_BYTES as u64 + 1),
+            &[],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            error
+                .pointer("/error/type")
+                .and_then(|value| value.as_str()),
+            Some("local_request_body_too_large")
+        );
+        assert_eq!(
+            error
+                .pointer("/error/limit_bytes")
+                .and_then(|value| value.as_u64()),
+            Some(MAX_LOCAL_REQUEST_BODY_BYTES as u64)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(state.health.lock().unwrap().is_empty());
+        let logs = state.logs.lock().unwrap();
+        let entry = logs.back().expect("本地 413 应记录诊断日志");
+        assert!(entry.message.contains("本地请求体被拒绝"));
+        assert!(entry.provider_id.is_none());
+        assert!(entry.routing_event.is_none());
+    }
+
+    #[tokio::test]
+    async fn streamed_body_over_limit_is_rejected_without_content_length() {
+        let state = test_state(Vec::new());
+        initialize_test_settings(&state);
+        let body = Body::from_stream(stream::iter(vec![
+            Ok::<_, Infallible>(Bytes::from_static(b"12345")),
+            Ok::<_, Infallible>(Bytes::from_static(b"67890")),
+        ]));
+
+        let response = read_local_request_body(&state, "/v1/responses", &HeaderMap::new(), body, 8)
+            .await
+            .expect_err("实际正文超过读取上限时必须拒绝");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            error
+                .pointer("/error/limit_bytes")
+                .and_then(|value| value.as_u64()),
+            Some(8)
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_token_is_rejected_before_large_body_is_read() {
+        let (upstream, calls) =
+            mock_counted_sequence(vec![(StatusCode::OK, r#"{"ok":true}"#, "application/json")])
+                .await;
+        let state = test_state(vec![test_provider("primary", upstream, 1)]);
+
+        let response = call_test_gateway_request(
+            state.clone(),
+            Body::from(r#"{"model":"gpt-test"}"#),
+            "Bearer wrong-token",
+            Some(MAX_LOCAL_REQUEST_BODY_BYTES as u64 + 1),
+            &[],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(state.logs.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -3187,6 +4887,7 @@ mod tests {
             enabled: true,
             timeout_ms: 1000,
             api_key: "key".into(),
+            api_key_error: None,
         };
         assert!(matches_model(&provider, Some("gpt-5")));
         assert!(!matches_model(&provider, Some("claude")));
@@ -3343,8 +5044,10 @@ mod tests {
         let state = test_state(Vec::new());
         initialize_test_settings(&state);
         let input = ConfigurationInput {
+            port: 9876,
             probe_interval_sec: 45,
             log_retention_days: 14,
+            usage_retention_days: 365,
             routing_policy: RoutingPolicy {
                 retry_count: 2,
                 ..RoutingPolicy::default()
@@ -3355,8 +5058,13 @@ mod tests {
         save_configuration_state(&state, &input).unwrap();
 
         assert_eq!(state.settings.read().unwrap().probe_interval_sec, 45);
+        assert_eq!(state.settings.read().unwrap().port, 9876);
         assert_eq!(state.settings.read().unwrap().log_retention_days, 14);
         assert_eq!(state.policy.read().unwrap().retry_count, 2);
+        assert_eq!(
+            setting(&state.store, "port").unwrap().as_deref(),
+            Some("9876")
+        );
         assert_eq!(
             setting(&state.store, "probe_interval_sec")
                 .unwrap()
@@ -3373,6 +5081,158 @@ mod tests {
                 .as_deref(),
             Some("14")
         );
+    }
+
+    #[test]
+    fn configurable_port_validation_and_legacy_default_are_stable() {
+        let state = test_state(Vec::new());
+        initialize_test_settings(&state);
+
+        assert_eq!(load_port(&state.store).unwrap(), DEFAULT_PORT);
+        assert!(validate_port(MIN_CONFIGURABLE_PORT - 1).is_err());
+        assert!(validate_port(MIN_CONFIGURABLE_PORT).is_ok());
+        assert!(validate_port(u16::MAX).is_ok());
+
+        save_setting(&state.store, "port", "9988").unwrap();
+        assert_eq!(load_port(&state.store).unwrap(), 9988);
+    }
+
+    #[test]
+    fn official_identity_headers_are_never_forwarded_to_third_party() {
+        let provider = test_provider("primary", "https://example.com/v1".to_string(), 0);
+        let state = test_state(vec![provider.clone()]);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer official-token".parse().unwrap(),
+        );
+        headers.insert(header::COOKIE, "session=official".parse().unwrap());
+        headers.insert("chatgpt-account-id", "account-1".parse().unwrap());
+        headers.insert("openai-organization", "org-1".parse().unwrap());
+        headers.insert("openai-project", "project-1".parse().unwrap());
+        headers.insert("x-openai-internal", "secret".parse().unwrap());
+        headers.insert("x-chatgpt-session", "secret".parse().unwrap());
+        headers.insert("x-business-header", "keep".parse().unwrap());
+
+        let request = upstream_request(
+            &state,
+            &provider,
+            &Method::POST,
+            Url::parse("https://example.com/v1/responses").unwrap(),
+            &headers,
+            &Bytes::new(),
+        )
+        .build()
+        .unwrap();
+
+        assert_eq!(request.headers()[header::AUTHORIZATION], "Bearer test-key");
+        assert!(!request.headers().contains_key(header::COOKIE));
+        assert!(!request.headers().contains_key("chatgpt-account-id"));
+        assert!(!request.headers().contains_key("openai-organization"));
+        assert!(!request.headers().contains_key("openai-project"));
+        assert!(!request.headers().contains_key("x-openai-internal"));
+        assert!(!request.headers().contains_key("x-chatgpt-session"));
+        assert_eq!(request.headers()["x-business-header"], "keep");
+    }
+
+    #[test]
+    fn gateway_token_header_authenticates_without_bearer_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ai-gateway-token", "local-test-token".parse().unwrap());
+        assert!(auth_valid(&headers, "local-test-token"));
+        assert!(!auth_valid(&headers, "different-token"));
+    }
+
+    #[test]
+    fn gateway_token_header_is_never_forwarded_upstream() {
+        let state = test_state(Vec::new());
+        let provider = test_provider("provider-a", "http://127.0.0.1:9999".to_string(), 1);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ai-gateway-token", "local-test-token".parse().unwrap());
+        headers.insert("x-request-id", "request-1".parse().unwrap());
+        let request = upstream_request(
+            &state,
+            &provider,
+            &Method::POST,
+            Url::parse("http://127.0.0.1:9999/v1/responses").unwrap(),
+            &headers,
+            &Bytes::from_static(b"{}"),
+        )
+        .build()
+        .unwrap();
+        assert!(request.headers().get("x-ai-gateway-token").is_none());
+        assert_eq!(request.headers().get("x-request-id").unwrap(), "request-1");
+    }
+
+    #[tokio::test]
+    async fn occupied_port_is_rejected_without_changing_runtime_settings() {
+        let state = test_state(Vec::new());
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let occupied_port = occupied.local_addr().unwrap().port();
+        let previous = state.settings.read().unwrap().clone();
+
+        let result = prepare_gateway_listener(&state, occupied_port).await;
+
+        assert!(result.is_err());
+        assert_eq!(state.settings.read().unwrap().port, previous.port);
+        assert_eq!(
+            state.settings.read().unwrap().gateway_listening,
+            previous.gateway_listening
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_listener_switches_to_prebound_port() {
+        let state = test_state(Vec::new());
+        state.settings.write().unwrap().gateway_listening = false;
+        let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_port = first.local_addr().unwrap().port();
+        activate_gateway_listener(state.clone(), first, first_port);
+        tokio::time::sleep(StdDuration::from_millis(30)).await;
+        assert_eq!(
+            state
+                .client
+                .get(format!("http://127.0.0.1:{first_port}/healthz"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second_port = second.local_addr().unwrap().port();
+        activate_gateway_listener(state.clone(), second, second_port);
+        tokio::time::sleep(StdDuration::from_millis(30)).await;
+
+        assert_eq!(state.settings.read().unwrap().port, second_port);
+        assert_eq!(
+            state
+                .client
+                .get(format!("http://127.0.0.1:{second_port}/healthz"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let mut old_port_closed = false;
+        for _ in 0..20 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", first_port))
+                .await
+                .is_err()
+            {
+                old_port_closed = true;
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        assert!(old_port_closed);
+
+        let shutdown = { state.gateway.runtime.lock().unwrap().shutdown.take() };
+        if let Some(shutdown) = shutdown {
+            let _ = shutdown.send(());
+        }
     }
 
     #[test]
@@ -3397,8 +5257,10 @@ mod tests {
 
         let result = persist_configuration(
             &state.store,
+            DEFAULT_PORT,
             45,
             DEFAULT_LOG_RETENTION_DAYS,
+            DEFAULT_USAGE_RETENTION_DAYS,
             &RoutingPolicy::default(),
         );
 
@@ -3749,5 +5611,202 @@ mod tests {
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert!(body.starts_with(b"data: "));
+    }
+
+    #[test]
+    fn parses_responses_and_chat_usage_shapes() {
+        let responses = serde_json::json!({
+            "usage": {
+                "input_tokens": 120,
+                "input_tokens_details": { "cached_tokens": 40 },
+                "output_tokens": 30,
+                "output_tokens_details": { "reasoning_tokens": 12 },
+                "total_tokens": 150
+            }
+        });
+        let chat = serde_json::json!({
+            "usage": {
+                "prompt_tokens": 80,
+                "prompt_tokens_details": { "cached_tokens": 20 },
+                "completion_tokens": 25,
+                "completion_tokens_details": { "reasoning_tokens": 5 }
+            }
+        });
+
+        let responses_usage = usage_from_response_json(&responses).unwrap();
+        let chat_usage = usage_from_response_json(&chat).unwrap();
+
+        assert_eq!(responses_usage.input_tokens, Some(120));
+        assert_eq!(responses_usage.cached_tokens, Some(40));
+        assert_eq!(responses_usage.reasoning_tokens, Some(12));
+        assert_eq!(responses_usage.total_tokens, Some(150));
+        assert_eq!(chat_usage.input_tokens, Some(80));
+        assert_eq!(chat_usage.output_tokens, Some(25));
+        assert_eq!(chat_usage.total_tokens, Some(105));
+    }
+
+    #[test]
+    fn parses_chunked_sse_usage_without_modifying_bytes() {
+        let first = Bytes::from_static(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":18,",
+        );
+        let second = Bytes::from_static(
+            b"\"output_tokens\":7,\"total_tokens\":25}}}\r\n\r\ndata: [DONE]\r\n\r\n",
+        );
+        let mut collector = UsageCollector::new(UsageResponseKind::Sse);
+
+        collector.observe(&first);
+        collector.observe(&second);
+        let usage = collector.finish();
+
+        assert_eq!(usage.input_tokens, Some(18));
+        assert_eq!(usage.output_tokens, Some(7));
+        assert_eq!(usage.total_tokens, Some(25));
+    }
+
+    #[tokio::test]
+    async fn completed_response_persists_reported_and_unreported_usage() {
+        let upstream = mock_counted_sequence(vec![
+            (
+                StatusCode::OK,
+                r#"{"usage":{"input_tokens":100,"output_tokens":25,"total_tokens":125}}"#,
+                "application/json",
+            ),
+            (StatusCode::OK, r#"{"ok":true}"#, "application/json"),
+        ])
+        .await
+        .0;
+        let state = test_state(vec![test_provider("primary", upstream, 1)]);
+        initialize_test_settings(&state);
+
+        let first = call_test_gateway(state.clone()).await;
+        first.into_body().collect().await.unwrap();
+        let second = call_test_gateway(state.clone()).await;
+        second.into_body().collect().await.unwrap();
+
+        let statistics = query_usage_statistics(
+            &state,
+            &UsageQuery {
+                mode: UsageQueryMode::Today,
+                start_date: None,
+                end_date: None,
+                month: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(statistics.completed_requests, 2);
+        assert_eq!(statistics.reported_requests, 1);
+        assert_eq!(statistics.coverage_percent, 50.0);
+        assert_eq!(statistics.totals.total_tokens.value, 125);
+        assert_eq!(statistics.providers[0].provider_id, "primary");
+    }
+
+    #[tokio::test]
+    async fn failover_usage_is_attributed_only_to_final_provider() {
+        let primary =
+            mock_upstream(StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"failed"}"#).await;
+        let backup = mock_upstream(
+            StatusCode::OK,
+            r#"{"usage":{"input_tokens":40,"output_tokens":10,"total_tokens":50}}"#,
+        )
+        .await;
+        let state = test_state(vec![
+            test_provider("primary", primary, 1),
+            test_provider("backup", backup, 2),
+        ]);
+        initialize_test_settings(&state);
+
+        let response = call_test_gateway(state.clone()).await;
+        response.into_body().collect().await.unwrap();
+        let statistics = query_usage_statistics(
+            &state,
+            &UsageQuery {
+                mode: UsageQueryMode::Today,
+                start_date: None,
+                end_date: None,
+                month: None,
+            },
+        )
+        .unwrap();
+
+        let primary = statistics
+            .providers
+            .iter()
+            .find(|provider| provider.provider_id == "primary")
+            .unwrap();
+        let backup = statistics
+            .providers
+            .iter()
+            .find(|provider| provider.provider_id == "backup")
+            .unwrap();
+        assert_eq!(primary.completed_requests, 0);
+        assert_eq!(backup.completed_requests, 1);
+        assert_eq!(backup.metrics.total_tokens.value, 50);
+    }
+
+    #[test]
+    fn usage_query_enforces_range_and_full_month_rules() {
+        let accepted = UsageQuery {
+            mode: UsageQueryMode::Range,
+            start_date: Some("2024-01-01".to_string()),
+            end_date: Some("2024-01-30".to_string()),
+            month: None,
+        };
+        let rejected = UsageQuery {
+            mode: UsageQueryMode::Range,
+            start_date: Some("2024-01-01".to_string()),
+            end_date: Some("2024-01-31".to_string()),
+            month: None,
+        };
+        let full_month = UsageQuery {
+            mode: UsageQueryMode::Month,
+            start_date: None,
+            end_date: None,
+            month: Some("2024-01".to_string()),
+        };
+
+        assert!(usage_period_bounds(&accepted).is_ok());
+        assert!(usage_period_bounds(&rejected).is_err());
+        let (_, start, end, _, _) = usage_period_bounds(&full_month).unwrap();
+        assert_eq!((end - start).num_days() + 1, 31);
+    }
+
+    #[test]
+    fn usage_retention_prunes_only_expired_records() {
+        let state = test_state(Vec::new());
+        initialize_test_settings(&state);
+        let insert = |completed_at: DateTime<Utc>| {
+            persist_usage_record(
+                &state.store,
+                &UsageRecord {
+                    completed_at,
+                    provider_id: "provider".to_string(),
+                    provider_name: "Provider".to_string(),
+                    model: Some("gpt-test".to_string()),
+                    request_path: "/v1/responses".to_string(),
+                    usage: CapturedUsage {
+                        input_tokens: Some(1),
+                        output_tokens: Some(1),
+                        total_tokens: Some(2),
+                        ..CapturedUsage::default()
+                    },
+                },
+            )
+            .unwrap();
+        };
+        insert(Utc::now() - Duration::days(31));
+        insert(Utc::now() - Duration::days(1));
+
+        let removed = prune_expired_usage(&state.store, 30).unwrap();
+        let remaining: i64 = state
+            .store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM usage_records", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(removed, 1);
+        assert_eq!(remaining, 1);
     }
 }

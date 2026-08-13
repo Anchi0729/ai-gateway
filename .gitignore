@@ -25,6 +25,7 @@ design-qa.md
 design-qa-*.png
 
 # Local release artifacts
+release/
 *.exe
 *.msi
 *.zip

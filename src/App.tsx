@@ -4,6 +4,8 @@ import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   Activity,
+  BarChart3,
+  Bot,
   ArrowDown,
   ArrowUp,
   Check,
@@ -66,8 +68,22 @@ import {
   exportConfigurationBackup,
   importConfigurationBackup,
   inspectConfigurationBackup,
+  getUsageStatistics,
+  UsageQuery,
+  UsageStatistics,
+  TokenMetric,
+  CodexIntegrationState,
+  CodexConnectionMode,
+  getCodexIntegrationState,
+  switchCodexConnectionMode,
+  refreshCodexLoginStatus,
+  repairCodexGatewayConfiguration,
+  CodexHistoryMigrationPreview,
+  previewCodexHistoryMigration,
+  applyCodexHistoryMigration,
+  restoreCodexHistoryMigration,
 } from "./api";
-import { buildDemoData } from "./demo";
+import { buildDemoData, buildDemoUsageStatistics } from "./demo";
 
 const statusLabels: Record<ProviderHealth, string> = {
   healthy: "运行正常",
@@ -95,7 +111,7 @@ type BackupDialogState =
   | { mode: "closed" }
   | { mode: "export" }
   | { mode: "import"; path: string };
-type AppView = "monitor" | "providers" | "logs" | "settings";
+type AppView = "monitor" | "usage" | "providers" | "codex" | "logs" | "settings";
 type ConfigurationSaveStatus = "idle" | "saving" | "saved" | "error";
 
 const DEFAULT_ROUTING_POLICY: RoutingPolicy = {
@@ -116,8 +132,10 @@ function configurationInputFromSnapshot(
   snapshot: ConfigurationSnapshot,
 ): ConfigurationInput {
   return {
+    port: snapshot.router_settings.port,
     probe_interval_sec: snapshot.router_settings.probe_interval_sec,
     log_retention_days: snapshot.router_settings.log_retention_days,
+    usage_retention_days: snapshot.router_settings.usage_retention_days,
     routing_policy: { ...snapshot.routing_policy },
     autostart_enabled: snapshot.autostart_enabled,
   };
@@ -129,8 +147,10 @@ function configurationInputsEqual(
 ) {
   if (!left || !right) return left === right;
   return (
+    left.port === right.port &&
     left.probe_interval_sec === right.probe_interval_sec &&
     left.log_retention_days === right.log_retention_days &&
+    left.usage_retention_days === right.usage_retention_days &&
     left.autostart_enabled === right.autostart_enabled &&
     JSON.stringify(left.routing_policy) === JSON.stringify(right.routing_policy)
   );
@@ -138,8 +158,10 @@ function configurationInputsEqual(
 
 function validateConfigurationDraft(draft: ConfigurationInput) {
   const checks: Array<[number, number, number, string]> = [
+    [draft.port, 1024, 65535, "监听端口"],
     [draft.probe_interval_sec, 5, 3600, "健康探测间隔"],
     [draft.log_retention_days, 1, 365, "日志保留天数"],
+    [draft.usage_retention_days, 30, 3650, "用量数据保留天数"],
     [draft.routing_policy.retry_count, 0, 3, "瞬时错误重试次数"],
     [draft.routing_policy.retry_interval_sec, 0, 60, "重试间隔"],
     [draft.routing_policy.max_retry_wait_sec, 1, 300, "单次请求最大等待"],
@@ -154,6 +176,51 @@ function validateConfigurationDraft(draft: ConfigurationInput) {
     if (!Number.isFinite(value) || value < min || value > max) {
       return `${label}必须在 ${min} 到 ${max} 之间`;
     }
+  }
+  return null;
+}
+
+function localDateValue(date: Date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function shiftLocalDate(value: string, days: number) {
+  const date = new Date(`${value}T00:00:00`);
+  date.setDate(date.getDate() + days);
+  return localDateValue(date);
+}
+
+const TODAY_VALUE = localDateValue(new Date());
+const CURRENT_MONTH_VALUE = TODAY_VALUE.slice(0, 7);
+const DEFAULT_USAGE_QUERY: UsageQuery = { mode: "today" };
+
+function defaultUsageDraft(): UsageQuery {
+  return {
+    mode: "today",
+    start_date: shiftLocalDate(TODAY_VALUE, -6),
+    end_date: TODAY_VALUE,
+    month: CURRENT_MONTH_VALUE,
+  };
+}
+
+function validateUsageQuery(query: UsageQuery) {
+  if (query.mode === "range") {
+    if (!query.start_date || !query.end_date) return "请选择开始和结束日期";
+    if (query.start_date > query.end_date) return "开始日期不能晚于结束日期";
+    if (query.end_date > TODAY_VALUE) return "不能查询未来日期";
+    const days = Math.round(
+      (new Date(`${query.end_date}T00:00:00`).getTime() -
+        new Date(`${query.start_date}T00:00:00`).getTime()) /
+        86_400_000,
+    ) + 1;
+    if (days > 30) return "自定义日期范围最多查询 30 个自然日";
+  }
+  if (query.mode === "month") {
+    if (!query.month) return "请选择要查询的月份";
+    if (query.month > CURRENT_MONTH_VALUE) return "不能查询未来月份";
   }
   return null;
 }
@@ -174,7 +241,18 @@ function App() {
   const [settings, setSettings] = useState<RouterSettings | null>(null);
   const [routeGroup, setRouteGroup] = useState<RouteGroup | null>(null);
   const [runtime, setRuntime] = useState<RuntimeStats | null>(null);
+  const [usageStatistics, setUsageStatistics] = useState<UsageStatistics | null>(null);
+  const [usageDraft, setUsageDraft] = useState<UsageQuery>(() => defaultUsageDraft());
+  const [usageQuery, setUsageQuery] = useState<UsageQuery>(DEFAULT_USAGE_QUERY);
+  const [usageLoading, setUsageLoading] = useState(false);
+  const [usageError, setUsageError] = useState<string | null>(null);
   const [routingPolicy, setRoutingPolicy] = useState<RoutingPolicy | null>(null);
+  const [codexState, setCodexState] = useState<CodexIntegrationState | null>(null);
+  const [codexBusy, setCodexBusy] = useState(false);
+  const [codexError, setCodexError] = useState<string | null>(null);
+  const [codexHistoryPreview, setCodexHistoryPreview] =
+    useState<CodexHistoryMigrationPreview | null>(null);
+  const [codexHistoryConfirming, setCodexHistoryConfirming] = useState(false);
   const [configurationSnapshot, setConfigurationSnapshot] =
     useState<ConfigurationSnapshot | null>(null);
   const [configurationDraft, setConfigurationDraft] =
@@ -212,7 +290,7 @@ function App() {
 
   const refresh = useCallback(async () => {
     try {
-      const [nextProviders, nextHealth, nextConfiguration, groups, stats, events] =
+      const [nextProviders, nextHealth, nextConfiguration, groups, stats, events, nextCodexState] =
         await Promise.all([
           listProviders(),
           getHealthSnapshots(),
@@ -220,6 +298,7 @@ function App() {
           listRouteGroups(),
           getRuntimeStats(),
           getRecentLogs(),
+          getCodexIntegrationState(),
         ]);
       setProviders(nextProviders);
       setHealth(nextHealth);
@@ -229,6 +308,7 @@ function App() {
       setRouteGroup(groups[0] ?? null);
       setRuntime(stats);
       setLogs(events);
+      setCodexState(nextCodexState);
       setLastUpdatedAt(new Date());
     } catch {
       // demo 查询参数只用于普通浏览器视觉验收，打包后的桌面应用不会使用演示数据。
@@ -246,8 +326,43 @@ function App() {
         setRouteGroup(demo.routeGroup);
         setRuntime(demo.runtime);
         setLogs(demo.logs);
+        setCodexState((current) => current ?? {
+          detected_mode: "gateway",
+          config_path: "C:\\Users\\demo\\.codex\\config.toml",
+          config_exists: true,
+          login_status: "logged_in",
+          gateway_configuration_current: true,
+          shared_provider_current: true,
+          official_features_available: true,
+          history_unified: false,
+          history_provider_counts: [
+            { provider: "custom", count: 41 },
+            { provider: "openai", count: 7 },
+          ],
+          history_migration_required: true,
+          external_provider_id: null,
+          config_error: null,
+          last_switched_at: new Date().toISOString(),
+          last_history_migration_at: null,
+        });
         setLastUpdatedAt(new Date());
       }
+    }
+  }, []);
+
+  const refreshUsage = useCallback(async (query: UsageQuery) => {
+    setUsageLoading(true);
+    setUsageError(null);
+    try {
+      setUsageStatistics(await getUsageStatistics(query));
+    } catch (error) {
+      if (import.meta.env.DEV && location.search.includes("demo=1")) {
+        setUsageStatistics(buildDemoUsageStatistics(query));
+      } else {
+        setUsageError(String(error));
+      }
+    } finally {
+      setUsageLoading(false);
     }
   }, []);
 
@@ -256,6 +371,32 @@ function App() {
     const timer = window.setInterval(() => void refresh(), STATUS_REFRESH_MS);
     return () => window.clearInterval(timer);
   }, [refresh]);
+
+  useEffect(() => {
+    if (view !== "usage") return;
+    void refreshUsage(usageQuery);
+    const timer = window.setInterval(
+      () => void refreshUsage(usageQuery),
+      STATUS_REFRESH_MS,
+    );
+    return () => window.clearInterval(timer);
+  }, [refreshUsage, usageQuery, view]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let refreshTimer: number | undefined;
+    void listen("usage-updated", () => {
+      if (view !== "usage") return;
+      window.clearTimeout(refreshTimer);
+      refreshTimer = window.setTimeout(() => void refreshUsage(usageQuery), 500);
+    }).then((cleanup) => {
+      unlisten = cleanup;
+    }).catch(() => undefined);
+    return () => {
+      unlisten?.();
+      window.clearTimeout(refreshTimer);
+    };
+  }, [refreshUsage, usageQuery, view]);
 
   useEffect(() => {
     // 轮询只在没有编辑草稿时同步配置；用户正在输入时不能被后台快照覆盖。
@@ -314,6 +455,14 @@ function App() {
     }).catch(() => undefined);
     return () => unlisten?.();
   }, [refresh, routingPolicy?.notify_switches]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen("codex-config-changed", () => void refresh()).then((cleanup) => {
+      unlisten = cleanup;
+    }).catch(() => undefined);
+    return () => unlisten?.();
+  }, [refresh]);
 
   const drawerProvider =
     providerDrawer.mode === "detail" || providerDrawer.mode === "edit"
@@ -458,6 +607,7 @@ function App() {
       const result = {
         file_name: backupDefaultFileName(),
         provider_count: providers.length,
+        warning_messages: [],
       };
       setBackupDialog({ mode: "closed" });
       setNotice(`已导出 ${result.provider_count} 个中转到 ${result.file_name}`);
@@ -470,7 +620,11 @@ function App() {
     if (!path) return null;
     const result = await exportConfigurationBackup(path, password);
     setBackupDialog({ mode: "closed" });
-    setNotice(`已导出 ${result.provider_count} 个中转到 ${result.file_name}`);
+    setNotice({
+      level: result.warning_messages.length ? "warning" : "info",
+      title: "加密配置已导出",
+      message: `已导出 ${result.provider_count} 个中转到 ${result.file_name}${result.warning_messages.length ? `。${result.warning_messages.join("；")}` : ""}`,
+    });
     return result;
   }
 
@@ -517,6 +671,25 @@ function App() {
     setConfigurationSaveError(null);
   }
 
+  function submitUsageQuery() {
+    const error = validateUsageQuery(usageDraft);
+    if (error) {
+      setUsageError(error);
+      return;
+    }
+    const next: UsageQuery = usageDraft.mode === "today"
+      ? { mode: "today" }
+      : usageDraft.mode === "range"
+        ? {
+            mode: "range",
+            start_date: usageDraft.start_date,
+            end_date: usageDraft.end_date,
+          }
+        : { mode: "month", month: usageDraft.month };
+    setUsageError(null);
+    setUsageQuery(next);
+  }
+
   async function handleSaveConfiguration() {
     if (!configurationDraft) return false;
     const validationError = validateConfigurationDraft(configurationDraft);
@@ -529,6 +702,7 @@ function App() {
     setConfigurationSaveStatus("saving");
     setConfigurationSaveError(null);
     try {
+      const previousPort = settings?.port ?? 8765;
       const next = await saveConfiguration(configurationDraft);
       setConfigurationSnapshot(next);
       setConfigurationDraft(configurationInputFromSnapshot(next));
@@ -536,15 +710,23 @@ function App() {
       setRoutingPolicy(next.routing_policy);
       setConfigurationSaveStatus("saved");
       setConfigurationSavedAt(new Date());
-      setNotice("配置中心已保存，日志保留期限已立即生效");
+      setNotice(previousPort !== next.router_settings.port
+        ? {
+            level: "warning",
+            title: "本地网关端口已切换",
+            message: `已切换至 127.0.0.1:${next.router_settings.port}，请将 cc-switch 的 Base URL 更新为 http://127.0.0.1:${next.router_settings.port}/v1。API Key 保持不变。`,
+          }
+        : "配置中心已保存，日志与用量保留期限已立即生效");
       return true;
     } catch (error) {
       if (import.meta.env.DEV && location.search.includes("demo=1") && settings) {
         const next: ConfigurationSnapshot = {
           router_settings: {
             ...settings,
+            port: configurationDraft.port,
             probe_interval_sec: configurationDraft.probe_interval_sec,
             log_retention_days: configurationDraft.log_retention_days,
+            usage_retention_days: configurationDraft.usage_retention_days,
           },
           routing_policy: { ...configurationDraft.routing_policy },
           autostart_enabled: configurationDraft.autostart_enabled,
@@ -560,6 +742,110 @@ function App() {
       setConfigurationSaveStatus("error");
       setConfigurationSaveError(String(error));
       return false;
+    }
+  }
+
+  async function handleSwitchCodexMode(mode: "official" | "gateway") {
+    setCodexBusy(true);
+    setCodexError(null);
+    try {
+      const result = await switchCodexConnectionMode(mode);
+      await refresh();
+      setNotice({
+        level: result.warning_messages.length ? "warning" : "info",
+        title: result.changed ? "Codex 接入模式已修改" : "Codex 接入配置无需修改",
+        message: `${result.restart_required
+          ? "请完全退出并重新启动 Codex，新的接入模式才会生效。"
+          : "当前配置已经是目标模式。"}${result.warning_messages.length ? ` ${result.warning_messages.join("；")}` : ""}`,
+      });
+    } catch (error) {
+      setCodexError(String(error));
+    } finally {
+      setCodexBusy(false);
+    }
+  }
+
+  async function handleRefreshCodexLogin() {
+    setCodexBusy(true);
+    setCodexError(null);
+    try {
+      setCodexState(await refreshCodexLoginStatus());
+    } catch (error) {
+      setCodexError(String(error));
+    } finally {
+      setCodexBusy(false);
+    }
+  }
+
+  async function handleRepairCodexGateway() {
+    setCodexBusy(true);
+    setCodexError(null);
+    try {
+      const result = await repairCodexGatewayConfiguration();
+      await refresh();
+      setNotice({
+        level: result.warning_messages.length ? "warning" : "info",
+        title: "Codex 接入配置已修复",
+        message: `${result.restart_required
+          ? "请完全退出并重新启动 Codex。"
+          : "AI Gateway Provider 配置已经是最新状态。"}${result.warning_messages.length ? ` ${result.warning_messages.join("；")}` : ""}`,
+      });
+    } catch (error) {
+      setCodexError(String(error));
+    } finally {
+      setCodexBusy(false);
+    }
+  }
+
+  async function handlePreviewCodexHistory() {
+    setCodexBusy(true);
+    setCodexError(null);
+    try {
+      setCodexHistoryPreview(await previewCodexHistoryMigration());
+    } catch (error) {
+      setCodexError(String(error));
+    } finally {
+      setCodexBusy(false);
+    }
+  }
+
+  async function handleApplyCodexHistory() {
+    if (!codexHistoryPreview) return;
+    setCodexBusy(true);
+    setCodexError(null);
+    try {
+      const result = await applyCodexHistoryMigration(codexHistoryPreview.preview_id);
+      setCodexHistoryPreview(null);
+      setCodexHistoryConfirming(false);
+      await refresh();
+      setNotice({
+        level: result.warning_messages.length ? "warning" : "info",
+        title: "Codex 会话历史已统一",
+        message: `已迁移 ${result.migrated_session_count} 个会话并更新 ${result.updated_index_count} 条索引。备份：${result.backup_name}${result.warning_messages.length ? `；${result.warning_messages.join("；")}` : ""}`,
+      });
+    } catch (error) {
+      setCodexError(String(error));
+    } finally {
+      setCodexBusy(false);
+    }
+  }
+
+  async function handleRestoreCodexHistory() {
+    setCodexBusy(true);
+    setCodexError(null);
+    try {
+      const result = await restoreCodexHistoryMigration();
+      setCodexHistoryPreview(null);
+      await refresh();
+      setNotice({
+        level: result.warning_messages.length ? "warning" : "info",
+        title: "最近一次会话迁移已恢复",
+        message: `已恢复 ${result.restored_session_count} 个会话和 ${result.restored_index_count} 条索引${result.warning_messages.length ? `；${result.warning_messages.join("；")}` : ""}`,
+      });
+    } catch (error) {
+      setCodexError(String(error));
+    } finally {
+      setCodexBusy(false);
     }
   }
 
@@ -609,11 +895,25 @@ function App() {
             运行监控
           </button>
           <button
+            className={`nav-item ${view === "usage" ? "active" : ""}`}
+            onClick={() => requestView("usage")}
+          >
+            <BarChart3 size={17} />
+            用量统计
+          </button>
+          <button
             className={`nav-item ${view === "providers" ? "active" : ""}`}
             onClick={() => requestView("providers")}
           >
             <Server size={17} />
             中转管理
+          </button>
+          <button
+            className={`nav-item ${view === "codex" ? "active" : ""}`}
+            onClick={() => requestView("codex")}
+          >
+            <Bot size={17} />
+            Codex 接入
           </button>
           <button
             className={`nav-item ${view === "logs" ? "active" : ""}`}
@@ -635,7 +935,7 @@ function App() {
             <ShieldCheck size={16} />
             <span>仅本机访问</span>
           </div>
-          <span className="version">v0.2.4</span>
+          <span className="version">v0.3.0</span>
         </div>
       </aside>
       <main className="main-content">
@@ -645,8 +945,12 @@ function App() {
             <h1>
               {view === "monitor"
                 ? "运行监控"
+                : view === "usage"
+                  ? "用量统计"
                 : view === "providers"
                   ? "中转管理"
+                : view === "codex"
+                  ? "Codex 接入"
                 : view === "logs"
                   ? "运行日志"
                   : "配置中心"}
@@ -664,7 +968,10 @@ function App() {
             <button
               className="icon-button"
               title="刷新状态"
-              onClick={() => void refresh()}
+              onClick={() => {
+                void refresh();
+                if (view === "usage") void refreshUsage(usageQuery);
+              }}
             >
               <RefreshCw size={16} />
             </button>
@@ -683,6 +990,15 @@ function App() {
             onOpenRoutingEvent={setRoutingDetail}
             onTest={(provider) => void handleTest(provider)}
             onLock={(provider) => void handleLock(provider)}
+          />
+        ) : view === "usage" ? (
+          <UsagePanel
+            draft={usageDraft}
+            statistics={usageStatistics}
+            loading={usageLoading}
+            error={usageError}
+            onDraftChange={setUsageDraft}
+            onSubmit={submitUsageQuery}
           />
         ) : view === "providers" ? (
           <>
@@ -720,7 +1036,7 @@ function App() {
                 <div className="panel-heading">
                   <div>
                     <h2>中转列表</h2>
-                    <p>按优先级尝试，异常时自动进入下一个可用中转</p>
+                    <p>按优先级尝试，异常时自动进入下一个可用中转；第三方中转间切换无需重启 Codex</p>
                   </div>
                   <div className="panel-heading-actions">
                     <button
@@ -789,6 +1105,26 @@ function App() {
                 )}
             </section>
           </>
+        ) : view === "codex" ? (
+          <CodexIntegrationPanel
+            state={codexState}
+            settings={settings}
+            providers={providers}
+            health={health}
+            routeGroup={routeGroup}
+            busy={codexBusy}
+            error={codexError}
+            onSwitch={handleSwitchCodexMode}
+            onRefreshLogin={() => void handleRefreshCodexLogin()}
+            onRepair={() => void handleRepairCodexGateway()}
+            historyPreview={codexHistoryPreview}
+            historyConfirming={codexHistoryConfirming}
+            onScanHistory={() => void handlePreviewCodexHistory()}
+            onConfirmHistory={() => setCodexHistoryConfirming(true)}
+            onCancelHistory={() => setCodexHistoryConfirming(false)}
+            onApplyHistory={() => void handleApplyCodexHistory()}
+            onRestoreHistory={() => void handleRestoreCodexHistory()}
+          />
         ) : view === "logs" ? (
           <LogsPanel logs={logs} providers={providers} runtime={runtime} onOpenRoutingEvent={setRoutingDetail} />
         ) : (
@@ -815,6 +1151,7 @@ function App() {
           }
           saving={providerFormSaving}
           closing={providerDrawerClosing}
+          gatewayUrl={`http://127.0.0.1:${settings?.port ?? 8765}/v1`}
           onClose={requestProviderDrawerClose}
           onDirtyChange={setProviderFormDirty}
           onSavingChange={setProviderFormSaving}
@@ -918,6 +1255,481 @@ function Stat({
         <span>{label}</span>
         <strong>{value}</strong>
       </div>
+    </div>
+  );
+}
+
+const compactTokenFormatter = new Intl.NumberFormat("zh-CN", {
+  notation: "compact",
+  maximumFractionDigits: 1,
+});
+const fullTokenFormatter = new Intl.NumberFormat("zh-CN");
+
+function formatTokenCount(value: number) {
+  return value >= 10_000
+    ? compactTokenFormatter.format(value)
+    : fullTokenFormatter.format(value);
+}
+
+function tokenMetricText(metric: TokenMetric, completedRequests: number) {
+  if (!completedRequests) return "—";
+  if (!metric.reported_count) return "未上报";
+  return formatTokenCount(metric.value);
+}
+
+function CodexIntegrationPanel({
+  state,
+  settings,
+  providers,
+  health,
+  routeGroup,
+  busy,
+  error,
+  onSwitch,
+  onRefreshLogin,
+  onRepair,
+  historyPreview,
+  historyConfirming,
+  onScanHistory,
+  onConfirmHistory,
+  onCancelHistory,
+  onApplyHistory,
+  onRestoreHistory,
+}: {
+  state: CodexIntegrationState | null;
+  settings: RouterSettings | null;
+  providers: Provider[];
+  health: HealthSnapshot[];
+  routeGroup: RouteGroup | null;
+  busy: boolean;
+  error: string | null;
+  onSwitch: (mode: "official" | "gateway") => Promise<void>;
+  onRefreshLogin: () => void;
+  onRepair: () => void;
+  historyPreview: CodexHistoryMigrationPreview | null;
+  historyConfirming: boolean;
+  onScanHistory: () => void;
+  onConfirmHistory: () => void;
+  onCancelHistory: () => void;
+  onApplyHistory: () => void;
+  onRestoreHistory: () => void;
+}) {
+  const activeProvider = providers.find(
+    (provider) => provider.id === routeGroup?.locked_provider_id,
+  ) ?? providers.find((provider) =>
+    provider.enabled && health.find((item) => item.provider_id === provider.id)?.state !== "open"
+  );
+  const availableProviders = providers.filter((provider) => provider.enabled).length;
+  const loginLabel = state?.login_status === "logged_in"
+    ? "已登录"
+    : state?.login_status === "logged_out"
+      ? "未登录"
+      : state?.login_status === "cli_unavailable"
+        ? "无法检测（未找到 Codex CLI）"
+        : "尚未检测";
+  const external = state?.detected_mode === "external";
+  const officialFeaturesLabel = state?.official_features_available
+    ? "当前可用"
+    : state?.login_status === "logged_out"
+      ? "需要重新登录"
+      : "等待登录状态检测";
+
+  return (
+    <div className="codex-page">
+      {external && (
+        <div className="codex-external-banner">
+          <div>
+            <strong>检测到外部配置</strong>
+            <span>
+              当前 model_provider 为 {state.external_provider_id ?? "未知 Provider"}。AI Gateway 不会静默覆盖它，请明确选择下面的模式。
+              使用 CC-Switch 时请先关闭其路由接管，避免两个工具重复改写 custom Provider。
+            </span>
+          </div>
+        </div>
+      )}
+      {state?.config_error && (
+        <div className="codex-error-banner">
+          <strong>无法读取 Codex 配置</strong>
+          <span>{state.config_error}</span>
+        </div>
+      )}
+      {error && <div className="codex-error-banner"><strong>操作失败</strong><span>{error}</span></div>}
+
+      <section className="panel codex-account-strip">
+        <div><span>ChatGPT 登录</span><strong>{loginLabel}</strong></div>
+        <div><span>官方账号能力</span><strong>{officialFeaturesLabel}</strong></div>
+        <div><span>连接模式</span><strong>{state?.detected_mode === "official" ? "官方直连" : state?.detected_mode === "gateway" ? "AI Gateway 第三方" : "外部配置"}</strong></div>
+      </section>
+
+      <section className="codex-mode-grid">
+        <article className={`codex-mode-card ${state?.detected_mode === "official" ? "active" : ""}`}>
+          <div className="codex-mode-heading">
+            <span className="codex-mode-icon official"><ShieldCheck size={19} /></span>
+            <div>
+              <h2>OpenAI 官方</h2>
+              <p>使用 Codex 原生 ChatGPT 登录，完全绕过 AI Gateway</p>
+            </div>
+            <span className="codex-mode-status">
+              {state?.detected_mode === "official" ? "当前模式" : "未启用"}
+            </span>
+          </div>
+          <dl className="codex-facts">
+            <div><dt>连接方式</dt><dd>OpenAI 官方直连</dd></div>
+            <div><dt>ChatGPT 登录</dt><dd>{loginLabel}</dd></div>
+            <div><dt>共享 Provider</dt><dd>custom · 保留官方认证</dd></div>
+            <div><dt>自动切换</dt><dd>不会进入第三方路由池</dd></div>
+            <div><dt>用量统计</dt><dd>官方直连期间不采集</dd></div>
+          </dl>
+          <div className="codex-mode-actions">
+            <button className="secondary-button" disabled={busy} onClick={onRefreshLogin}>
+              <RefreshCw size={15} />重新检测登录状态
+            </button>
+            <button
+              className="primary-button"
+              disabled={busy || state?.detected_mode === "official"}
+              onClick={() => void onSwitch("official")}
+            >
+              切换到官方
+            </button>
+          </div>
+        </article>
+
+        <article className={`codex-mode-card ${state?.detected_mode === "gateway" ? "active" : ""}`}>
+          <div className="codex-mode-heading">
+            <span className="codex-mode-icon gateway"><Router size={19} /></span>
+            <div>
+              <h2>第三方中转</h2>
+              <p>Codex 固定连接本地网关，中转选择由 AI Gateway 统一管理</p>
+            </div>
+            <span className="codex-mode-status">
+              {state?.detected_mode === "gateway" ? "当前模式" : "未启用"}
+            </span>
+          </div>
+          <dl className="codex-facts">
+            <div><dt>本地 Base URL</dt><dd>http://127.0.0.1:{settings?.port ?? 8765}/v1</dd></div>
+            <div><dt>网关状态</dt><dd>{settings?.gateway_listening ? "正在监听" : "未监听"}</dd></div>
+            <div><dt>当前中转</dt><dd>{activeProvider?.name ?? "等待可用中转"}</dd></div>
+            <div><dt>可用配置</dt><dd>{availableProviders} 个已启用中转</dd></div>
+            <div><dt>官方登录</dt><dd>保留，身份头不转发</dd></div>
+          </dl>
+          {!state?.gateway_configuration_current && state?.detected_mode === "gateway" && (
+            <p className="codex-repair-hint">当前 Codex Provider 与本地端口或令牌不一致，需要修复后重启 Codex。</p>
+          )}
+          <div className="codex-mode-actions">
+            <button
+              className="secondary-button"
+              disabled={busy || state?.detected_mode !== "gateway"}
+              onClick={onRepair}
+            >
+              <RefreshCw size={15} />修复接入配置
+            </button>
+            <button
+              className="primary-button"
+              disabled={busy || (state?.detected_mode === "gateway" && state.gateway_configuration_current)}
+              onClick={() => void onSwitch("gateway")}
+            >
+              切换到第三方
+            </button>
+          </div>
+        </article>
+      </section>
+
+      <section className="panel codex-history-panel">
+        <div className="codex-history-heading">
+          <div>
+            <h2>统一会话历史</h2>
+            <p>将普通和归档会话的 Provider 元数据统一为 custom，让本地历史不再因接入模式隐藏。</p>
+          </div>
+          <span className={`codex-history-status ${state?.history_unified ? "complete" : "pending"}`}>
+            {state?.history_unified ? "已统一" : "待扫描"}
+          </span>
+        </div>
+        <div className="codex-history-summary">
+          <div><span>Provider 分布</span><strong>{(historyPreview?.provider_counts ?? state?.history_provider_counts ?? []).map((item) => `${item.provider} ${item.count}`).join(" · ") || "暂无会话"}</strong></div>
+          <div><span>普通会话</span><strong>{historyPreview?.normal_session_count ?? "扫描后显示"}</strong></div>
+          <div><span>归档会话</span><strong>{historyPreview?.archived_session_count ?? "保持归档"}</strong></div>
+          <div><span>需要迁移</span><strong>{historyPreview?.migration_required_count ?? (state?.history_migration_required ? "待扫描" : "0")}</strong></div>
+        </div>
+        {historyPreview && (
+          <div className="codex-history-preview">
+            <p>本地索引 {historyPreview.indexed_record_count} 条；包含 encrypted_content 的会话 {historyPreview.encrypted_content_session_count} 个。</p>
+            {historyPreview.warning_messages.map((warning) => <p key={warning} className="warning">{warning}</p>)}
+          </div>
+        )}
+        <div className="codex-history-actions">
+          <button className="secondary-button" disabled={busy || !(historyPreview?.can_restore_latest || state?.last_history_migration_at)} onClick={onRestoreHistory}>
+            <RefreshCw size={15} />恢复最近备份
+          </button>
+          <button className="secondary-button" disabled={busy} onClick={onScanHistory}>
+            <ScrollText size={15} />扫描会话
+          </button>
+          <button className="primary-button" disabled={busy || !historyPreview || historyPreview.migration_required_count === 0} onClick={onConfirmHistory}>
+            确认迁移
+          </button>
+        </div>
+      </section>
+
+      <section className="panel codex-config-panel">
+        <div>
+          <h2>配置来源</h2>
+          <p>{state?.config_path || "正在检测 Codex config.toml"}</p>
+        </div>
+        <div className="codex-config-note">
+          <ShieldCheck size={17} />
+          <span>AI Gateway 只修改 config.toml 中自己拥有的 Provider 配置，永远不读取或修改 auth.json。</span>
+        </div>
+      </section>
+
+      {historyConfirming && historyPreview && (
+        <div className="modal-backdrop" role="presentation">
+          <section className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="history-migration-title">
+            <h2 id="history-migration-title">确认统一 Codex 会话历史</h2>
+            <p>请先完全退出 Codex。即将修改 {historyPreview.migration_required_count} 个会话的首条 Provider 元数据并同步本地索引，归档会话不会恢复到普通列表。</p>
+            <p className="confirm-warning">旧会话可能包含第三方无法继续处理的 encrypted_content；迁移只保证历史可见。</p>
+            <div className="confirm-actions">
+              <button className="secondary-button" disabled={busy} onClick={onCancelHistory}>取消</button>
+              <button className="primary-button" disabled={busy} onClick={onApplyHistory}>{busy ? "迁移中" : "开始迁移"}</button>
+            </div>
+          </section>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function UsagePanel({
+  draft,
+  statistics,
+  loading,
+  error,
+  onDraftChange,
+  onSubmit,
+}: {
+  draft: UsageQuery;
+  statistics: UsageStatistics | null;
+  loading: boolean;
+  error: string | null;
+  onDraftChange: (query: UsageQuery) => void;
+  onSubmit: () => void;
+}) {
+  const rangeEndMax = draft.start_date
+    ? [TODAY_VALUE, shiftLocalDate(draft.start_date, 29)].sort()[0]
+    : TODAY_VALUE;
+  const peakTokens = Math.max(
+    1,
+    ...(statistics?.series.map((point) => point.metrics.total_tokens.value) ?? []),
+  );
+  const labelStep = Math.max(1, Math.ceil((statistics?.series.length ?? 1) / 8));
+  const summaryItems = statistics
+    ? [
+        ["总 Token", statistics.totals.total_tokens, "全部已上报用量"],
+        ["输入 Token", statistics.totals.input_tokens, "Prompt 与输入上下文"],
+        ["输出 Token", statistics.totals.output_tokens, "文本、工具与推理输出"],
+        ["缓存 Token", statistics.totals.cached_tokens, "上游明确返回的缓存命中"],
+        ["推理 Token", statistics.totals.reasoning_tokens, "上游明确返回的推理细项"],
+      ] as const
+    : [];
+
+  return (
+    <div className="usage-page">
+      <section className="panel usage-filter-panel">
+        <div className="usage-filter-heading">
+          <div>
+            <p className="section-kicker">TOKEN USAGE</p>
+            <h2>用量查询</h2>
+            <span>仅汇总中转明确返回的 usage，不修改请求，也不本地估算。</span>
+          </div>
+          {statistics && (
+            <div className="usage-period-label">
+              <span>当前统计周期</span>
+              <strong>{statistics.period.label}</strong>
+            </div>
+          )}
+        </div>
+        <div className="usage-filter-controls">
+          <div className="usage-mode-switch" role="group" aria-label="用量查询方式">
+            {([
+              ["today", "今天"],
+              ["range", "日期范围"],
+              ["month", "月份"],
+            ] as const).map(([mode, label]) => (
+              <button
+                type="button"
+                aria-pressed={draft.mode === mode}
+                className={draft.mode === mode ? "active" : ""}
+                key={mode}
+                onClick={() => onDraftChange({ ...draft, mode })}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <div className="usage-date-fields">
+            {draft.mode === "today" ? (
+              <div className="usage-today-value">
+                <span>本机日期</span>
+                <strong>{TODAY_VALUE}</strong>
+              </div>
+            ) : draft.mode === "range" ? (
+              <>
+                <label>
+                  <span>开始日期</span>
+                  <input
+                    type="date"
+                    max={TODAY_VALUE}
+                    value={draft.start_date ?? ""}
+                    onChange={(event) => {
+                      const start = event.target.value;
+                      if (!start) {
+                        onDraftChange({ ...draft, start_date: "", end_date: "" });
+                        return;
+                      }
+                      const endMax = [TODAY_VALUE, shiftLocalDate(start, 29)].sort()[0];
+                      onDraftChange({
+                        ...draft,
+                        start_date: start,
+                        end_date: draft.end_date && draft.end_date <= endMax
+                          ? draft.end_date
+                          : endMax,
+                      });
+                    }}
+                  />
+                </label>
+                <span className="usage-date-separator">至</span>
+                <label>
+                  <span>结束日期</span>
+                  <input
+                    type="date"
+                    min={draft.start_date}
+                    max={rangeEndMax}
+                    value={draft.end_date ?? ""}
+                    onChange={(event) => onDraftChange({
+                      ...draft,
+                      end_date: event.target.value,
+                    })}
+                  />
+                </label>
+              </>
+            ) : (
+              <label>
+                <span>查询月份</span>
+                <input
+                  type="month"
+                  max={CURRENT_MONTH_VALUE}
+                  value={draft.month ?? ""}
+                  onChange={(event) => onDraftChange({
+                    ...draft,
+                    month: event.target.value,
+                  })}
+                />
+              </label>
+            )}
+          </div>
+          <button
+            type="button"
+            className="primary-button usage-query-button"
+            disabled={loading}
+            onClick={onSubmit}
+          >
+            <BarChart3 size={16} />
+            {loading ? "查询中…" : "查询"}
+          </button>
+        </div>
+        {draft.mode === "range" && (
+          <div className="usage-range-hint">自定义日期范围最多 30 个自然日；月份查询可覆盖完整 31 天月份。</div>
+        )}
+        {error && <div className="usage-query-error">{error}</div>}
+      </section>
+
+      {statistics ? (
+        <>
+          <section className="usage-summary-grid">
+            {summaryItems.map(([label, metric, detail]) => (
+              <div className="usage-summary-card" key={label}>
+                <span>{label}</span>
+                <strong title={fullTokenFormatter.format(metric.value)}>
+                  {tokenMetricText(metric, statistics.completed_requests)}
+                </strong>
+                <small>
+                  {metric.reported_count
+                    ? `${metric.reported_count}/${statistics.completed_requests} 次请求上报`
+                    : detail}
+                </small>
+              </div>
+            ))}
+          </section>
+
+          <section className="panel usage-chart-panel">
+            <div className="usage-section-heading">
+              <div>
+                <p className="section-kicker">TREND</p>
+                <h2>用量趋势</h2>
+                <span>{statistics.period.resolution === "hour" ? "按小时" : "按天"}汇总输入与输出 Token</span>
+              </div>
+              <div className="usage-coverage">
+                <span>上报覆盖率</span>
+                <strong>{statistics.coverage_percent}%</strong>
+                <small>{statistics.reported_requests}/{statistics.completed_requests} 次完成请求</small>
+              </div>
+            </div>
+            {statistics.series.some((point) => point.metrics.total_tokens.value > 0) ? (
+              <div className="usage-chart" style={{ gridTemplateColumns: `repeat(${statistics.series.length}, minmax(8px, 1fr))` }}>
+                {statistics.series.map((point, index) => {
+                  const inputHeight = (point.metrics.input_tokens.value / peakTokens) * 100;
+                  const outputHeight = (point.metrics.output_tokens.value / peakTokens) * 100;
+                  const tooltip = `${point.label}\n输入 ${fullTokenFormatter.format(point.metrics.input_tokens.value)}\n输出 ${fullTokenFormatter.format(point.metrics.output_tokens.value)}\n缓存 ${fullTokenFormatter.format(point.metrics.cached_tokens.value)}\n推理 ${fullTokenFormatter.format(point.metrics.reasoning_tokens.value)}\n总计 ${fullTokenFormatter.format(point.metrics.total_tokens.value)}`;
+                  return (
+                    <div className="usage-chart-column" key={point.key} title={tooltip}>
+                      <div className="usage-bar-track">
+                        <span className="usage-bar-output" style={{ height: `${outputHeight}%` }} />
+                        <span className="usage-bar-input" style={{ height: `${inputHeight}%` }} />
+                      </div>
+                      <small>{index % labelStep === 0 || index === statistics.series.length - 1 ? point.label : ""}</small>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="usage-empty-chart">当前周期没有中转上报 Token 用量</div>
+            )}
+            <div className="usage-chart-legend">
+              <span><i className="input" />输入 Token</span>
+              <span><i className="output" />输出 Token</span>
+            </div>
+          </section>
+
+          <section className="panel usage-provider-panel">
+            <div className="usage-section-heading compact">
+              <div>
+                <p className="section-kicker">PROVIDERS</p>
+                <h2>中转用量明细</h2>
+              </div>
+              <span className="privacy-note">统计来自中转返回的 usage，不等同于中转账单</span>
+            </div>
+            <div className="usage-provider-table">
+              <div className="usage-provider-header">
+                <span>中转</span><span>完成请求</span><span>覆盖率</span><span>输入</span><span>输出</span><span>缓存</span><span>推理</span><span>总 Token</span>
+              </div>
+              {statistics.providers.map((provider) => (
+                <div className="usage-provider-row" key={provider.provider_id}>
+                  <div><strong>{provider.provider_name}</strong>{provider.deleted && <small>已删除中转</small>}</div>
+                  <span>{provider.completed_requests}</span>
+                  <span className={provider.coverage_percent < 100 && provider.completed_requests ? "partial" : ""}>{provider.completed_requests ? `${provider.coverage_percent}%` : "—"}</span>
+                  <span>{tokenMetricText(provider.metrics.input_tokens, provider.completed_requests)}</span>
+                  <span>{tokenMetricText(provider.metrics.output_tokens, provider.completed_requests)}</span>
+                  <span>{tokenMetricText(provider.metrics.cached_tokens, provider.completed_requests)}</span>
+                  <span>{tokenMetricText(provider.metrics.reasoning_tokens, provider.completed_requests)}</span>
+                  <strong>{tokenMetricText(provider.metrics.total_tokens, provider.completed_requests)}</strong>
+                </div>
+              ))}
+            </div>
+          </section>
+        </>
+      ) : (
+        <section className="panel usage-loading-state">
+          {loading ? "正在读取用量数据…" : "选择统计周期后查询用量"}
+        </section>
+      )}
     </div>
   );
 }
@@ -1412,6 +2224,7 @@ function ProviderDrawer({
   locked,
   saving,
   closing,
+  gatewayUrl,
   onClose,
   onDirtyChange,
   onSavingChange,
@@ -1426,6 +2239,7 @@ function ProviderDrawer({
   locked: boolean;
   saving: boolean;
   closing: boolean;
+  gatewayUrl: string;
   onClose: () => void;
   onDirtyChange: (dirty: boolean) => void;
   onSavingChange: (saving: boolean) => void;
@@ -1481,6 +2295,7 @@ function ProviderDrawer({
               provider={provider}
               health={health}
               locked={locked}
+              gatewayUrl={gatewayUrl}
               onEdit={onEdit}
               onTest={onTest}
               onLock={onLock}
@@ -1542,6 +2357,7 @@ function ProviderDetail({
   provider,
   health,
   locked,
+  gatewayUrl,
   onEdit,
   onTest,
   onLock,
@@ -1549,11 +2365,11 @@ function ProviderDetail({
   provider: Provider;
   health?: HealthSnapshot;
   locked: boolean;
+  gatewayUrl: string;
   onEdit: () => void;
   onTest: () => void;
   onLock: () => void;
 }) {
-  const token = "http://127.0.0.1:8765/v1";
   return (
     <div className="detail-content">
       <div className="detail-head">
@@ -1598,7 +2414,10 @@ function ProviderDetail({
         />
         <DetailLine
           label="API Key"
-          value={provider.has_api_key ? "已安全保存" : "未配置"}
+          value={
+            provider.api_key_error ??
+            (provider.has_api_key ? "已安全保存" : "未配置，请重新填写")
+          }
           icon={<KeyRound size={15} />}
         />
         <DetailLine label="响应头超时" value={`${provider.timeout_ms} ms`} />
@@ -1606,11 +2425,11 @@ function ProviderDetail({
       <div className="detail-section">
         <h3>本地接入</h3>
         <div className="copy-field">
-          <span>{token}</span>
+          <span>{gatewayUrl}</span>
           <button
             className="icon-button"
             title="复制地址"
-            onClick={() => void navigator.clipboard?.writeText(token)}
+            onClick={() => void navigator.clipboard?.writeText(gatewayUrl)}
           >
             <Copy size={15} />
           </button>
@@ -2043,6 +2862,12 @@ function ProviderForm({
         onChange={setApiKey}
         placeholder={provider?.has_api_key ? "已配置，留空保持不变" : "sk-..."}
         type="password"
+        hint={
+          provider?.api_key_error ??
+          (provider && !provider.has_api_key
+            ? "旧版未持久化的密钥无法恢复，请重新填写一次。"
+            : undefined)
+        }
       />
       <Field
         label="模型匹配"
@@ -2127,7 +2952,7 @@ function ConfigurationCenter({
 }) {
   const [testingGateway, setTestingGateway] = useState(false);
   const [gatewayTest, setGatewayTest] = useState<GatewayTestResult | null>(null);
-  const port = settings?.port ?? 8765;
+  const port = draft?.port ?? settings?.port ?? 8765;
   const gatewayUrl = `http://127.0.0.1:${port}/v1`;
 
   function setPolicyNumber(key: keyof RoutingPolicy, value: number) {
@@ -2194,11 +3019,16 @@ function ConfigurationCenter({
             <label className="field">
               <span>监听地址</span>
               <input value="127.0.0.1" disabled />
+              <small>仅允许本机访问，不开放局域网监听。</small>
             </label>
-            <label className="field">
-              <span>监听端口</span>
-              <input value={String(port)} disabled />
-            </label>
+            <NumberStepper
+              label="监听端口"
+              hint="允许 1024–65535，默认 8765；保存前会检查端口是否可用。"
+              value={draft.port}
+              min={1024}
+              max={65535}
+              onChange={(value) => onChange({ ...draft, port: value })}
+            />
           </div>
           <div className="token-block">
             <div>
@@ -2245,13 +3075,14 @@ function ConfigurationCenter({
           <div className="panel-heading">
             <div>
               <p className="section-kicker">HEALTH CHECK</p>
-              <h2>健康探测、日志与启动</h2>
-              <p>健康探测间隔和日志保留期限统一保存。</p>
+              <h2>健康探测、数据与启动</h2>
+              <p>探测间隔、日志和 Token 用量保留期限统一保存。</p>
             </div>
           </div>
           <div className="configuration-body">
           <NumberStepper label="健康探测间隔（秒）" hint="允许 5–3600 秒；正在等待的旧周期不会被强制中断。" value={draft.probe_interval_sec} min={5} max={3600} onChange={(value) => onChange({ ...draft, probe_interval_sec: value })} />
           <NumberStepper label="运行日志保留天数" hint="允许 1–365 天，默认 7 天；缩短期限后立即清理超期日志。" value={draft.log_retention_days} min={1} max={365} onChange={(value) => onChange({ ...draft, log_retention_days: value })} />
+          <NumberStepper label="用量数据保留天数" hint="允许 30–3650 天，默认 365 天；仅保存 Token 数字，不保存请求正文。" value={draft.usage_retention_days} min={30} max={3650} onChange={(value) => onChange({ ...draft, usage_retention_days: value })} />
           <div className="option-row">
             <div>
               <strong>开机自动启动</strong>
@@ -2329,7 +3160,7 @@ function ConfigurationCenter({
       <div className={`configuration-save-bar ${dirty ? "dirty" : ""} ${saveStatus === "error" ? "error" : ""}`}>
         <div>
           <strong>{statusText}</strong>
-          <span>{saveError ?? (dirty ? "离开配置中心前会提示保存或放弃修改。" : "日志期限立即生效，健康探测间隔在下一轮生效。")}</span>
+          <span>{saveError ?? (dirty ? "离开配置中心前会提示保存或放弃修改。" : "日志与用量保留期限立即生效，健康探测间隔在下一轮生效。")}</span>
         </div>
         <button className="primary-button" disabled={!dirty || saveStatus === "saving"}>
           <Save size={15} />

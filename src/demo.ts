@@ -7,6 +7,9 @@ import type {
   RuntimeStats,
   RoutingPolicy,
   RoutingEvent,
+  UsageQuery,
+  UsageStatistics,
+  UsageMetrics,
 } from "./api";
 
 export interface DemoData {
@@ -31,6 +34,7 @@ export function buildDemoData(): DemoData {
       enabled: true,
       timeout_ms: 120000,
       has_api_key: true,
+      api_key_error: null,
     },
     {
       id: "demo-backup",
@@ -41,6 +45,7 @@ export function buildDemoData(): DemoData {
       enabled: true,
       timeout_ms: 120000,
       has_api_key: true,
+      api_key_error: null,
     },
     {
       id: "demo-economy",
@@ -51,6 +56,7 @@ export function buildDemoData(): DemoData {
       enabled: true,
       timeout_ms: 90000,
       has_api_key: true,
+      api_key_error: null,
     },
   ];
   const makeProbeHistory = (
@@ -165,6 +171,7 @@ export function buildDemoData(): DemoData {
       local_token: "demo-local-token",
       probe_interval_sec: 60,
       log_retention_days: 7,
+      usage_retention_days: 365,
       gateway_running: true,
       gateway_listening: true,
       gateway_error: null,
@@ -195,5 +202,114 @@ export function buildDemoData(): DemoData {
       payload_too_large_action: "failover",
       notify_switches: true,
     },
+  };
+}
+
+function localDateString(date: Date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function demoMetrics(input: number, output: number, records: number): UsageMetrics {
+  return {
+    input_tokens: { value: input, reported_count: records },
+    output_tokens: { value: output, reported_count: records },
+    cached_tokens: {
+      value: Math.round(input * 0.42),
+      reported_count: Math.max(0, records - 2),
+    },
+    reasoning_tokens: {
+      value: Math.round(output * 0.31),
+      reported_count: Math.max(0, records - 4),
+    },
+    total_tokens: { value: input + output, reported_count: records },
+  };
+}
+
+// 演示统计跟随筛选生成，便于在普通浏览器验证今天、范围和月份三种布局。
+export function buildDemoUsageStatistics(query: UsageQuery): UsageStatistics {
+  const now = new Date();
+  let start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  let end = new Date(start);
+  let label = "今天";
+  let resolution: "hour" | "day" = "hour";
+  if (query.mode === "range" && query.start_date && query.end_date) {
+    start = new Date(`${query.start_date}T00:00:00`);
+    end = new Date(`${query.end_date}T00:00:00`);
+    label = `${query.start_date} 至 ${query.end_date}`;
+    resolution = "day";
+  } else if (query.mode === "month" && query.month) {
+    const [year, month] = query.month.split("-").map(Number);
+    start = new Date(year, month - 1, 1);
+    end = new Date(year, month, 0);
+    label = `${year}年${month}月`;
+    resolution = "day";
+  }
+  const bucketCount = resolution === "hour"
+    ? 24
+    : Math.round((end.getTime() - start.getTime()) / 86_400_000) + 1;
+  const series = Array.from({ length: bucketCount }, (_, index) => {
+    const input = 8_400 + ((index * 2_713) % 18_000);
+    const output = 2_100 + ((index * 1_177) % 6_800);
+    const records = 4 + (index % 8);
+    const date = new Date(start);
+    date.setDate(start.getDate() + index);
+    return {
+      key: resolution === "hour" ? String(index).padStart(2, "0") : localDateString(date),
+      label: resolution === "hour"
+        ? `${String(index).padStart(2, "0")}:00`
+        : `${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`,
+      completed_requests: records + (index % 3 === 0 ? 1 : 0),
+      reported_requests: records,
+      metrics: demoMetrics(input, output, records),
+    };
+  });
+  const totals = series.reduce(
+    (sum, point) => ({
+      input: sum.input + point.metrics.input_tokens.value,
+      output: sum.output + point.metrics.output_tokens.value,
+      completed: sum.completed + point.completed_requests,
+      reported: sum.reported + point.reported_requests,
+    }),
+    { input: 0, output: 0, completed: 0, reported: 0 },
+  );
+  const providerShares = [0.62, 0.27, 0.11];
+  const providers = ["主力中转", "备用中转", "经济线路"].map((name, index) => {
+    const input = index === 2
+      ? totals.input - Math.round(totals.input * providerShares[0]) - Math.round(totals.input * providerShares[1])
+      : Math.round(totals.input * providerShares[index]);
+    const output = index === 2
+      ? totals.output - Math.round(totals.output * providerShares[0]) - Math.round(totals.output * providerShares[1])
+      : Math.round(totals.output * providerShares[index]);
+    const completed = Math.round(totals.completed * providerShares[index]);
+    const reported = Math.min(completed, Math.round(totals.reported * providerShares[index]));
+    return {
+      provider_id: ["demo-primary", "demo-backup", "demo-economy"][index],
+      provider_name: name,
+      deleted: false,
+      completed_requests: completed,
+      reported_requests: reported,
+      coverage_percent: completed ? Math.round((reported / completed) * 1000) / 10 : 0,
+      metrics: demoMetrics(input, output, reported),
+    };
+  });
+  return {
+    period: {
+      mode: query.mode,
+      start_date: localDateString(start),
+      end_date: localDateString(end),
+      label,
+      resolution,
+    },
+    totals: demoMetrics(totals.input, totals.output, totals.reported),
+    providers,
+    series,
+    completed_requests: totals.completed,
+    reported_requests: totals.reported,
+    coverage_percent: totals.completed
+      ? Math.round((totals.reported / totals.completed) * 1000) / 10
+      : 0,
   };
 }
