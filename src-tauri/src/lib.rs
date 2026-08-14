@@ -1,5 +1,7 @@
 mod backup;
 mod codex_integration;
+mod codex_usage;
+mod usage_estimation;
 
 use axum::{
     body::{to_bytes, Body},
@@ -18,6 +20,7 @@ use keyring::{credential::CredentialPersistence, default, Entry};
 use reqwest::Client;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, VecDeque},
     error::Error as StdError,
@@ -53,7 +56,8 @@ const MAX_LOG_RETENTION_DAYS: u16 = 365;
 const DEFAULT_USAGE_RETENTION_DAYS: u16 = 365;
 const MIN_USAGE_RETENTION_DAYS: u16 = 30;
 const MAX_USAGE_RETENTION_DAYS: u16 = 3_650;
-const MAX_USAGE_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
+// usage 解析与 tokenizer 输出观察共用 8 MiB 上限；超限只停止统计，响应仍原样透传。
+const MAX_USAGE_CAPTURE_BYTES: usize = usage_estimation::MAX_ESTIMATION_TEXT_BYTES;
 const MAX_LOCAL_REQUEST_BODY_BYTES: usize = 200 * 1024 * 1024;
 const MAX_HEALTH_PROBES: usize = 24;
 const MAX_ERROR_BODY_BYTES: usize = 1024 * 1024;
@@ -166,11 +170,24 @@ pub struct UsageQuery {
     pub start_date: Option<String>,
     pub end_date: Option<String>,
     pub month: Option<String>,
+    #[serde(default)]
+    pub source: UsageSource,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageSource {
+    #[default]
+    All,
+    Official,
+    Gateway,
+    Unconfirmed,
 }
 
 #[derive(Clone, Serialize, Default)]
 pub struct TokenMetric {
     pub value: u64,
+    pub estimated_value: u64,
     pub reported_count: u64,
 }
 
@@ -178,8 +195,7 @@ pub struct TokenMetric {
 pub struct UsageMetrics {
     pub input_tokens: TokenMetric,
     pub output_tokens: TokenMetric,
-    pub cached_tokens: TokenMetric,
-    pub reasoning_tokens: TokenMetric,
+    pub cache_hit_tokens: TokenMetric,
     pub total_tokens: TokenMetric,
 }
 
@@ -200,6 +216,7 @@ pub struct ProviderUsageStatistics {
     pub completed_requests: u64,
     pub reported_requests: u64,
     pub coverage_percent: f64,
+    pub data_quality: String,
     pub metrics: UsageMetrics,
 }
 
@@ -221,13 +238,16 @@ pub struct UsageStatistics {
     pub completed_requests: u64,
     pub reported_requests: u64,
     pub coverage_percent: f64,
+    pub data_quality: String,
+    pub codex_sync_status: codex_usage::CodexUsageSyncStatus,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 struct CapturedUsage {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
-    cached_tokens: Option<u64>,
+    cache_read_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
     reasoning_tokens: Option<u64>,
     total_tokens: Option<u64>,
 }
@@ -245,6 +265,17 @@ struct UsageRecord {
     model: Option<String>,
     request_path: String,
     usage: CapturedUsage,
+    data_source: &'static str,
+    usage_origin: &'static str,
+    client_origin: &'static str,
+    codex_event_key: Option<String>,
+    gateway_request_id: Option<String>,
+    attempt_index: u32,
+    is_final_attempt: bool,
+    http_status: Option<u16>,
+    outcome: &'static str,
+    token_source: &'static str,
+    estimate_method: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -269,6 +300,9 @@ pub struct RoutingPolicy {
     pub retry_count: u8,
     pub retry_interval_sec: u64,
     pub max_retry_wait_sec: u64,
+    pub retry_unknown_transient_errors: bool,
+    pub allow_provider_failover: bool,
+    // 旧版备份仍包含容量专用字段；保存时与统一重试配置同步，避免破坏格式版本 1。
     pub capacity_retry_count: u8,
     pub capacity_retry_interval_sec: u64,
     pub capacity_max_retry_wait_sec: u64,
@@ -282,11 +316,13 @@ pub struct RoutingPolicy {
 impl Default for RoutingPolicy {
     fn default() -> Self {
         Self {
-            retry_count: 1,
+            retry_count: 5,
             retry_interval_sec: 1,
-            max_retry_wait_sec: 10,
-            capacity_retry_count: 3,
-            capacity_retry_interval_sec: 5,
+            max_retry_wait_sec: 30,
+            retry_unknown_transient_errors: true,
+            allow_provider_failover: false,
+            capacity_retry_count: 5,
+            capacity_retry_interval_sec: 1,
             capacity_max_retry_wait_sec: 30,
             circuit_failure_threshold: 3,
             circuit_cooldown_sec: 60,
@@ -322,6 +358,37 @@ pub struct EventLog {
     pub model: Option<String>,
     pub event_type: Option<String>,
     pub routing_event: Option<RoutingEvent>,
+    pub diagnostic_detail: Option<DiagnosticDetail>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct DiagnosticDetail {
+    pub request_id: String,
+    pub provider_id: String,
+    pub model: Option<String>,
+    pub request_path: String,
+    pub error_class: String,
+    pub http_status: Option<u16>,
+    pub error_code: Option<String>,
+    pub error_type: Option<String>,
+    pub error_message: Option<String>,
+    pub incomplete_reason: Option<String>,
+    pub upstream_request_id: Option<String>,
+    pub last_sse_event: Option<String>,
+    pub terminal_event: Option<String>,
+    pub terminal_received: bool,
+    pub business_output_started: bool,
+    pub bytes_received: u64,
+    pub elapsed_ms: u64,
+    pub attempt_index: u8,
+    pub max_attempts: u8,
+    pub retry_wait_sec: Option<u64>,
+    pub fallback_retry_enabled: bool,
+    pub failover_enabled: bool,
+    pub action: String,
+    pub parse_error: Option<String>,
+    // 每条诊断保留当时已经发生的脱敏路由尝试，详情弹窗无需查询请求正文即可还原过程。
+    pub attempts: Vec<RoutingAttempt>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -519,8 +586,11 @@ struct AppState {
     codex_config_fingerprint: Arc<Mutex<Option<String>>>,
     // 迁移预览只在当前进程内有效；执行时还会重新扫描磁盘并核对完整指纹。
     codex_history_preview: Arc<Mutex<Option<codex_integration::HistoryPreviewSnapshot>>>,
-    // 登录检测是显式操作，轮询状态时复用最近结果，避免反复启动 CLI。
-    codex_login_status: Arc<Mutex<codex_integration::CodexLoginStatus>>,
+    // 桌面端、CLI 和本地登录凭据只在启动或用户手动刷新时检测，避免轮询反复查询系统进程。
+    codex_environment_status: Arc<Mutex<codex_integration::CodexEnvironmentStatus>>,
+    // 自动同步、手动同步和重建必须串行，避免重建清游标时另一轮正在回填。
+    codex_usage_sync_lock: Arc<tokio::sync::Mutex<()>>,
+    codex_usage_status: Arc<Mutex<codex_usage::CodexUsageSyncStatus>>,
     // 单元测试不启动 Tauri runtime，因此事件发送句柄允许为空。
     app_handle: Option<tauri::AppHandle>,
 }
@@ -578,7 +648,8 @@ impl AppState {
                     provider_id TEXT,
                     model TEXT,
                     event_type TEXT,
-                    routing_event_json TEXT
+                    routing_event_json TEXT,
+                    diagnostic_json TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_event_logs_timestamp ON event_logs(timestamp);
                 CREATE TABLE IF NOT EXISTS usage_records (
@@ -591,19 +662,55 @@ impl AppState {
                     input_tokens INTEGER,
                     output_tokens INTEGER,
                     cached_tokens INTEGER,
+                    cache_write_tokens INTEGER,
                     reasoning_tokens INTEGER,
                     total_tokens INTEGER,
-                    usage_reported INTEGER NOT NULL
+                    usage_reported INTEGER NOT NULL,
+                    data_source TEXT NOT NULL DEFAULT 'gateway_response',
+                    usage_origin TEXT NOT NULL DEFAULT 'gateway',
+                    client_origin TEXT NOT NULL DEFAULT 'unknown',
+                    codex_event_key TEXT,
+                    codex_usage_supplemented INTEGER NOT NULL DEFAULT 0,
+                    gateway_request_id TEXT,
+                    attempt_index INTEGER NOT NULL DEFAULT 1,
+                    is_final_attempt INTEGER NOT NULL DEFAULT 1,
+                    http_status INTEGER,
+                    outcome TEXT NOT NULL DEFAULT 'completed',
+                    token_source TEXT NOT NULL DEFAULT 'none',
+                    estimate_method TEXT,
+                    codex_previous_usage_json TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_usage_records_completed_at
                     ON usage_records(completed_at);
                 CREATE INDEX IF NOT EXISTS idx_usage_records_provider_time
-                    ON usage_records(provider_id, completed_at);",
+                    ON usage_records(provider_id, completed_at);
+                CREATE TABLE IF NOT EXISTS codex_usage_sync_state (
+                    relative_path TEXT PRIMARY KEY,
+                    file_identity TEXT NOT NULL,
+                    file_size INTEGER NOT NULL,
+                    modified_at_ms INTEGER NOT NULL,
+                    line_offset INTEGER NOT NULL,
+                    byte_offset INTEGER NOT NULL,
+                    last_total_json TEXT,
+                    session_id TEXT,
+                    model_provider TEXT,
+                    current_model TEXT,
+                    parent_session_id TEXT,
+                    last_synced_at TEXT NOT NULL,
+                    last_warning TEXT
+                );
+                CREATE TABLE IF NOT EXISTS codex_mode_history (
+                    changed_at TEXT PRIMARY KEY,
+                    mode TEXT NOT NULL
+                );",
             )
             .map_err(|e| e.to_string())?;
+        migrate_usage_schema(&connection)?;
+        migrate_event_log_schema(&connection)?;
         let store = Arc::new(Store {
             connection: Mutex::new(connection),
         });
+        migrate_unified_retry_policy(&store)?;
         let secrets: Arc<dyn ProviderSecretStore> = Arc::new(SystemProviderSecretStore);
         let token =
             setting(&store, "local_token")?.unwrap_or_else(|| Uuid::new_v4().simple().to_string());
@@ -639,6 +746,30 @@ impl AppState {
             gateway_listening: false,
             gateway_error: None,
         };
+        if setting(&store, "codex_mode_history_initialized")?.is_none() {
+            // 升级后的第一条模式基线来自当前 config.toml；无法检测时保持为空，避免猜错旧历史来源。
+            let configuration = gateway_codex_configuration(&settings);
+            let mode = codex_integration::integration_state(
+                &configuration,
+                codex_integration::CodexEnvironmentStatus {
+                    desktop_status: codex_integration::CodexApplicationStatus::NotInstalled,
+                    cli_status: codex_integration::CodexApplicationStatus::NotInstalled,
+                    login_status: codex_integration::CodexLoginStatus::Unknown,
+                },
+            )
+            .current_mode;
+            match mode {
+                codex_integration::CodexConnectionMode::Official => {
+                    codex_usage::record_mode(&store, "official")?
+                }
+                codex_integration::CodexConnectionMode::Gateway => {
+                    codex_usage::record_mode(&store, "gateway")?
+                }
+                codex_integration::CodexConnectionMode::External => {}
+            }
+            save_setting(&store, "codex_mode_history_initialized", "1")?;
+        }
+        let codex_usage_status = codex_usage::stored_status(&store);
         Ok(Self {
             config: Arc::new(RwLock::new(providers)),
             health: Arc::new(Mutex::new(HashMap::new())),
@@ -655,11 +786,91 @@ impl AppState {
                 codex_integration::config_fingerprint().ok(),
             )),
             codex_history_preview: Arc::new(Mutex::new(None)),
-            // 启动时只调用一次 Codex CLI，页面首次打开即可显示登录状态；轮询不会重复启动进程。
-            codex_login_status: Arc::new(Mutex::new(codex_integration::login_status())),
+            codex_environment_status: Arc::new(Mutex::new(codex_integration::environment_status())),
+            codex_usage_sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+            codex_usage_status: Arc::new(Mutex::new(codex_usage_status)),
             app_handle: Some(app.clone()),
         })
     }
+}
+
+fn usage_column_exists(connection: &Connection, column: &str) -> Result<bool, String> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('usage_records') WHERE name = ?1)",
+            [column],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("无法检查用量数据库结构：{error}"))
+}
+
+fn migrate_usage_schema(connection: &Connection) -> Result<(), String> {
+    // SQLite 的 ADD COLUMN 是非破坏性的；逐列检测保证 0.2.x/0.3.0 数据库可直接升级。
+    for (column, definition) in [
+        ("cache_write_tokens", "INTEGER"),
+        ("data_source", "TEXT NOT NULL DEFAULT 'gateway_response'"),
+        ("usage_origin", "TEXT NOT NULL DEFAULT 'gateway'"),
+        ("client_origin", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("codex_event_key", "TEXT"),
+        ("codex_usage_supplemented", "INTEGER NOT NULL DEFAULT 0"),
+        ("gateway_request_id", "TEXT"),
+        ("attempt_index", "INTEGER NOT NULL DEFAULT 1"),
+        ("is_final_attempt", "INTEGER NOT NULL DEFAULT 1"),
+        ("http_status", "INTEGER"),
+        ("outcome", "TEXT NOT NULL DEFAULT 'completed'"),
+        ("token_source", "TEXT NOT NULL DEFAULT 'none'"),
+        ("estimate_method", "TEXT"),
+        ("codex_previous_usage_json", "TEXT"),
+    ] {
+        if !usage_column_exists(connection, column)? {
+            connection
+                .execute(
+                    &format!("ALTER TABLE usage_records ADD COLUMN {column} {definition}"),
+                    [],
+                )
+                .map_err(|error| format!("无法升级用量数据库字段 {column}：{error}"))?;
+        }
+    }
+    connection
+        .execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_records_codex_event_key
+                 ON usage_records(codex_event_key) WHERE codex_event_key IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS idx_usage_records_origin_time
+                 ON usage_records(usage_origin, completed_at);
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_records_gateway_attempt
+                 ON usage_records(gateway_request_id, provider_id, attempt_index)
+                 WHERE gateway_request_id IS NOT NULL;",
+        )
+        .map_err(|error| format!("无法创建用量去重索引：{error}"))?;
+    // 旧版本没有记录 Token 来源；按现有来源和上报状态进行一次可重复的兼容回填。
+    connection
+        .execute_batch(
+            "UPDATE usage_records
+             SET token_source = CASE
+                 WHEN data_source='codex_session' THEN 'codex_session'
+                 WHEN usage_reported=1 THEN 'upstream'
+                 ELSE 'none'
+             END
+             WHERE token_source='none' AND (data_source='codex_session' OR usage_reported=1);",
+        )
+        .map_err(|error| format!("无法回填用量来源：{error}"))
+}
+
+fn migrate_event_log_schema(connection: &Connection) -> Result<(), String> {
+    let diagnostic_exists = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('event_logs') WHERE name = 'diagnostic_json')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("无法检查运行日志数据库结构：{error}"))?;
+    if !diagnostic_exists {
+        // 诊断详情使用可空列，旧日志无需回填，升级后仍可按原格式读取。
+        connection
+            .execute("ALTER TABLE event_logs ADD COLUMN diagnostic_json TEXT", [])
+            .map_err(|error| format!("无法升级运行日志诊断字段：{error}"))?;
+    }
+    Ok(())
 }
 
 fn load_port(store: &Store) -> Result<u16, String> {
@@ -691,6 +902,55 @@ fn save_setting(store: &Store, key: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn migrate_unified_retry_policy(store: &Store) -> Result<(), String> {
+    if setting(store, "unified_retry_policy_v1")?.is_some() {
+        return Ok(());
+    }
+    let defaults = RoutingPolicy::default();
+    let mut conn = store
+        .connection
+        .lock()
+        .map_err(|_| "数据库锁已损坏".to_string())?;
+    let transaction = conn.transaction().map_err(|error| error.to_string())?;
+    // 0.3.2 只迁移新定义的统一重试字段，保留用户已有的熔断、413 和通知偏好。
+    for (key, value) in [
+        ("retry_count", defaults.retry_count.to_string()),
+        (
+            "retry_interval_sec",
+            defaults.retry_interval_sec.to_string(),
+        ),
+        (
+            "max_retry_wait_sec",
+            defaults.max_retry_wait_sec.to_string(),
+        ),
+        (
+            "allow_provider_failover",
+            defaults.allow_provider_failover.to_string(),
+        ),
+        (
+            "capacity_retry_count",
+            defaults.capacity_retry_count.to_string(),
+        ),
+        (
+            "capacity_retry_interval_sec",
+            defaults.capacity_retry_interval_sec.to_string(),
+        ),
+        (
+            "capacity_max_retry_wait_sec",
+            defaults.capacity_max_retry_wait_sec.to_string(),
+        ),
+        ("unified_retry_policy_v1", "1".to_string()),
+    ] {
+        transaction
+            .execute(
+                "INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![key, value],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    transaction.commit().map_err(|error| error.to_string())
+}
+
 fn load_routing_policy(store: &Store) -> Result<RoutingPolicy, String> {
     let defaults = RoutingPolicy::default();
     let value = |key: &str| setting(store, key);
@@ -698,7 +958,7 @@ fn load_routing_policy(store: &Store) -> Result<RoutingPolicy, String> {
         Some("return") => PayloadTooLargeAction::Return,
         _ => PayloadTooLargeAction::Failover,
     };
-    let policy = RoutingPolicy {
+    let mut policy = RoutingPolicy {
         retry_count: value("retry_count")?
             .and_then(|item| item.parse().ok())
             .unwrap_or(defaults.retry_count),
@@ -708,6 +968,12 @@ fn load_routing_policy(store: &Store) -> Result<RoutingPolicy, String> {
         max_retry_wait_sec: value("max_retry_wait_sec")?
             .and_then(|item| item.parse().ok())
             .unwrap_or(defaults.max_retry_wait_sec),
+        retry_unknown_transient_errors: value("retry_unknown_transient_errors")?
+            .and_then(|item| item.parse().ok())
+            .unwrap_or(defaults.retry_unknown_transient_errors),
+        allow_provider_failover: value("allow_provider_failover")?
+            .and_then(|item| item.parse().ok())
+            .unwrap_or(defaults.allow_provider_failover),
         capacity_retry_count: value("capacity_retry_count")?
             .and_then(|item| item.parse().ok())
             .unwrap_or(defaults.capacity_retry_count),
@@ -731,19 +997,33 @@ fn load_routing_policy(store: &Store) -> Result<RoutingPolicy, String> {
             .and_then(|item| item.parse().ok())
             .unwrap_or(defaults.notify_switches),
     };
+    synchronize_legacy_retry_fields(&mut policy);
     validate_routing_policy(&policy)?;
     Ok(policy)
 }
 
+fn synchronize_legacy_retry_fields(policy: &mut RoutingPolicy) {
+    // 容量和账号并发错误已归入统一重试策略，旧字段仅作为备份兼容镜像。
+    policy.capacity_retry_count = policy.retry_count;
+    policy.capacity_retry_interval_sec = policy.retry_interval_sec;
+    policy.capacity_max_retry_wait_sec = policy.max_retry_wait_sec;
+}
+
+fn normalized_routing_policy(policy: &RoutingPolicy) -> RoutingPolicy {
+    let mut normalized = policy.clone();
+    synchronize_legacy_retry_fields(&mut normalized);
+    normalized
+}
+
 fn validate_routing_policy(policy: &RoutingPolicy) -> Result<(), String> {
-    if policy.retry_count > 3 {
-        return Err("重试次数必须在 0 到 3 之间".to_string());
+    if policy.retry_count > 5 {
+        return Err("重试次数必须在 0 到 5 之间".to_string());
     }
-    if policy.retry_interval_sec > 60 {
-        return Err("重试间隔必须在 0 到 60 秒之间".to_string());
+    if !(1..=60).contains(&policy.retry_interval_sec) {
+        return Err("重试间隔必须在 1 到 60 秒之间".to_string());
     }
-    if !(1..=300).contains(&policy.max_retry_wait_sec) {
-        return Err("单次请求最大重试等待必须在 1 到 300 秒之间".to_string());
+    if !(1..=600).contains(&policy.max_retry_wait_sec) {
+        return Err("单次请求最大重试等待必须在 1 到 600 秒之间".to_string());
     }
     if policy.capacity_retry_count > 5 {
         return Err("模型容量重试次数必须在 0 到 5 之间".to_string());
@@ -807,6 +1087,14 @@ fn routing_policy_values(policy: &RoutingPolicy) -> Vec<(&'static str, String)> 
         ("retry_interval_sec", policy.retry_interval_sec.to_string()),
         ("max_retry_wait_sec", policy.max_retry_wait_sec.to_string()),
         (
+            "retry_unknown_transient_errors",
+            policy.retry_unknown_transient_errors.to_string(),
+        ),
+        (
+            "allow_provider_failover",
+            policy.allow_provider_failover.to_string(),
+        ),
+        (
             "capacity_retry_count",
             policy.capacity_retry_count.to_string(),
         ),
@@ -842,13 +1130,14 @@ fn routing_policy_values(policy: &RoutingPolicy) -> Vec<(&'static str, String)> 
 }
 
 fn persist_routing_policy(store: &Store, policy: &RoutingPolicy) -> Result<(), String> {
+    let policy = normalized_routing_policy(policy);
     let mut conn = store
         .connection
         .lock()
         .map_err(|_| "数据库锁已损坏".to_string())?;
     let transaction = conn.transaction().map_err(|error| error.to_string())?;
     // 所有规则在同一事务中更新，避免新请求读取到一半是旧值、一半是新值的策略。
-    for (key, value) in routing_policy_values(policy) {
+    for (key, value) in routing_policy_values(&policy) {
         transaction
             .execute(
                 "INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -867,6 +1156,7 @@ fn persist_configuration(
     usage_retention_days: u16,
     policy: &RoutingPolicy,
 ) -> Result<(), String> {
+    let policy = normalized_routing_policy(policy);
     let mut conn = store
         .connection
         .lock()
@@ -878,7 +1168,7 @@ fn persist_configuration(
         ("log_retention_days", log_retention_days.to_string()),
         ("usage_retention_days", usage_retention_days.to_string()),
     ];
-    values.extend(routing_policy_values(policy));
+    values.extend(routing_policy_values(&policy));
 
     // 监听端口、探测间隔和路由规则属于同一份运行配置，必须一起提交，避免保存成功一半。
     for (key, value) in values {
@@ -972,13 +1262,19 @@ fn persist_event_log(store: &Store, entry: &EventLog) -> Result<(), String> {
         .map(serde_json::to_string)
         .transpose()
         .map_err(|error| format!("无法序列化路由事件：{error}"))?;
+    let diagnostic_json = entry
+        .diagnostic_detail
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| format!("无法序列化诊断详情：{error}"))?;
     let conn = store
         .connection
         .lock()
         .map_err(|_| "数据库锁已损坏".to_string())?;
     conn.execute(
-        "INSERT INTO event_logs(timestamp,level,message,provider_id,model,event_type,routing_event_json)
-         VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        "INSERT INTO event_logs(timestamp,level,message,provider_id,model,event_type,routing_event_json,diagnostic_json)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
         params![
             log_timestamp(entry.timestamp),
             entry.level,
@@ -986,7 +1282,8 @@ fn persist_event_log(store: &Store, entry: &EventLog) -> Result<(), String> {
             entry.provider_id,
             entry.model,
             entry.event_type,
-            routing_event_json
+            routing_event_json,
+            diagnostic_json
         ],
     )
     .map_err(|error| format!("无法写入运行日志：{error}"))?;
@@ -1000,7 +1297,7 @@ fn load_recent_logs(store: &Store) -> Result<VecDeque<EventLog>, String> {
         .map_err(|_| "数据库锁已损坏".to_string())?;
     let mut statement = conn
         .prepare(
-            "SELECT timestamp,level,message,provider_id,model,event_type,routing_event_json
+            "SELECT timestamp,level,message,provider_id,model,event_type,routing_event_json,diagnostic_json
              FROM event_logs ORDER BY id DESC LIMIT ?1",
         )
         .map_err(|error| error.to_string())?;
@@ -1014,13 +1311,22 @@ fn load_recent_logs(store: &Store) -> Result<VecDeque<EventLog>, String> {
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         })
         .map_err(|error| error.to_string())?;
     let mut newest_first = Vec::new();
     for row in rows {
-        let (timestamp, level, message, provider_id, model, event_type, routing_event_json) =
-            row.map_err(|error| error.to_string())?;
+        let (
+            timestamp,
+            level,
+            message,
+            provider_id,
+            model,
+            event_type,
+            routing_event_json,
+            diagnostic_json,
+        ) = row.map_err(|error| error.to_string())?;
         let timestamp = DateTime::parse_from_rfc3339(&timestamp)
             .map_err(|error| format!("运行日志时间格式损坏：{error}"))?
             .with_timezone(&Utc);
@@ -1028,6 +1334,9 @@ fn load_recent_logs(store: &Store) -> Result<VecDeque<EventLog>, String> {
         let routing_event = routing_event_json
             .as_deref()
             .and_then(|json| serde_json::from_str::<RoutingEvent>(json).ok());
+        let diagnostic_detail = diagnostic_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<DiagnosticDetail>(json).ok());
         newest_first.push(EventLog {
             timestamp,
             level,
@@ -1036,6 +1345,7 @@ fn load_recent_logs(store: &Store) -> Result<VecDeque<EventLog>, String> {
             model,
             event_type,
             routing_event,
+            diagnostic_detail,
         });
     }
     newest_first.reverse();
@@ -1063,7 +1373,7 @@ fn sqlite_token(value: Option<u64>) -> Result<Option<i64>, String> {
         .transpose()
 }
 
-fn persist_usage_record(store: &Store, record: &UsageRecord) -> Result<(), String> {
+fn persist_usage_record(store: &Store, record: &UsageRecord) -> Result<bool, String> {
     let conn = store
         .connection
         .lock()
@@ -1071,8 +1381,14 @@ fn persist_usage_record(store: &Store, record: &UsageRecord) -> Result<(), Strin
     conn.execute(
         "INSERT INTO usage_records(
             completed_at,provider_id,provider_name,model,request_path,
-            input_tokens,output_tokens,cached_tokens,reasoning_tokens,total_tokens,usage_reported
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            input_tokens,output_tokens,cached_tokens,cache_write_tokens,reasoning_tokens,
+            total_tokens,usage_reported,data_source,usage_origin,client_origin,codex_event_key,
+            gateway_request_id,attempt_index,is_final_attempt,http_status,outcome,token_source,
+            estimate_method
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,
+                  ?17,?18,?19,?20,?21,?22,?23)
+         ON CONFLICT(gateway_request_id,provider_id,attempt_index) WHERE gateway_request_id IS NOT NULL
+         DO NOTHING",
         params![
             log_timestamp(record.completed_at),
             record.provider_id,
@@ -1081,14 +1397,97 @@ fn persist_usage_record(store: &Store, record: &UsageRecord) -> Result<(), Strin
             record.request_path,
             sqlite_token(record.usage.input_tokens)?,
             sqlite_token(record.usage.output_tokens)?,
-            sqlite_token(record.usage.cached_tokens)?,
+            sqlite_token(record.usage.cache_read_tokens)?,
+            sqlite_token(record.usage.cache_write_tokens)?,
             sqlite_token(record.usage.reasoning_tokens)?,
             sqlite_token(record.usage.total_tokens)?,
             i64::from(record.usage.is_reported()),
+            record.data_source,
+            record.usage_origin,
+            record.client_origin,
+            record.codex_event_key,
+            record.gateway_request_id,
+            i64::from(record.attempt_index),
+            i64::from(record.is_final_attempt),
+            record.http_status.map(i64::from),
+            record.outcome,
+            record.token_source,
+            record.estimate_method,
         ],
     )
-    .map(|_| ())
+    .map(|inserted| inserted > 0)
     .map_err(|error| format!("无法保存 Token 用量：{error}"))
+}
+
+fn emit_usage_updated(state: &AppState, record: &UsageRecord) {
+    if let Some(app) = state.app_handle.as_ref() {
+        let _ = app.emit(
+            "usage-updated",
+            serde_json::json!({
+                "provider_id": record.provider_id,
+                "completed_at": record.completed_at,
+            }),
+        );
+    }
+}
+
+fn persist_gateway_attempt(state: &AppState, record: UsageRecord) {
+    // 统计失败不能改变代理结果；唯一索引保证流终态、Drop 和异常分支不会重复结算同一尝试。
+    match persist_usage_record(&state.store, &record) {
+        // 幂等冲突表示该尝试已经结算，不能再次触发页面刷新或同步连锁反应。
+        Ok(true) => emit_usage_updated(state, &record),
+        Ok(false) => {}
+        Err(error) => warn!(%error, "usage persistence failed"),
+    }
+}
+
+fn collect_prepared_usage(
+    response: &PreparedUpstreamResponse,
+    request_estimate: Option<usage_estimation::RequestTokenEstimate>,
+    model: Option<String>,
+    allow_estimate: bool,
+) -> CollectedUsage {
+    let mut collector =
+        UsageCollector::new(response.usage_response_kind(), request_estimate, model);
+    for chunk in &response.prefix {
+        collector.observe(chunk);
+    }
+    collector.finish(allow_estimate)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gateway_usage_record(
+    request_id: &str,
+    attempt_index: u32,
+    provider_id: &str,
+    provider_name: &str,
+    model: Option<String>,
+    request_path: &str,
+    status: Option<StatusCode>,
+    outcome: &'static str,
+    is_final_attempt: bool,
+    client_origin: &'static str,
+    collected: CollectedUsage,
+) -> UsageRecord {
+    UsageRecord {
+        completed_at: Utc::now(),
+        provider_id: provider_id.to_string(),
+        provider_name: provider_name.to_string(),
+        model,
+        request_path: request_path.to_string(),
+        usage: collected.usage,
+        data_source: "gateway_response",
+        usage_origin: "gateway",
+        client_origin,
+        codex_event_key: None,
+        gateway_request_id: Some(request_id.to_string()),
+        attempt_index,
+        is_final_attempt,
+        http_status: status.map(|value| value.as_u16()),
+        outcome,
+        token_source: collected.token_source,
+        estimate_method: collected.estimate_method,
+    }
 }
 
 fn prune_expired_usage(store: &Store, retention_days: u16) -> Result<usize, String> {
@@ -1109,26 +1508,62 @@ struct UsageAggregate {
     metrics: UsageMetrics,
     completed_requests: u64,
     reported_requests: u64,
+    exact_requests: u64,
+    estimated_requests: u64,
 }
 
 impl UsageAggregate {
-    fn add_metric(metric: &mut TokenMetric, value: Option<u64>) {
+    fn add_metric(metric: &mut TokenMetric, value: Option<u64>, estimated: bool) {
         if let Some(value) = value {
             metric.value = metric.value.saturating_add(value);
+            if estimated {
+                metric.estimated_value = metric.estimated_value.saturating_add(value);
+            }
             metric.reported_count = metric.reported_count.saturating_add(1);
         }
     }
 
-    fn add(&mut self, usage: &CapturedUsage) {
+    fn add(&mut self, usage: &CapturedUsage, token_source: &str) {
         self.completed_requests = self.completed_requests.saturating_add(1);
         if usage.is_reported() {
             self.reported_requests = self.reported_requests.saturating_add(1);
+            if token_source == "estimated" {
+                self.estimated_requests = self.estimated_requests.saturating_add(1);
+            } else {
+                self.exact_requests = self.exact_requests.saturating_add(1);
+            }
         }
-        Self::add_metric(&mut self.metrics.input_tokens, usage.input_tokens);
-        Self::add_metric(&mut self.metrics.output_tokens, usage.output_tokens);
-        Self::add_metric(&mut self.metrics.cached_tokens, usage.cached_tokens);
-        Self::add_metric(&mut self.metrics.reasoning_tokens, usage.reasoning_tokens);
-        Self::add_metric(&mut self.metrics.total_tokens, usage.total_tokens);
+        let estimated = token_source == "estimated";
+        Self::add_metric(
+            &mut self.metrics.input_tokens,
+            usage.input_tokens,
+            estimated,
+        );
+        Self::add_metric(
+            &mut self.metrics.output_tokens,
+            usage.output_tokens,
+            estimated,
+        );
+        Self::add_metric(
+            &mut self.metrics.cache_hit_tokens,
+            usage.cache_read_tokens,
+            false,
+        );
+        Self::add_metric(
+            &mut self.metrics.total_tokens,
+            usage.total_tokens,
+            estimated,
+        );
+    }
+
+    fn data_quality(&self) -> String {
+        match (self.exact_requests, self.estimated_requests) {
+            (0, 0) => "unknown",
+            (0, _) => "estimated",
+            (_, 0) => "exact",
+            _ => "mixed",
+        }
+        .to_string()
     }
 }
 
@@ -1245,6 +1680,7 @@ fn usage_from_columns(
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
     cached_tokens: Option<i64>,
+    cache_write_tokens: Option<i64>,
     reasoning_tokens: Option<i64>,
     total_tokens: Option<i64>,
 ) -> CapturedUsage {
@@ -1252,7 +1688,8 @@ fn usage_from_columns(
     CapturedUsage {
         input_tokens: nonnegative(input_tokens),
         output_tokens: nonnegative(output_tokens),
-        cached_tokens: nonnegative(cached_tokens),
+        cache_read_tokens: nonnegative(cached_tokens),
+        cache_write_tokens: nonnegative(cache_write_tokens),
         reasoning_tokens: nonnegative(reasoning_tokens),
         total_tokens: nonnegative(total_tokens),
     }
@@ -1276,9 +1713,12 @@ fn query_usage_statistics(state: &AppState, query: &UsageQuery) -> Result<UsageS
     let mut statement = conn
         .prepare(
             "SELECT completed_at,provider_id,provider_name,
-                    input_tokens,output_tokens,cached_tokens,reasoning_tokens,total_tokens
+                    input_tokens,output_tokens,cached_tokens,cache_write_tokens,
+                    reasoning_tokens,total_tokens,usage_origin,token_source
              FROM usage_records
              WHERE completed_at >= ?1 AND completed_at < ?2
+               AND (data_source='codex_session' OR request_path='/v1/responses'
+                    OR request_path='/v1/chat/completions')
              ORDER BY completed_at ASC",
         )
         .map_err(|error| error.to_string())?;
@@ -1295,21 +1735,59 @@ fn query_usage_statistics(state: &AppState, query: &UsageQuery) -> Result<UsageS
                     row.get::<_, Option<i64>>(5)?,
                     row.get::<_, Option<i64>>(6)?,
                     row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
                 ))
             },
         )
         .map_err(|error| error.to_string())?;
 
-    let mut provider_aggregates = configured_names
-        .iter()
-        .map(|(id, name)| (id.clone(), (name.clone(), UsageAggregate::default())))
-        .collect::<HashMap<_, _>>();
+    let mut provider_aggregates = if matches!(query.source, UsageSource::All | UsageSource::Gateway)
+    {
+        configured_names
+            .iter()
+            .map(|(id, name)| (id.clone(), (name.clone(), UsageAggregate::default())))
+            .collect::<HashMap<_, _>>()
+    } else {
+        HashMap::new()
+    };
+    if matches!(query.source, UsageSource::All | UsageSource::Official) {
+        provider_aggregates
+            .entry(codex_usage::OFFICIAL_PROVIDER_ID.to_string())
+            .or_insert_with(|| {
+                (
+                    codex_usage::OFFICIAL_PROVIDER_NAME.to_string(),
+                    UsageAggregate::default(),
+                )
+            });
+    }
     let mut series_aggregates: HashMap<String, UsageAggregate> = HashMap::new();
     let mut totals = UsageAggregate::default();
 
     for row in rows {
-        let (timestamp, provider_id, stored_name, input, output, cached, reasoning, total) =
-            row.map_err(|error| error.to_string())?;
+        let (
+            timestamp,
+            provider_id,
+            stored_name,
+            input,
+            output,
+            cached,
+            cache_write,
+            reasoning,
+            total,
+            origin,
+            token_source,
+        ) = row.map_err(|error| error.to_string())?;
+        let selected = match query.source {
+            UsageSource::All => true,
+            UsageSource::Official => origin == "official",
+            UsageSource::Gateway => origin == "gateway",
+            UsageSource::Unconfirmed => origin == "unconfirmed",
+        };
+        if !selected {
+            continue;
+        }
         let completed_at = match DateTime::parse_from_rfc3339(&timestamp) {
             Ok(value) => value.with_timezone(&Utc),
             Err(error) => {
@@ -1317,8 +1795,8 @@ fn query_usage_statistics(state: &AppState, query: &UsageQuery) -> Result<UsageS
                 continue;
             }
         };
-        let usage = usage_from_columns(input, output, cached, reasoning, total);
-        totals.add(&usage);
+        let usage = usage_from_columns(input, output, cached, cache_write, reasoning, total);
+        totals.add(&usage, &token_source);
         let provider = provider_aggregates
             .entry(provider_id.clone())
             .or_insert_with(|| (stored_name.clone(), UsageAggregate::default()));
@@ -1328,7 +1806,7 @@ fn query_usage_statistics(state: &AppState, query: &UsageQuery) -> Result<UsageS
             // 已删除中转可能有多次改名，按时间顺序保留最后一次请求时的名称。
             provider.0 = stored_name;
         }
-        provider.1.add(&usage);
+        provider.1.add(&usage, &token_source);
 
         let local = completed_at.with_timezone(&Local);
         let bucket = if period.resolution == "hour" {
@@ -1336,7 +1814,10 @@ fn query_usage_statistics(state: &AppState, query: &UsageQuery) -> Result<UsageS
         } else {
             local.date_naive().to_string()
         };
-        series_aggregates.entry(bucket).or_default().add(&usage);
+        series_aggregates
+            .entry(bucket)
+            .or_default()
+            .add(&usage, &token_source);
     }
     drop(statement);
     drop(conn);
@@ -1345,7 +1826,9 @@ fn query_usage_statistics(state: &AppState, query: &UsageQuery) -> Result<UsageS
         .into_iter()
         .map(
             |(provider_id, (provider_name, aggregate))| ProviderUsageStatistics {
-                deleted: !configured_names.contains_key(&provider_id),
+                deleted: !configured_names.contains_key(&provider_id)
+                    && provider_id != codex_usage::OFFICIAL_PROVIDER_ID
+                    && provider_id != codex_usage::UNCONFIRMED_PROVIDER_ID,
                 provider_id,
                 provider_name,
                 completed_requests: aggregate.completed_requests,
@@ -1354,16 +1837,32 @@ fn query_usage_statistics(state: &AppState, query: &UsageQuery) -> Result<UsageS
                     aggregate.reported_requests,
                     aggregate.completed_requests,
                 ),
+                data_quality: aggregate.data_quality(),
                 metrics: aggregate.metrics,
             },
         )
         .collect::<Vec<_>>();
     providers.sort_by(|left, right| {
-        right
-            .metrics
-            .total_tokens
-            .value
-            .cmp(&left.metrics.total_tokens.value)
+        let rank = |provider: &ProviderUsageStatistics| {
+            if provider.provider_id == codex_usage::OFFICIAL_PROVIDER_ID {
+                0
+            } else if provider.provider_id == codex_usage::UNCONFIRMED_PROVIDER_ID {
+                3
+            } else if provider.deleted {
+                2
+            } else {
+                1
+            }
+        };
+        rank(left)
+            .cmp(&rank(right))
+            .then_with(|| {
+                right
+                    .metrics
+                    .total_tokens
+                    .value
+                    .cmp(&left.metrics.total_tokens.value)
+            })
             .then_with(|| left.provider_name.cmp(&right.provider_name))
     });
 
@@ -1398,14 +1897,18 @@ fn query_usage_statistics(state: &AppState, query: &UsageQuery) -> Result<UsageS
         }
     }
 
+    let data_quality = totals.data_quality();
+    let total_metrics = totals.metrics;
     Ok(UsageStatistics {
         period,
-        totals: totals.metrics,
+        totals: total_metrics,
         providers,
         series,
         completed_requests: totals.completed_requests,
         reported_requests: totals.reported_requests,
         coverage_percent: coverage_percent(totals.reported_requests, totals.completed_requests),
+        data_quality,
+        codex_sync_status: state.codex_usage_status.lock().unwrap().clone(),
     })
 }
 
@@ -1445,6 +1948,17 @@ fn push_log_with_model(
     provider_id: Option<&str>,
     model: Option<&str>,
 ) {
+    push_diagnostic_log(state, level, message, provider_id, model, None);
+}
+
+fn push_diagnostic_log(
+    state: &AppState,
+    level: &str,
+    message: impl Into<String>,
+    provider_id: Option<&str>,
+    model: Option<&str>,
+    event_type: Option<&str>,
+) {
     append_event_log(
         state,
         EventLog {
@@ -1454,10 +1968,79 @@ fn push_log_with_model(
             provider_id: provider_id.map(ToOwned::to_owned),
             // 模型名属于路由元数据，允许展示但限制长度；prompt 和响应正文始终不会进入日志。
             model: model.map(|value| value.chars().take(120).collect()),
-            event_type: None,
+            event_type: event_type.map(ToOwned::to_owned),
             routing_event: None,
+            diagnostic_detail: None,
         },
     );
+}
+
+fn push_diagnostic_detail_log(
+    state: &AppState,
+    level: &str,
+    message: impl Into<String>,
+    event_type: &str,
+    detail: DiagnosticDetail,
+) {
+    append_event_log(
+        state,
+        EventLog {
+            timestamp: Utc::now(),
+            level: level.to_string(),
+            message: message.into(),
+            provider_id: Some(detail.provider_id.clone()),
+            model: detail.model.clone(),
+            event_type: Some(event_type.to_string()),
+            routing_event: None,
+            diagnostic_detail: Some(detail),
+        },
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_diagnostic_detail(
+    request_id: &str,
+    provider_id: &str,
+    model: Option<&str>,
+    request_path: &str,
+    status: Option<StatusCode>,
+    upstream_request_id: Option<String>,
+    failure: &StreamFailure,
+    elapsed_ms: u64,
+    attempt_index: u8,
+    policy: &RoutingPolicy,
+    retry_wait_sec: Option<u64>,
+    action: &str,
+    attempts: Vec<RoutingAttempt>,
+    business_output_started: bool,
+) -> DiagnosticDetail {
+    DiagnosticDetail {
+        request_id: request_id.to_string(),
+        provider_id: provider_id.to_string(),
+        model: model.map(|value| sanitized_diagnostic_text(value, 120)),
+        request_path: sanitized_diagnostic_text(request_path, 180),
+        error_class: failure.classification.as_str().to_string(),
+        http_status: status.map(|status| status.as_u16()),
+        error_code: failure.code.clone(),
+        error_type: failure.error_type.clone(),
+        error_message: Some(sanitized_diagnostic_text(&failure.message, 300)),
+        incomplete_reason: failure.incomplete_reason.clone(),
+        upstream_request_id,
+        last_sse_event: failure.last_sse_event.clone(),
+        terminal_event: failure.terminal_event.clone(),
+        terminal_received: failure.terminal_received,
+        business_output_started,
+        bytes_received: failure.bytes_received,
+        elapsed_ms,
+        attempt_index,
+        max_attempts: policy.retry_count.saturating_add(1),
+        retry_wait_sec,
+        fallback_retry_enabled: policy.retry_unknown_transient_errors,
+        failover_enabled: policy.allow_provider_failover,
+        action: action.to_string(),
+        parse_error: failure.parse_error.clone(),
+        attempts,
+    }
 }
 
 fn push_routing_event(state: &AppState, message: String, event: RoutingEvent) {
@@ -1476,6 +2059,7 @@ fn push_routing_event(state: &AppState, message: String, event: RoutingEvent) {
             model: event.model.clone(),
             event_type: Some(event.event_type.clone()),
             routing_event: Some(event.clone()),
+            diagnostic_detail: None,
         },
     );
 
@@ -1592,6 +2176,14 @@ fn mark_response_completed(state: &AppState, id: &str) {
     let record = health.entry(id.to_string()).or_default();
     record.total_requests += 1;
     record.successful_requests += 1;
+}
+
+fn record_incomplete_business_response(state: &AppState, id: &str, latency: u64) {
+    let mut health = state.health.lock().unwrap();
+    let record = health.entry(id.to_string()).or_default();
+    // 业务性 incomplete 是一次未完整产出的请求，但不是线路故障：只计请求量，不累计失败或改变熔断状态。
+    record.total_requests += 1;
+    record.latency_ms = Some(latency);
 }
 
 fn record_capacity_exhausted(state: &AppState, id: &str, message: &str, latency: u64) {
@@ -1781,12 +2373,187 @@ struct CapacityError {
     message: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ErrorClassification {
+    Retryable,
+    Permanent,
+    IncompleteBusiness,
+    Unknown,
+}
+
+impl ErrorClassification {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Retryable => "retryable",
+            Self::Permanent => "permanent",
+            Self::IncompleteBusiness => "incomplete_business",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct StreamFailure {
+    classification: ErrorClassification,
+    code: Option<String>,
+    error_type: Option<String>,
+    message: String,
+    incomplete_reason: Option<String>,
+    last_sse_event: Option<String>,
+    terminal_event: Option<String>,
+    terminal_received: bool,
+    bytes_received: u64,
+    parse_error: Option<String>,
+}
+
+fn sanitized_diagnostic_text(value: &str, max_chars: usize) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_control() || character.is_whitespace())
+        .take(max_chars)
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn unparsed_body_diagnostic(headers: &HeaderMap, body: &[u8], parse_error: &str) -> String {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| sanitized_diagnostic_text(value, 120))
+        .unwrap_or_else(|| "unknown".to_string());
+    let body_hash = format!("{:x}", Sha256::digest(body));
+    format!(
+        "{}；content_type={}；sha256={}",
+        sanitized_diagnostic_text(parse_error, 180),
+        content_type,
+        body_hash
+    )
+}
+
+fn upstream_request_id(headers: &HeaderMap) -> Option<String> {
+    ["x-request-id", "request-id", "openai-request-id", "cf-ray"]
+        .into_iter()
+        .find_map(|name| headers.get(name))
+        .and_then(|value| value.to_str().ok())
+        .map(|value| sanitized_diagnostic_text(value, 160))
+        .filter(|value| !value.is_empty())
+}
+
+fn classify_error_fields(
+    code: Option<&str>,
+    error_type: Option<&str>,
+    message: Option<&str>,
+) -> ErrorClassification {
+    let normalized = [
+        code.unwrap_or_default(),
+        error_type.unwrap_or_default(),
+        message.unwrap_or_default(),
+    ]
+    .join(" ")
+    .to_ascii_lowercase();
+    let permanent = [
+        "invalid_request",
+        "authentication",
+        "unauthorized",
+        "permission",
+        "forbidden",
+        "model_not_found",
+        "context_length",
+        "insufficient_quota",
+        "billing",
+        "balance",
+        "content_policy",
+        "safety",
+    ];
+    if permanent.iter().any(|marker| normalized.contains(marker)) {
+        return ErrorClassification::Permanent;
+    }
+    let retryable = [
+        "server_error",
+        "internal_error",
+        "upstream_error",
+        "service_unavailable",
+        "overloaded",
+        "timeout",
+        "timed out",
+        "rate_limit",
+        "capacity",
+        "concurrency",
+        "temporar",
+        "try again",
+        "processing error",
+    ];
+    if retryable.iter().any(|marker| normalized.contains(marker)) {
+        return ErrorClassification::Retryable;
+    }
+    ErrorClassification::Unknown
+}
+
+fn classify_incomplete_reason(reason: Option<&str>) -> ErrorClassification {
+    let normalized = reason.unwrap_or_default().to_ascii_lowercase();
+    if [
+        "max_output_tokens",
+        "content_filter",
+        "content_policy",
+        "safety",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+    {
+        return ErrorClassification::IncompleteBusiness;
+    }
+    if [
+        "timeout",
+        "overload",
+        "interrupted",
+        "upstream",
+        "server_error",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+    {
+        return ErrorClassification::Retryable;
+    }
+    ErrorClassification::Unknown
+}
+
+fn response_error_fields(
+    value: &serde_json::Value,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let error = value
+        .pointer("/response/error")
+        .or_else(|| value.get("error"));
+    let code = error
+        .and_then(|item| item.get("code"))
+        .and_then(|item| item.as_str())
+        .map(|value| sanitized_diagnostic_text(value, 120));
+    let error_type = error
+        .and_then(|item| item.get("type"))
+        .and_then(|item| item.as_str())
+        .map(|value| sanitized_diagnostic_text(value, 120));
+    let message = error
+        .and_then(|item| {
+            item.get("message")
+                .and_then(|message| message.as_str())
+                .or_else(|| item.as_str())
+        })
+        .or_else(|| value.get("message").and_then(|item| item.as_str()))
+        .map(|value| sanitized_diagnostic_text(value, 300));
+    (code, error_type, message)
+}
+
 fn capacity_message_matches(message: &str) -> bool {
     let normalized = message.to_ascii_lowercase();
-    normalized.contains("model")
+    let model_capacity = normalized.contains("model")
         && (normalized.contains("at capacity")
             || normalized.contains("capacity exceeded")
-            || normalized.contains("capacity limit"))
+            || normalized.contains("capacity limit"));
+    let account_concurrency = normalized.contains("concurrency")
+        && normalized.contains("limit")
+        && (normalized.contains("account") || normalized.contains("exceeded"));
+    model_capacity || account_concurrency
 }
 
 fn capacity_error_from_json(value: &serde_json::Value) -> Option<CapacityError> {
@@ -1818,7 +2585,11 @@ fn capacity_error_from_json(value: &serde_json::Value) -> Option<CapacityError> 
         .into_iter()
         .chain(error_type)
         .map(str::to_ascii_lowercase)
-        .any(|identifier| identifier.contains("capacity") && identifier.contains("model"));
+        .any(|identifier| {
+            (identifier.contains("capacity") && identifier.contains("model"))
+                || identifier.contains("concurrency_limit")
+                || identifier.contains("account_concurrency")
+        });
     if !identifier_matches && !capacity_message_matches(message) {
         return None;
     }
@@ -1963,7 +2734,7 @@ fn usage_from_object(value: &serde_json::Value) -> Option<CapturedUsage> {
         json_token(object, "input_tokens").or_else(|| json_token(object, "prompt_tokens"));
     let output_tokens =
         json_token(object, "output_tokens").or_else(|| json_token(object, "completion_tokens"));
-    let cached_tokens = object
+    let cache_read_tokens = object
         .get("input_tokens_details")
         .or_else(|| object.get("prompt_tokens_details"))
         .and_then(serde_json::Value::as_object)
@@ -1978,7 +2749,15 @@ fn usage_from_object(value: &serde_json::Value) -> Option<CapturedUsage> {
     let usage = CapturedUsage {
         input_tokens,
         output_tokens,
-        cached_tokens,
+        cache_read_tokens,
+        cache_write_tokens: object
+            .get("input_tokens_details")
+            .or_else(|| object.get("prompt_tokens_details"))
+            .and_then(serde_json::Value::as_object)
+            .and_then(|details| {
+                json_token(details, "cache_write_tokens")
+                    .or_else(|| json_token(details, "cache_creation_tokens"))
+            }),
         reasoning_tokens,
         total_tokens,
     };
@@ -2000,15 +2779,31 @@ struct UsageCollector {
     buffer: Vec<u8>,
     disabled: bool,
     captured: Option<CapturedUsage>,
+    request_estimate: Option<usage_estimation::RequestTokenEstimate>,
+    output_capture: usage_estimation::OutputTextCapture,
+    model: Option<String>,
+}
+
+struct CollectedUsage {
+    usage: CapturedUsage,
+    token_source: &'static str,
+    estimate_method: Option<String>,
 }
 
 impl UsageCollector {
-    fn new(kind: UsageResponseKind) -> Self {
+    fn new(
+        kind: UsageResponseKind,
+        request_estimate: Option<usage_estimation::RequestTokenEstimate>,
+        model: Option<String>,
+    ) -> Self {
         Self {
             kind,
             buffer: Vec::new(),
             disabled: false,
             captured: None,
+            request_estimate,
+            output_capture: usage_estimation::OutputTextCapture::default(),
+            model,
         }
     }
 
@@ -2044,6 +2839,7 @@ impl UsageCollector {
                         if let Some(usage) = usage_from_response_json(&value) {
                             self.captured = Some(usage);
                         }
+                        self.output_capture.observe_event(&value);
                     }
                 }
                 if self.buffer.len() > MAX_USAGE_CAPTURE_BYTES {
@@ -2055,14 +2851,49 @@ impl UsageCollector {
         }
     }
 
-    fn finish(&mut self) -> CapturedUsage {
+    fn finish(&mut self, allow_estimate: bool) -> CollectedUsage {
         if !self.disabled && matches!(self.kind, UsageResponseKind::Json) {
-            self.captured = serde_json::from_slice::<serde_json::Value>(&self.buffer)
-                .ok()
-                .as_ref()
-                .and_then(usage_from_response_json);
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&self.buffer) {
+                self.captured = usage_from_response_json(&value);
+                self.output_capture.observe_json_response(&value);
+            }
         }
-        self.captured.take().unwrap_or_default()
+        if let Some(usage) = self.captured.take() {
+            return CollectedUsage {
+                usage,
+                token_source: "upstream",
+                estimate_method: None,
+            };
+        }
+        if allow_estimate {
+            if let (Some(request), Some(output_tokens)) = (
+                self.request_estimate.as_ref(),
+                self.output_capture.estimated_tokens(self.model.as_deref()),
+            ) {
+                let total_tokens = request.input_tokens.saturating_add(output_tokens);
+                return CollectedUsage {
+                    usage: CapturedUsage {
+                        input_tokens: Some(request.input_tokens),
+                        output_tokens: Some(output_tokens),
+                        cache_read_tokens: None,
+                        cache_write_tokens: None,
+                        reasoning_tokens: None,
+                        total_tokens: Some(total_tokens),
+                    },
+                    token_source: "estimated",
+                    estimate_method: Some(request.method.clone()),
+                };
+            }
+        }
+        CollectedUsage {
+            usage: CapturedUsage::default(),
+            token_source: "none",
+            estimate_method: None,
+        }
+    }
+
+    fn saw_output(&self) -> bool {
+        self.output_capture.saw_output()
     }
 }
 
@@ -2126,38 +2957,122 @@ impl PreparedUpstreamResponse {
 
 async fn inspect_json_error_response(
     mut response: PreparedUpstreamResponse,
-) -> (PreparedUpstreamResponse, Option<CapacityError>) {
+) -> (
+    PreparedUpstreamResponse,
+    Option<CapacityError>,
+    StreamFailure,
+) {
     let mut body = Vec::new();
+    let status = response.status;
     while let Some(chunk) = response.stream.next().await {
         match chunk {
             Ok(chunk) => {
                 body.extend_from_slice(&chunk);
                 response.prefix.push(chunk);
                 if body.len() > MAX_ERROR_BODY_BYTES {
-                    return (response, None);
+                    let parse_error = unparsed_body_diagnostic(
+                        &response.headers,
+                        &body,
+                        "错误正文超过安全解析上限，哈希仅覆盖已读取部分",
+                    );
+                    return (
+                        response,
+                        None,
+                        StreamFailure {
+                            classification: if should_retry_status(status) {
+                                ErrorClassification::Retryable
+                            } else {
+                                ErrorClassification::Permanent
+                            },
+                            code: Some(format!("http_{}", status.as_u16())),
+                            error_type: Some("http_error_body_too_large".to_string()),
+                            message: format!("上游返回 {status}"),
+                            incomplete_reason: None,
+                            last_sse_event: None,
+                            terminal_event: None,
+                            terminal_received: false,
+                            bytes_received: body.len() as u64,
+                            parse_error: Some(parse_error),
+                        },
+                    );
                 }
             }
             Err(error) => {
+                let parse_error = unparsed_body_diagnostic(
+                    &response.headers,
+                    &body,
+                    &format!("读取错误正文失败：{error}"),
+                );
                 response.preserve_stream_error(error);
-                return (response, None);
+                return (
+                    response,
+                    None,
+                    StreamFailure {
+                        classification: if should_retry_status(status) {
+                            ErrorClassification::Retryable
+                        } else {
+                            ErrorClassification::Permanent
+                        },
+                        code: Some(format!("http_{}", status.as_u16())),
+                        error_type: Some("http_error_read_error".to_string()),
+                        message: format!("上游返回 {status}，读取错误正文失败"),
+                        incomplete_reason: None,
+                        last_sse_event: None,
+                        terminal_event: None,
+                        terminal_received: false,
+                        bytes_received: body.len() as u64,
+                        parse_error: Some(parse_error),
+                    },
+                );
             }
         }
     }
-    let capacity = serde_json::from_slice::<serde_json::Value>(&body)
-        .ok()
+    let parsed = serde_json::from_slice::<serde_json::Value>(&body);
+    let capacity = parsed.as_ref().ok().and_then(capacity_error_from_json);
+    let (code, error_type, message) = parsed
         .as_ref()
-        .and_then(capacity_error_from_json);
-    (response, capacity)
+        .ok()
+        .map(response_error_fields)
+        .unwrap_or_default();
+    let classification = if should_retry_status(status) {
+        // 408、429 和 5xx 的状态码本身具有最高优先级，不依赖第三方错误正文格式。
+        ErrorClassification::Retryable
+    } else if status.is_client_error() {
+        ErrorClassification::Permanent
+    } else {
+        classify_error_fields(code.as_deref(), error_type.as_deref(), message.as_deref())
+    };
+    let failure = StreamFailure {
+        classification,
+        code: code.or_else(|| Some(format!("http_{}", status.as_u16()))),
+        error_type,
+        message: message.unwrap_or_else(|| format!("上游返回 {status}")),
+        incomplete_reason: None,
+        last_sse_event: None,
+        terminal_event: None,
+        terminal_received: false,
+        bytes_received: body.len() as u64,
+        parse_error: parsed
+            .err()
+            .map(|error| unparsed_body_diagnostic(&response.headers, &body, &error.to_string())),
+    };
+    (response, capacity, failure)
 }
 
 enum SsePreflightResult {
     Forward(PreparedUpstreamResponse),
     Capacity(PreparedUpstreamResponse, CapacityError),
+    Failure(PreparedUpstreamResponse, StreamFailure),
+    TrackingDisabled(PreparedUpstreamResponse, StreamFailure),
 }
 
-async fn inspect_sse_before_output(mut response: PreparedUpstreamResponse) -> SsePreflightResult {
+async fn inspect_sse_before_output(
+    mut response: PreparedUpstreamResponse,
+    validate_responses_terminal: bool,
+) -> SsePreflightResult {
     let mut pending_event = Vec::new();
     let mut total_buffered = 0_usize;
+    let mut last_sse_event = None;
     while let Some(chunk) = response.stream.next().await {
         match chunk {
             Ok(chunk) => {
@@ -2166,24 +3081,81 @@ async fn inspect_sse_before_output(mut response: PreparedUpstreamResponse) -> Ss
                 response.prefix.push(chunk);
             }
             Err(error) => {
+                let detail = sanitized_diagnostic_text(&error.to_string(), 300);
                 response.preserve_stream_error(error);
-                return SsePreflightResult::Forward(response);
+                return SsePreflightResult::Failure(
+                    response,
+                    StreamFailure {
+                        classification: ErrorClassification::Retryable,
+                        code: Some("upstream_stream_interrupted".to_string()),
+                        error_type: Some("stream_read_error".to_string()),
+                        message: "上游流在产生业务输出前中断".to_string(),
+                        incomplete_reason: None,
+                        last_sse_event,
+                        terminal_event: None,
+                        terminal_received: false,
+                        bytes_received: total_buffered as u64,
+                        parse_error: Some(detail),
+                    },
+                );
             }
         }
 
         if total_buffered > MAX_SSE_PREFLIGHT_BYTES {
-            return SsePreflightResult::Forward(response);
+            return SsePreflightResult::TrackingDisabled(
+                response,
+                StreamFailure {
+                    classification: ErrorClassification::Unknown,
+                    code: Some("sse_preflight_limit_exceeded".to_string()),
+                    error_type: Some("semantic_tracking_disabled".to_string()),
+                    message: "输出前预检缓冲达到上限，已降级为原始透传".to_string(),
+                    incomplete_reason: None,
+                    last_sse_event,
+                    terminal_event: None,
+                    terminal_received: false,
+                    bytes_received: total_buffered as u64,
+                    parse_error: None,
+                },
+            );
         }
         loop {
             let Some(frame_end) = next_sse_frame_end(&pending_event) else {
                 if pending_event.len() > MAX_SSE_EVENT_BYTES {
-                    return SsePreflightResult::Forward(response);
+                    return SsePreflightResult::TrackingDisabled(
+                        response,
+                        StreamFailure {
+                            classification: ErrorClassification::Unknown,
+                            code: Some("sse_event_limit_exceeded".to_string()),
+                            error_type: Some("semantic_tracking_disabled".to_string()),
+                            message: "单个 SSE 事件超过语义跟踪上限，已降级为原始透传".to_string(),
+                            incomplete_reason: None,
+                            last_sse_event,
+                            terminal_event: None,
+                            terminal_received: false,
+                            bytes_received: total_buffered as u64,
+                            parse_error: None,
+                        },
+                    );
                 }
                 break;
             };
             if frame_end > MAX_SSE_EVENT_BYTES {
                 // 完整事件可能在单个网络块内到达，同样必须执行上限检查后立刻降级为原始透传。
-                return SsePreflightResult::Forward(response);
+                return SsePreflightResult::TrackingDisabled(
+                    response,
+                    StreamFailure {
+                        classification: ErrorClassification::Unknown,
+                        code: Some("sse_event_limit_exceeded".to_string()),
+                        error_type: Some("semantic_tracking_disabled".to_string()),
+                        message: "单个 SSE 事件超过语义跟踪上限，已降级为原始透传".to_string(),
+                        incomplete_reason: None,
+                        last_sse_event,
+                        terminal_event: None,
+                        terminal_received: false,
+                        bytes_received: total_buffered as u64,
+                        parse_error: None,
+                    },
+                );
             }
             let frame = pending_event.drain(..frame_end).collect::<Vec<_>>();
             let Some(data) = sse_frame_data(&frame) else {
@@ -2191,26 +3163,131 @@ async fn inspect_sse_before_output(mut response: PreparedUpstreamResponse) -> Ss
                 continue;
             };
             if data == b"[DONE]" {
+                if validate_responses_terminal {
+                    return SsePreflightResult::Failure(
+                        response,
+                        StreamFailure {
+                            classification: ErrorClassification::Retryable,
+                            code: Some("upstream_stream_incomplete".to_string()),
+                            error_type: Some("protocol_incomplete".to_string()),
+                            message: "上游在 response.completed 前发送结束标记".to_string(),
+                            incomplete_reason: None,
+                            last_sse_event,
+                            terminal_event: Some("[DONE]".to_string()),
+                            terminal_received: false,
+                            bytes_received: total_buffered as u64,
+                            parse_error: None,
+                        },
+                    );
+                }
+                // Chat Completions 使用 [DONE] 正常结束，不应用 Responses 的终态规则。
                 return SsePreflightResult::Forward(response);
             }
-            let Ok(value) = serde_json::from_slice::<serde_json::Value>(&data) else {
-                return SsePreflightResult::Forward(response);
+            let value = match serde_json::from_slice::<serde_json::Value>(&data) {
+                Ok(value) => value,
+                Err(error) => {
+                    return SsePreflightResult::Failure(
+                        response,
+                        StreamFailure {
+                            classification: ErrorClassification::Unknown,
+                            code: Some("invalid_sse_json".to_string()),
+                            error_type: Some("parse_error".to_string()),
+                            message: "输出前收到无法解析的 SSE JSON".to_string(),
+                            incomplete_reason: None,
+                            last_sse_event,
+                            terminal_event: None,
+                            terminal_received: false,
+                            bytes_received: total_buffered as u64,
+                            parse_error: Some(sanitized_diagnostic_text(&error.to_string(), 300)),
+                        },
+                    );
+                }
             };
             if let Some(capacity) = capacity_error_from_json(&value) {
                 return SsePreflightResult::Capacity(response, capacity);
             }
             let event_type = value.get("type").and_then(|item| item.as_str());
+            if let Some(event_type) = event_type {
+                last_sse_event = Some(event_type.to_string());
+            }
             if matches!(
                 event_type,
                 Some("response.created" | "response.in_progress")
             ) {
                 continue;
             }
+            if event_type == Some("response.completed") {
+                // completed 是合法终态，不要求文本或 usage；空响应也必须按成功透传。
+                return SsePreflightResult::Forward(response);
+            }
+            if event_type == Some("response.failed") {
+                let (code, error_type, message) = response_error_fields(&value);
+                return SsePreflightResult::Failure(
+                    response,
+                    StreamFailure {
+                        classification: classify_error_fields(
+                            code.as_deref(),
+                            error_type.as_deref(),
+                            message.as_deref(),
+                        ),
+                        code,
+                        error_type,
+                        message: message
+                            .unwrap_or_else(|| "上游返回未说明原因的 response.failed".to_string()),
+                        incomplete_reason: None,
+                        last_sse_event: Some("response.failed".to_string()),
+                        terminal_event: Some("response.failed".to_string()),
+                        terminal_received: true,
+                        bytes_received: total_buffered as u64,
+                        parse_error: None,
+                    },
+                );
+            }
+            if event_type == Some("response.incomplete") {
+                let reason = value
+                    .pointer("/response/incomplete_details/reason")
+                    .and_then(|item| item.as_str())
+                    .map(|value| sanitized_diagnostic_text(value, 180));
+                return SsePreflightResult::Failure(
+                    response,
+                    StreamFailure {
+                        classification: classify_incomplete_reason(reason.as_deref()),
+                        code: None,
+                        error_type: Some("response_incomplete".to_string()),
+                        message: reason
+                            .as_deref()
+                            .map(|reason| format!("上游返回 response.incomplete：{reason}"))
+                            .unwrap_or_else(|| {
+                                "上游返回未说明原因的 response.incomplete".to_string()
+                            }),
+                        incomplete_reason: reason,
+                        last_sse_event: Some("response.incomplete".to_string()),
+                        terminal_event: Some("response.incomplete".to_string()),
+                        terminal_received: true,
+                        bytes_received: total_buffered as u64,
+                        parse_error: None,
+                    },
+                );
+            }
             // 第一个非生命周期事件可能包含文本、推理或工具调用；此后重放将不再安全。
             return SsePreflightResult::Forward(response);
         }
     }
-    SsePreflightResult::Forward(response)
+    SsePreflightResult::Failure(
+        response,
+        StreamFailure {
+            classification: ErrorClassification::Retryable,
+            code: Some("upstream_stream_incomplete".to_string()),
+            error_type: Some("unexpected_eof".to_string()),
+            message: "上游流在产生业务输出前结束".to_string(),
+            incomplete_reason: None,
+            last_sse_event,
+            terminal_event: None,
+            terminal_received: false,
+            bytes_received: total_buffered as u64,
+            parse_error: None,
+        },
+    )
 }
 
 fn local_request_body_limit_label(limit: usize) -> String {
@@ -2310,6 +3387,16 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
     if !auth_valid(&headers, &token) {
         return json_error(StatusCode::UNAUTHORIZED, "本地访问令牌无效");
     }
+    // 只有专用请求头能可靠证明请求来自 Codex 集成；Bearer 兼容入口可能由其他客户端使用。
+    let client_origin = if headers
+        .get("x-ai-gateway-token")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == token)
+    {
+        "codex"
+    } else {
+        "other"
+    };
     let request_path = uri.path().to_string();
     // 鉴权完成后才允许分配大请求缓冲区，避免未授权的本机进程消耗最多 200 MiB 内存。
     let body = match read_local_request_body(
@@ -2326,6 +3413,10 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
     };
     let model = request_model(&body);
     let body_bytes = body.len();
+    let request_id = Uuid::new_v4().to_string();
+    // 请求输入只估算一次并复用于所有重试；正文仍由原始 Bytes 共享，不为统计复制大请求体。
+    let request_token_estimate =
+        usage_estimation::estimate_request(&body, uri.path(), model.as_deref());
     // 每个请求固定使用进入网关时的策略快照；页面保存的新规则只影响后续请求。
     let policy = state.policy.read().unwrap().clone();
     let mut candidates = state.config.read().unwrap().clone();
@@ -2336,7 +3427,7 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
             && matches_model(provider, model.as_deref())
     });
     if let Some(locked_id) = state.locked_provider_id.read().unwrap().as_ref() {
-        // 手动固定只改变首选顺序，首选故障时仍允许自动切换，避免固定配置把 Codex 完全阻断。
+        // 手动固定只改变首选顺序；是否继续尝试备用中转由全局开关决定。
         candidates.sort_by_key(|provider| {
             if &provider.id == locked_id {
                 0
@@ -2345,18 +3436,46 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
             }
         });
     }
+    if !policy.allow_provider_failover {
+        candidates.truncate(1);
+    }
+    if !policy.allow_provider_failover {
+        if let Some(provider) = candidates.first() {
+            let available = {
+                let mut health = state.health.lock().unwrap();
+                can_use(health.entry(provider.id.clone()).or_default())
+            };
+            if !available {
+                push_diagnostic_log(
+                    &state,
+                    "warning",
+                    "当前中转暂不可用，自动切换已关闭",
+                    Some(&provider.id),
+                    model.as_deref(),
+                    Some("provider_failover_blocked"),
+                );
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "当前中转暂不可用，自动切换已关闭",
+                );
+            }
+        }
+    }
     let mut last_error = "没有可用的中转".to_string();
     let mut last_status = None;
     let mut only_payload_failures = true;
     let mut first_failed_provider = None;
     let mut first_failure_reason = None;
     let mut attempts = Vec::new();
+    let mut upstream_attempt_index = 0_u32;
     for provider in candidates {
         let (available, payload_allowed) = {
             let mut health = state.health.lock().unwrap();
             let record = health.entry(provider.id.clone()).or_default();
-            let available = can_use(record);
-            let payload_allowed = payload_size_allowed(record, body_bytes);
+            // 自动切换关闭时仍把当前首选交给上游，避免健康缓存悄悄改变用户选择。
+            let available = !policy.allow_provider_failover || can_use(record);
+            let payload_allowed =
+                !policy.allow_provider_failover || payload_size_allowed(record, body_bytes);
             (available, payload_allowed)
         };
         if !available {
@@ -2395,17 +3514,23 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                     retry_count: 0,
                     switched: true,
                 });
+                if !policy.allow_provider_failover {
+                    return json_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &format!("当前中转地址无效：{last_error}"),
+                    );
+                }
                 continue;
             }
         };
         let mut waited_seconds = 0_u64;
         let mut provider_failed = false;
-        let mut capacity_retry_index = 0_u8;
-        let mut capacity_waited_seconds = 0_u64;
         let mut capacity_attempts = Vec::new();
         let mut last_capacity = None;
         'transient_retry: for retry_index in 0..=policy.retry_count {
             loop {
+                upstream_attempt_index = upstream_attempt_index.saturating_add(1);
+                let usage_attempt_index = upstream_attempt_index;
                 let started = Instant::now();
                 let result = send_upstream_request(
                     upstream_request(&state, &provider, &method, url.clone(), &headers, &body),
@@ -2418,51 +3543,294 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                         let prepared = PreparedUpstreamResponse::from_reqwest(response);
                         let status = prepared.status;
                         let retry_after = retry_after_seconds(&prepared.headers);
-                        let (prepared, capacity) = if !status.is_success() {
-                            inspect_json_error_response(prepared).await
-                        } else if prepared.is_sse() {
-                            match inspect_sse_before_output(prepared).await {
-                                SsePreflightResult::Forward(response) => (response, None),
-                                SsePreflightResult::Capacity(response, capacity) => {
-                                    (response, Some(capacity))
+                        let upstream_id = upstream_request_id(&prepared.headers);
+                        let (prepared, capacity, stream_failure, tracking_disabled, http_failure) =
+                            if !status.is_success() {
+                                let (response, capacity, failure) =
+                                    inspect_json_error_response(prepared).await;
+                                (response, capacity, None, None, Some(failure))
+                            } else if prepared.is_sse() {
+                                match inspect_sse_before_output(
+                                    prepared,
+                                    request_path == "/v1/responses",
+                                )
+                                .await
+                                {
+                                    SsePreflightResult::Forward(response) => {
+                                        (response, None, None, None, None)
+                                    }
+                                    SsePreflightResult::Capacity(response, capacity) => {
+                                        (response, Some(capacity), None, None, None)
+                                    }
+                                    SsePreflightResult::Failure(response, failure) => {
+                                        (response, None, Some(failure), None, None)
+                                    }
+                                    SsePreflightResult::TrackingDisabled(response, failure) => {
+                                        (response, None, None, Some(failure), None)
+                                    }
                                 }
+                            } else {
+                                (prepared, None, None, None, None)
+                            };
+
+                        if let Some(failure) = tracking_disabled {
+                            let detail = stream_diagnostic_detail(
+                                &request_id,
+                                &provider.id,
+                                model.as_deref(),
+                                &request_path,
+                                Some(status),
+                                upstream_id.clone(),
+                                &failure,
+                                latency,
+                                retry_index.saturating_add(1),
+                                &policy,
+                                None,
+                                "forward_with_semantic_tracking_disabled",
+                                attempts.clone(),
+                                false,
+                            );
+                            push_diagnostic_detail_log(
+                                &state,
+                                "warning",
+                                failure.message,
+                                "sse_semantic_tracking_disabled",
+                                detail,
+                            );
+                        }
+
+                        if let Some(failure) = stream_failure {
+                            let wait_seconds = policy.retry_interval_sec;
+                            let retry_allowed = failure.classification
+                                == ErrorClassification::Retryable
+                                || (failure.classification == ErrorClassification::Unknown
+                                    && policy.retry_unknown_transient_errors);
+                            let can_retry = retry_allowed
+                                && retry_index < policy.retry_count
+                                && waited_seconds.saturating_add(wait_seconds)
+                                    <= policy.max_retry_wait_sec;
+                            let collected = collect_prepared_usage(
+                                &prepared,
+                                request_token_estimate.clone(),
+                                model.clone(),
+                                false,
+                            );
+                            persist_gateway_attempt(
+                                &state,
+                                gateway_usage_record(
+                                    &request_id,
+                                    usage_attempt_index,
+                                    &provider.id,
+                                    &provider.name,
+                                    model.clone(),
+                                    &request_path,
+                                    Some(status),
+                                    if can_retry {
+                                        "retryable_failure"
+                                    } else {
+                                        "failed"
+                                    },
+                                    !can_retry
+                                        && (!retry_allowed || !policy.allow_provider_failover),
+                                    client_origin,
+                                    collected,
+                                ),
+                            );
+                            let event_type = if failure.terminal_event.as_deref()
+                                == Some("response.incomplete")
+                            {
+                                "sse_incomplete_detected"
+                            } else {
+                                "sse_failure_detected"
+                            };
+                            let attempt = RoutingAttempt {
+                                provider_id: provider.id.clone(),
+                                provider_name: provider.name.clone(),
+                                status_code: Some(status.as_u16()),
+                                error: Some(failure.message.clone()),
+                                latency_ms: Some(latency),
+                                retry_count: retry_index,
+                                switched: !can_retry
+                                    && retry_allowed
+                                    && policy.allow_provider_failover,
+                            };
+                            attempts.push(attempt);
+                            if can_retry {
+                                waited_seconds += wait_seconds;
+                                let action =
+                                    if failure.classification == ErrorClassification::Unknown {
+                                        "retry_unknown_on_current_provider"
+                                    } else {
+                                        "retry_current_provider"
+                                    };
+                                let detail = stream_diagnostic_detail(
+                                    &request_id,
+                                    &provider.id,
+                                    model.as_deref(),
+                                    &request_path,
+                                    Some(status),
+                                    upstream_id.clone(),
+                                    &failure,
+                                    latency,
+                                    retry_index.saturating_add(1),
+                                    &policy,
+                                    Some(wait_seconds),
+                                    action,
+                                    attempts.clone(),
+                                    false,
+                                );
+                                push_diagnostic_detail_log(
+                                    &state,
+                                    "warning",
+                                    format!(
+                                        "{}，{wait_seconds} 秒后重试当前中转（{}/{})",
+                                        failure.message,
+                                        retry_index + 1,
+                                        policy.retry_count
+                                    ),
+                                    if failure.classification == ErrorClassification::Unknown {
+                                        "unknown_error_retry_scheduled"
+                                    } else {
+                                        event_type
+                                    },
+                                    detail,
+                                );
+                                sleep(StdDuration::from_secs(wait_seconds)).await;
+                                continue 'transient_retry;
                             }
-                        } else {
-                            (prepared, None)
-                        };
+
+                            let action = if !retry_allowed {
+                                "forward_without_retry"
+                            } else if policy.allow_provider_failover {
+                                "failover_after_retry_exhausted"
+                            } else {
+                                "forward_after_retry_exhausted"
+                            };
+                            let detail = stream_diagnostic_detail(
+                                &request_id,
+                                &provider.id,
+                                model.as_deref(),
+                                &request_path,
+                                Some(status),
+                                upstream_id.clone(),
+                                &failure,
+                                latency,
+                                retry_index.saturating_add(1),
+                                &policy,
+                                None,
+                                action,
+                                attempts.clone(),
+                                false,
+                            );
+                            push_diagnostic_detail_log(
+                                &state,
+                                if retry_allowed { "error" } else { "warning" },
+                                if retry_allowed {
+                                    format!(
+                                        "输出前流式响应重试已耗尽：{}（共 {} 次尝试）",
+                                        failure.message,
+                                        retry_index + 1
+                                    )
+                                } else {
+                                    format!(
+                                        "输出前流式响应不满足重试条件，原样透传：{}",
+                                        failure.message
+                                    )
+                                },
+                                if failure.classification == ErrorClassification::Unknown
+                                    && retry_allowed
+                                {
+                                    "unknown_error_retry_exhausted"
+                                } else {
+                                    event_type
+                                },
+                                detail,
+                            );
+                            if !retry_allowed {
+                                // 永久错误、业务性 incomplete 或关闭兜底后的未知错误均保留上游原始终态。
+                                if failure.classification == ErrorClassification::IncompleteBusiness
+                                {
+                                    record_incomplete_business_response(
+                                        &state,
+                                        &provider.id,
+                                        latency,
+                                    );
+                                }
+                                return response_to_axum(prepared, None);
+                            }
+                            mark_failure(
+                                &state,
+                                &provider.id,
+                                failure.message.clone(),
+                                None,
+                                &policy,
+                            );
+                            if !policy.allow_provider_failover {
+                                return response_to_axum(prepared, None);
+                            }
+                            only_payload_failures = false;
+                            last_status = Some(status);
+                            last_error = failure.message.clone();
+                            first_failed_provider.get_or_insert_with(|| provider.id.clone());
+                            first_failure_reason.get_or_insert_with(|| failure.message.clone());
+                            provider_failed = true;
+                            break 'transient_retry;
+                        }
 
                         if let Some(capacity) = capacity {
                             let attempt_latency = started.elapsed().as_millis() as u64;
-                            let wait_seconds =
-                                retry_after.unwrap_or(policy.capacity_retry_interval_sec);
-                            let can_retry = capacity_retry_index < policy.capacity_retry_count
-                                && capacity_waited_seconds.saturating_add(wait_seconds)
-                                    <= policy.capacity_max_retry_wait_sec;
+                            let wait_seconds = retry_after.unwrap_or(policy.retry_interval_sec);
+                            let can_retry = retry_index < policy.retry_count
+                                && waited_seconds.saturating_add(wait_seconds)
+                                    <= policy.max_retry_wait_sec;
+                            let collected = collect_prepared_usage(
+                                &prepared,
+                                request_token_estimate.clone(),
+                                model.clone(),
+                                false,
+                            );
+                            persist_gateway_attempt(
+                                &state,
+                                gateway_usage_record(
+                                    &request_id,
+                                    usage_attempt_index,
+                                    &provider.id,
+                                    &provider.name,
+                                    model.clone(),
+                                    &request_path,
+                                    Some(status),
+                                    "capacity_rejected",
+                                    !can_retry,
+                                    client_origin,
+                                    collected,
+                                ),
+                            );
                             capacity_attempts.push(RoutingAttempt {
                                 provider_id: provider.id.clone(),
                                 provider_name: provider.name.clone(),
                                 status_code: Some(status.as_u16()),
                                 error: Some(capacity.message.clone()),
                                 latency_ms: Some(attempt_latency),
-                                retry_count: capacity_retry_index,
+                                retry_count: retry_index,
                                 switched: false,
                             });
                             last_capacity = Some(capacity.clone());
                             if can_retry {
-                                capacity_retry_index += 1;
-                                capacity_waited_seconds += wait_seconds;
-                                push_log_with_model(
+                                waited_seconds += wait_seconds;
+                                push_diagnostic_log(
                                     &state,
                                     "warning",
                                     format!(
                                         "模型容量不足，{wait_seconds} 秒后重试同一中转（{}/{})",
-                                        capacity_retry_index, policy.capacity_retry_count
+                                        retry_index + 1,
+                                        policy.retry_count
                                     ),
                                     Some(&provider.id),
                                     model.as_deref(),
+                                    Some("retry_scheduled"),
                                 );
                                 sleep(StdDuration::from_secs(wait_seconds)).await;
-                                continue;
+                                continue 'transient_retry;
                             }
                             record_capacity_exhausted(
                                 &state,
@@ -2481,6 +3849,18 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                                 false,
                                 Some(status.as_u16()),
                             );
+                            push_diagnostic_log(
+                                &state,
+                                "error",
+                                format!(
+                                    "同一中转重试已耗尽：{}（共 {} 次尝试）",
+                                    capacity.message,
+                                    retry_index + 1
+                                ),
+                                Some(&provider.id),
+                                model.as_deref(),
+                                Some("retry_exhausted"),
+                            );
                             return response_to_axum(prepared, None);
                         }
 
@@ -2494,7 +3874,7 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                                     status_code: Some(status.as_u16()),
                                     error: None,
                                     latency_ms: Some(latency),
-                                    retry_count: capacity_retry_index,
+                                    retry_count: retry_index,
                                     switched: false,
                                 });
                                 push_capacity_event(
@@ -2516,7 +3896,7 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                                     status_code: Some(status.as_u16()),
                                     error: Some(message.clone()),
                                     latency_ms: Some(latency),
-                                    retry_count: capacity_retry_index,
+                                    retry_count: retry_index,
                                     switched: false,
                                 });
                                 record_capacity_exhausted(&state, &provider.id, &message, latency);
@@ -2530,6 +3910,28 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                                     capacity,
                                     false,
                                     Some(status.as_u16()),
+                                );
+                                let collected = collect_prepared_usage(
+                                    &prepared,
+                                    request_token_estimate.clone(),
+                                    model.clone(),
+                                    false,
+                                );
+                                persist_gateway_attempt(
+                                    &state,
+                                    gateway_usage_record(
+                                        &request_id,
+                                        usage_attempt_index,
+                                        &provider.id,
+                                        &provider.name,
+                                        model.clone(),
+                                        &request_path,
+                                        Some(status),
+                                        "capacity_retry_failed",
+                                        true,
+                                        client_origin,
+                                        collected,
+                                    ),
                                 );
                                 return response_to_axum(prepared, None);
                             }
@@ -2555,6 +3957,30 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                                 switched: policy.payload_too_large_action
                                     == PayloadTooLargeAction::Failover,
                             });
+                            let collected = collect_prepared_usage(
+                                &prepared,
+                                request_token_estimate.clone(),
+                                model.clone(),
+                                false,
+                            );
+                            persist_gateway_attempt(
+                                &state,
+                                gateway_usage_record(
+                                    &request_id,
+                                    usage_attempt_index,
+                                    &provider.id,
+                                    &provider.name,
+                                    model.clone(),
+                                    &request_path,
+                                    Some(status),
+                                    "payload_rejected",
+                                    !policy.allow_provider_failover
+                                        || policy.payload_too_large_action
+                                            == PayloadTooLargeAction::Return,
+                                    client_origin,
+                                    collected,
+                                ),
+                            );
                             push_log_with_model(
                                 &state,
                                 "warning",
@@ -2562,7 +3988,9 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                                 Some(&provider.id),
                                 model.as_deref(),
                             );
-                            if policy.payload_too_large_action == PayloadTooLargeAction::Return {
+                            if !policy.allow_provider_failover
+                                || policy.payload_too_large_action == PayloadTooLargeAction::Return
+                            {
                                 return response_to_axum(prepared, None);
                             }
                             first_failed_provider.get_or_insert_with(|| provider.id.clone());
@@ -2574,7 +4002,19 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                         if should_retry_status(status) {
                             only_payload_failures = false;
                             last_status = Some(status);
-                            last_error = format!("上游返回 {status}");
+                            let failure = http_failure.clone().unwrap_or(StreamFailure {
+                                classification: ErrorClassification::Retryable,
+                                code: Some(format!("http_{}", status.as_u16())),
+                                error_type: Some("http_error".to_string()),
+                                message: format!("上游返回 {status}"),
+                                incomplete_reason: None,
+                                last_sse_event: None,
+                                terminal_event: None,
+                                terminal_received: false,
+                                bytes_received: 0,
+                                parse_error: None,
+                            });
+                            last_error = failure.message.clone();
                             let wait_seconds = if status == StatusCode::TOO_MANY_REQUESTS {
                                 retry_after.unwrap_or(policy.retry_interval_sec)
                             } else {
@@ -2590,10 +4030,63 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                                 error: Some(last_error.clone()),
                                 latency_ms: Some(latency),
                                 retry_count: retry_index,
-                                switched: !can_retry,
+                                switched: !can_retry && policy.allow_provider_failover,
                             });
+                            let collected = collect_prepared_usage(
+                                &prepared,
+                                request_token_estimate.clone(),
+                                model.clone(),
+                                false,
+                            );
+                            persist_gateway_attempt(
+                                &state,
+                                gateway_usage_record(
+                                    &request_id,
+                                    usage_attempt_index,
+                                    &provider.id,
+                                    &provider.name,
+                                    model.clone(),
+                                    &request_path,
+                                    Some(status),
+                                    if can_retry {
+                                        "retryable_http"
+                                    } else {
+                                        "http_error"
+                                    },
+                                    !can_retry && !policy.allow_provider_failover,
+                                    client_origin,
+                                    collected,
+                                ),
+                            );
                             if can_retry {
                                 waited_seconds += wait_seconds;
+                                let detail = stream_diagnostic_detail(
+                                    &request_id,
+                                    &provider.id,
+                                    model.as_deref(),
+                                    &request_path,
+                                    Some(status),
+                                    upstream_id.clone(),
+                                    &failure,
+                                    latency,
+                                    retry_index.saturating_add(1),
+                                    &policy,
+                                    Some(wait_seconds),
+                                    "retry_current_provider",
+                                    attempts.clone(),
+                                    false,
+                                );
+                                push_diagnostic_detail_log(
+                                    &state,
+                                    "warning",
+                                    format!(
+                                        "{last_error}，{wait_seconds} 秒后重试当前中转（{}/{})",
+                                        retry_index + 1,
+                                        policy.retry_count
+                                    ),
+                                    "retry_scheduled",
+                                    detail,
+                                );
                                 sleep(StdDuration::from_secs(wait_seconds)).await;
                                 continue 'transient_retry;
                             }
@@ -2613,6 +4106,47 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                                 cooldown,
                                 &policy,
                             );
+                            let detail = stream_diagnostic_detail(
+                                &request_id,
+                                &provider.id,
+                                model.as_deref(),
+                                &request_path,
+                                Some(status),
+                                upstream_id.clone(),
+                                &failure,
+                                latency,
+                                retry_index.saturating_add(1),
+                                &policy,
+                                None,
+                                if policy.allow_provider_failover {
+                                    "failover_after_retry_exhausted"
+                                } else {
+                                    "forward_after_retry_exhausted"
+                                },
+                                attempts.clone(),
+                                false,
+                            );
+                            push_diagnostic_detail_log(
+                                &state,
+                                "error",
+                                format!(
+                                    "同一中转重试已耗尽：{last_error}（共 {} 次尝试）",
+                                    retry_index + 1
+                                ),
+                                "retry_exhausted",
+                                detail,
+                            );
+                            if !policy.allow_provider_failover {
+                                push_diagnostic_log(
+                                    &state,
+                                    "warning",
+                                    "自动切换已关闭，原样返回当前中转的最后一次响应",
+                                    Some(&provider.id),
+                                    model.as_deref(),
+                                    Some("provider_failover_blocked"),
+                                );
+                                return response_to_axum(prepared, None);
+                            }
                             first_failed_provider.get_or_insert_with(|| provider.id.clone());
                             first_failure_reason.get_or_insert_with(|| last_error.clone());
                             provider_failed = true;
@@ -2669,6 +4203,15 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                         } else {
                             // 400/401/403/404 等请求或配置错误原样返回，避免对所有中转重复发送无效请求。
                             mark_upstream_rejection(&state, &provider.id, status, latency);
+                            attempts.push(RoutingAttempt {
+                                provider_id: provider.id.clone(),
+                                provider_name: provider.name.clone(),
+                                status_code: Some(status.as_u16()),
+                                error: http_failure.as_ref().map(|failure| failure.message.clone()),
+                                latency_ms: Some(latency),
+                                retry_count: retry_index,
+                                switched: false,
+                            });
                             push_log_with_model(
                                 &state,
                                 "error",
@@ -2676,15 +4219,73 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                                 Some(&provider.id),
                                 model.as_deref(),
                             );
+                            if let Some(failure) = http_failure.as_ref() {
+                                let detail = stream_diagnostic_detail(
+                                    &request_id,
+                                    &provider.id,
+                                    model.as_deref(),
+                                    &request_path,
+                                    Some(status),
+                                    upstream_id.clone(),
+                                    failure,
+                                    latency,
+                                    retry_index.saturating_add(1),
+                                    &policy,
+                                    None,
+                                    "forward_permanent_http_error",
+                                    attempts.clone(),
+                                    false,
+                                );
+                                push_diagnostic_detail_log(
+                                    &state,
+                                    "error",
+                                    format!("上游拒绝请求：{}", failure.message),
+                                    "http_error_detected",
+                                    detail,
+                                );
+                            }
+                            let collected = collect_prepared_usage(
+                                &prepared,
+                                request_token_estimate.clone(),
+                                model.clone(),
+                                false,
+                            );
+                            persist_gateway_attempt(
+                                &state,
+                                gateway_usage_record(
+                                    &request_id,
+                                    usage_attempt_index,
+                                    &provider.id,
+                                    &provider.name,
+                                    model.clone(),
+                                    &request_path,
+                                    Some(status),
+                                    "rejected",
+                                    true,
+                                    client_origin,
+                                    collected,
+                                ),
+                            );
                         }
                         let observation = status.is_success().then(|| ResponseStreamContext {
                             state: state.clone(),
+                            request_id: request_id.clone(),
                             provider_id: provider.id.clone(),
                             provider_name: provider.name.clone(),
                             model: model.clone(),
                             request_path: request_path.clone(),
+                            response_status: status,
                             policy: policy.clone(),
                             usage_kind: prepared.usage_response_kind(),
+                            request_estimate: request_token_estimate.clone(),
+                            client_origin,
+                            validate_responses_terminal: request_path == "/v1/responses"
+                                && prepared.is_sse(),
+                            upstream_request_id: upstream_id.clone(),
+                            attempt_index: retry_index.saturating_add(1),
+                            usage_attempt_index,
+                            attempts: attempts.clone(),
+                            started_at: Instant::now(),
                         });
                         return response_to_axum(prepared, observation);
                     }
@@ -2701,6 +4302,60 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                                 format!("连接或发送上游请求失败：{error}")
                             }
                         };
+                        let wait_seconds = policy.retry_interval_sec;
+                        let can_retry = retry_index < policy.retry_count
+                            && waited_seconds.saturating_add(wait_seconds)
+                                <= policy.max_retry_wait_sec;
+                        attempts.push(RoutingAttempt {
+                            provider_id: provider.id.clone(),
+                            provider_name: provider.name.clone(),
+                            status_code: None,
+                            error: Some(last_error.clone()),
+                            latency_ms: Some(latency),
+                            retry_count: retry_index,
+                            switched: !can_retry && policy.allow_provider_failover,
+                        });
+                        persist_gateway_attempt(
+                            &state,
+                            gateway_usage_record(
+                                &request_id,
+                                usage_attempt_index,
+                                &provider.id,
+                                &provider.name,
+                                model.clone(),
+                                &request_path,
+                                None,
+                                if can_retry {
+                                    "connection_retry"
+                                } else {
+                                    "connection_failed"
+                                },
+                                !can_retry && !policy.allow_provider_failover,
+                                client_origin,
+                                CollectedUsage {
+                                    usage: CapturedUsage::default(),
+                                    token_source: "none",
+                                    estimate_method: None,
+                                },
+                            ),
+                        );
+                        if can_retry {
+                            waited_seconds += wait_seconds;
+                            push_diagnostic_log(
+                                &state,
+                                "warning",
+                                format!(
+                                    "{last_error}，{wait_seconds} 秒后重试当前中转（{}/{})",
+                                    retry_index + 1,
+                                    policy.retry_count
+                                ),
+                                Some(&provider.id),
+                                model.as_deref(),
+                                Some("retry_scheduled"),
+                            );
+                            sleep(StdDuration::from_secs(wait_seconds)).await;
+                            continue 'transient_retry;
+                        }
                         if !capacity_attempts.is_empty() {
                             let capacity =
                                 last_capacity.as_ref().expect("容量重试必须保留错误原因");
@@ -2710,7 +4365,7 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                                 status_code: None,
                                 error: Some(last_error.clone()),
                                 latency_ms: Some(latency),
-                                retry_count: capacity_retry_index,
+                                retry_count: retry_index,
                                 switched: false,
                             });
                             record_capacity_exhausted(&state, &provider.id, &last_error, latency);
@@ -2727,25 +4382,18 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                             );
                             return json_error(StatusCode::SERVICE_UNAVAILABLE, &last_error);
                         }
-                        let wait_seconds = policy.retry_interval_sec;
-                        let can_retry = retry_index < policy.retry_count
-                            && waited_seconds.saturating_add(wait_seconds)
-                                <= policy.max_retry_wait_sec;
-                        attempts.push(RoutingAttempt {
-                            provider_id: provider.id.clone(),
-                            provider_name: provider.name.clone(),
-                            status_code: None,
-                            error: Some(last_error.clone()),
-                            latency_ms: Some(latency),
-                            retry_count: retry_index,
-                            switched: !can_retry,
-                        });
-                        if can_retry {
-                            waited_seconds += wait_seconds;
-                            sleep(StdDuration::from_secs(wait_seconds)).await;
-                            continue 'transient_retry;
-                        }
                         mark_failure(&state, &provider.id, last_error.clone(), None, &policy);
+                        push_diagnostic_log(
+                            &state,
+                            "error",
+                            format!(
+                                "同一中转重试已耗尽：{last_error}（共 {} 次尝试）",
+                                retry_index + 1
+                            ),
+                            Some(&provider.id),
+                            model.as_deref(),
+                            Some("retry_exhausted"),
+                        );
                         first_failed_provider.get_or_insert_with(|| provider.id.clone());
                         first_failure_reason.get_or_insert_with(|| last_error.clone());
                         provider_failed = true;
@@ -2755,6 +4403,17 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
             }
         }
         if provider_failed {
+            if !policy.allow_provider_failover {
+                push_diagnostic_log(
+                    &state,
+                    "warning",
+                    "自动切换已关闭，保留当前中转错误".to_string(),
+                    Some(&provider.id),
+                    model.as_deref(),
+                    Some("provider_failover_blocked"),
+                );
+                return json_error(StatusCode::SERVICE_UNAVAILABLE, &last_error);
+            }
             push_log_with_model(
                 &state,
                 "warning",
@@ -2782,12 +4441,152 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
 
 struct ResponseStreamContext {
     state: AppState,
+    request_id: String,
     provider_id: String,
     provider_name: String,
     model: Option<String>,
     request_path: String,
+    response_status: StatusCode,
     policy: RoutingPolicy,
     usage_kind: UsageResponseKind,
+    request_estimate: Option<usage_estimation::RequestTokenEstimate>,
+    client_origin: &'static str,
+    validate_responses_terminal: bool,
+    upstream_request_id: Option<String>,
+    attempt_index: u8,
+    usage_attempt_index: u32,
+    attempts: Vec<RoutingAttempt>,
+    started_at: Instant,
+}
+
+struct SseStreamState {
+    buffer: Vec<u8>,
+    semantic_tracking: bool,
+    started_output: bool,
+    terminal_event_received: bool,
+    terminal_event_type: Option<String>,
+    error_code: Option<String>,
+    error_type: Option<String>,
+    error_message: Option<String>,
+    incomplete_reason: Option<String>,
+    parse_error: Option<String>,
+    response_id: Option<String>,
+    last_event_type: Option<String>,
+    bytes_received: u64,
+}
+
+impl Default for SseStreamState {
+    fn default() -> Self {
+        Self {
+            buffer: Vec::new(),
+            semantic_tracking: true,
+            started_output: false,
+            terminal_event_received: false,
+            terminal_event_type: None,
+            error_code: None,
+            error_type: None,
+            error_message: None,
+            incomplete_reason: None,
+            parse_error: None,
+            response_id: None,
+            last_event_type: None,
+            bytes_received: 0,
+        }
+    }
+}
+
+impl SseStreamState {
+    fn observe(&mut self, chunk: &[u8]) {
+        self.bytes_received = self.bytes_received.saturating_add(chunk.len() as u64);
+        if !self.semantic_tracking {
+            return;
+        }
+        self.buffer.extend_from_slice(chunk);
+        while let Some(end) = next_sse_frame_end(&self.buffer) {
+            if end > MAX_SSE_EVENT_BYTES {
+                // 超大事件继续逐字节透传，但停止终态语义判断，避免观察缓冲无界增长。
+                self.buffer.clear();
+                self.semantic_tracking = false;
+                return;
+            }
+            let frame = self.buffer.drain(..end).collect::<Vec<_>>();
+            let Some(data) = sse_frame_data(&frame) else {
+                continue;
+            };
+            let value = match serde_json::from_slice::<serde_json::Value>(&data) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.parse_error = Some(sanitized_diagnostic_text(&error.to_string(), 300));
+                    continue;
+                }
+            };
+            let event_type = value.get("type").and_then(|item| item.as_str());
+            if let Some(event_type) = event_type {
+                self.last_event_type = Some(event_type.to_string());
+                if matches!(
+                    event_type,
+                    "response.completed" | "response.failed" | "response.incomplete"
+                ) {
+                    self.terminal_event_received = true;
+                    self.terminal_event_type = Some(event_type.to_string());
+                    if event_type == "response.failed" {
+                        let (code, error_type, message) = response_error_fields(&value);
+                        self.error_code = code;
+                        self.error_type = error_type;
+                        self.error_message = message;
+                    } else if event_type == "response.incomplete" {
+                        self.incomplete_reason = value
+                            .pointer("/response/incomplete_details/reason")
+                            .and_then(|item| item.as_str())
+                            .map(|reason| sanitized_diagnostic_text(reason, 180));
+                    }
+                } else if !matches!(event_type, "response.created" | "response.in_progress") {
+                    // 文本、推理和工具事件一旦出现，就禁止网关重放当前尝试。
+                    self.started_output = true;
+                }
+            }
+            if self.response_id.is_none() {
+                self.response_id = value
+                    .pointer("/response/id")
+                    .or_else(|| value.get("response_id"))
+                    .and_then(|item| item.as_str())
+                    .map(ToOwned::to_owned);
+            }
+        }
+        if self.buffer.len() > MAX_SSE_EVENT_BYTES {
+            // 没有完整分帧的异常流也必须受到相同上限约束；降级不改变下游收到的原始字节。
+            self.buffer.clear();
+            self.semantic_tracking = false;
+        }
+    }
+
+    fn incomplete_failure_event(&self) -> Bytes {
+        incomplete_sse_failure_event(self.response_id.as_deref())
+    }
+}
+
+fn incomplete_sse_failure_event(response_id: Option<&str>) -> Bytes {
+    let response = if let Some(id) = response_id {
+        serde_json::json!({
+            "id": id,
+            "status": "failed",
+            "error": {
+                "code": "upstream_stream_incomplete",
+                "message": "上游流在 response.completed 前结束"
+            }
+        })
+    } else {
+        // 没观察到真实 response id 时不伪造标识，只提供可被客户端识别的脱敏错误。
+        serde_json::json!({
+            "status": "failed",
+            "error": {
+                "code": "upstream_stream_incomplete",
+                "message": "上游流在 response.completed 前结束"
+            }
+        })
+    };
+    let data = serde_json::json!({ "type": "response.failed", "response": response });
+    Bytes::from(format!("event: response.failed\ndata: {data}\n\n"))
 }
 
 struct ObservedResponseStream {
@@ -2796,18 +4595,42 @@ struct ObservedResponseStream {
     finished: bool,
     failed: bool,
     usage: UsageCollector,
+    sse: SseStreamState,
 }
 
 impl ObservedResponseStream {
     fn new(stream: GatewayByteStream, context: ResponseStreamContext) -> Self {
-        let usage = UsageCollector::new(context.usage_kind);
+        let usage = UsageCollector::new(
+            context.usage_kind,
+            context.request_estimate.clone(),
+            context.model.clone(),
+        );
         Self {
             inner: stream,
             context,
             finished: false,
             failed: false,
             usage,
+            sse: SseStreamState::default(),
         }
+    }
+
+    fn persist_attempt(&mut self, outcome: &'static str, allow_estimate: bool) {
+        let collected = self.usage.finish(allow_estimate);
+        let record = gateway_usage_record(
+            &self.context.request_id,
+            self.context.usage_attempt_index,
+            &self.context.provider_id,
+            &self.context.provider_name,
+            self.context.model.clone(),
+            &self.context.request_path,
+            Some(self.context.response_status),
+            outcome,
+            true,
+            self.context.client_origin,
+            collected,
+        );
+        persist_gateway_attempt(&self.context.state, record);
     }
 }
 
@@ -2818,6 +4641,9 @@ impl Stream for ObservedResponseStream {
         match self.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
                 self.usage.observe(&chunk);
+                if self.context.validate_responses_terminal {
+                    self.sse.observe(&chunk);
+                }
                 Poll::Ready(Some(Ok(chunk)))
             }
             Poll::Ready(Some(Err(error))) => {
@@ -2836,44 +4662,217 @@ impl Stream for ObservedResponseStream {
                         None,
                         &self.context.policy,
                     );
-                    push_log_with_model(
+                    let failure = StreamFailure {
+                        classification: ErrorClassification::Retryable,
+                        code: Some("upstream_stream_interrupted".to_string()),
+                        error_type: Some("stream_read_error".to_string()),
+                        message: message.clone(),
+                        incomplete_reason: None,
+                        last_sse_event: self.sse.last_event_type.clone(),
+                        terminal_event: self.sse.terminal_event_type.clone(),
+                        terminal_received: self.sse.terminal_event_received,
+                        bytes_received: self.sse.bytes_received,
+                        parse_error: Some(detail),
+                    };
+                    let diagnostic = stream_diagnostic_detail(
+                        &self.context.request_id,
+                        &self.context.provider_id,
+                        self.context.model.as_deref(),
+                        &self.context.request_path,
+                        None,
+                        self.context.upstream_request_id.clone(),
+                        &failure,
+                        self.context.started_at.elapsed().as_millis() as u64,
+                        self.context.attempt_index,
+                        &self.context.policy,
+                        None,
+                        "delegate_stream_recovery_to_client",
+                        self.context.attempts.clone(),
+                        self.sse.started_output,
+                    );
+                    push_diagnostic_detail_log(
                         &self.context.state,
                         "error",
                         message,
-                        Some(&self.context.provider_id),
-                        self.context.model.as_deref(),
+                        "stream_retry_delegated",
+                        diagnostic,
                     );
+                    let allow_estimate = self.usage.saw_output() || self.sse.started_output;
+                    self.persist_attempt("stream_interrupted", allow_estimate);
                 }
                 Poll::Ready(Some(Err(std::io::Error::other("上游流式响应中途断开"))))
             }
             Poll::Ready(None) => {
+                if self.failed {
+                    return Poll::Ready(None);
+                }
+                if self.context.validate_responses_terminal
+                    && self.sse.semantic_tracking
+                    && !self.sse.terminal_event_received
+                {
+                    self.failed = true;
+                    let detail = format!(
+                        "上游流在 response.completed 前结束（最后事件：{}，已接收 {} 字节）",
+                        self.sse.last_event_type.as_deref().unwrap_or("无"),
+                        self.sse.bytes_received
+                    );
+                    let message =
+                        format!("流式响应不完整（{}）：{detail}", self.context.request_path);
+                    mark_failure(
+                        &self.context.state,
+                        &self.context.provider_id,
+                        message.clone(),
+                        None,
+                        &self.context.policy,
+                    );
+                    let failure = StreamFailure {
+                        classification: ErrorClassification::Retryable,
+                        code: Some("upstream_stream_incomplete".to_string()),
+                        error_type: Some("unexpected_eof".to_string()),
+                        message: detail,
+                        incomplete_reason: None,
+                        last_sse_event: self.sse.last_event_type.clone(),
+                        terminal_event: None,
+                        terminal_received: false,
+                        bytes_received: self.sse.bytes_received,
+                        parse_error: self.sse.parse_error.clone(),
+                    };
+                    let diagnostic = stream_diagnostic_detail(
+                        &self.context.request_id,
+                        &self.context.provider_id,
+                        self.context.model.as_deref(),
+                        &self.context.request_path,
+                        None,
+                        self.context.upstream_request_id.clone(),
+                        &failure,
+                        self.context.started_at.elapsed().as_millis() as u64,
+                        self.context.attempt_index,
+                        &self.context.policy,
+                        None,
+                        "delegate_stream_recovery_to_client",
+                        self.context.attempts.clone(),
+                        self.sse.started_output,
+                    );
+                    push_diagnostic_detail_log(
+                        &self.context.state,
+                        "error",
+                        message,
+                        "stream_retry_delegated",
+                        diagnostic,
+                    );
+                    let allow_estimate = self.usage.saw_output() || self.sse.started_output;
+                    self.persist_attempt("stream_incomplete", allow_estimate);
+                    return Poll::Ready(Some(Ok(self.sse.incomplete_failure_event())));
+                }
+                if self.context.validate_responses_terminal
+                    && self.sse.semantic_tracking
+                    && matches!(
+                        self.sse.terminal_event_type.as_deref(),
+                        Some("response.failed" | "response.incomplete")
+                    )
+                {
+                    self.finished = true;
+                    let terminal = self
+                        .sse
+                        .terminal_event_type
+                        .as_deref()
+                        .unwrap_or("response.failed")
+                        .to_string();
+                    let message = format!(
+                        "上游返回 {terminal}（{}，已接收 {} 字节）",
+                        self.context.request_path, self.sse.bytes_received
+                    );
+                    let classification = if terminal == "response.incomplete" {
+                        classify_incomplete_reason(self.sse.incomplete_reason.as_deref())
+                    } else {
+                        classify_error_fields(
+                            self.sse.error_code.as_deref(),
+                            self.sse.error_type.as_deref(),
+                            self.sse.error_message.as_deref(),
+                        )
+                    };
+                    if classification != ErrorClassification::IncompleteBusiness {
+                        mark_failure(
+                            &self.context.state,
+                            &self.context.provider_id,
+                            message.clone(),
+                            None,
+                            &self.context.policy,
+                        );
+                    } else {
+                        // max_output_tokens/内容过滤属于业务性结束：只计请求量，不误计成功，也不降低线路健康度。
+                        record_incomplete_business_response(
+                            &self.context.state,
+                            &self.context.provider_id,
+                            self.context.started_at.elapsed().as_millis() as u64,
+                        );
+                    }
+                    let failure = StreamFailure {
+                        classification,
+                        code: self.sse.error_code.clone(),
+                        error_type: self.sse.error_type.clone(),
+                        message: self
+                            .sse
+                            .error_message
+                            .clone()
+                            .unwrap_or_else(|| message.clone()),
+                        incomplete_reason: self.sse.incomplete_reason.clone(),
+                        last_sse_event: self.sse.last_event_type.clone(),
+                        terminal_event: self.sse.terminal_event_type.clone(),
+                        terminal_received: true,
+                        bytes_received: self.sse.bytes_received,
+                        parse_error: self.sse.parse_error.clone(),
+                    };
+                    let diagnostic = stream_diagnostic_detail(
+                        &self.context.request_id,
+                        &self.context.provider_id,
+                        self.context.model.as_deref(),
+                        &self.context.request_path,
+                        None,
+                        self.context.upstream_request_id.clone(),
+                        &failure,
+                        self.context.started_at.elapsed().as_millis() as u64,
+                        self.context.attempt_index,
+                        &self.context.policy,
+                        None,
+                        if self.sse.started_output {
+                            "delegate_stream_recovery_to_client"
+                        } else {
+                            "forward_terminal"
+                        },
+                        self.context.attempts.clone(),
+                        self.sse.started_output,
+                    );
+                    push_diagnostic_detail_log(
+                        &self.context.state,
+                        if classification == ErrorClassification::IncompleteBusiness {
+                            "info"
+                        } else {
+                            "error"
+                        },
+                        message,
+                        if terminal == "response.incomplete" {
+                            "sse_incomplete_detected"
+                        } else {
+                            "sse_failure_detected"
+                        },
+                        diagnostic,
+                    );
+                    let allow_estimate = self.usage.saw_output() || self.sse.started_output;
+                    self.persist_attempt(
+                        if terminal == "response.incomplete" {
+                            "incomplete"
+                        } else {
+                            "failed"
+                        },
+                        allow_estimate,
+                    );
+                    return Poll::Ready(None);
+                }
                 if !self.finished {
                     self.finished = true;
                     mark_response_completed(&self.context.state, &self.context.provider_id);
-                    let usage = self.usage.finish();
-                    let record = UsageRecord {
-                        completed_at: Utc::now(),
-                        provider_id: self.context.provider_id.clone(),
-                        provider_name: self.context.provider_name.clone(),
-                        model: self.context.model.clone(),
-                        request_path: self.context.request_path.clone(),
-                        usage,
-                    };
-                    // 每个完成响应只有一次短事务写入；失败只影响统计，绝不能中断已经完成的代理响应。
-                    match persist_usage_record(&self.context.state.store, &record) {
-                        Ok(()) => {
-                            if let Some(app) = self.context.state.app_handle.as_ref() {
-                                let _ = app.emit(
-                                    "usage-updated",
-                                    serde_json::json!({
-                                        "provider_id": record.provider_id,
-                                        "completed_at": record.completed_at,
-                                    }),
-                                );
-                            }
-                        }
-                        Err(error) => warn!(%error, "usage persistence failed"),
-                    }
+                    self.persist_attempt("completed", true);
                 }
                 Poll::Ready(None)
             }
@@ -2898,6 +4897,8 @@ impl Drop for ObservedResponseStream {
             Some(&self.context.provider_id),
             self.context.model.as_deref(),
         );
+        let allow_estimate = self.usage.saw_output() || self.sse.started_output;
+        self.persist_attempt("client_cancelled", allow_estimate);
     }
 }
 
@@ -3042,6 +5043,40 @@ async fn codex_config_watch_loop(state: AppState) {
     }
 }
 
+async fn codex_usage_sync_loop(state: AppState) {
+    loop {
+        let _guard = state.codex_usage_sync_lock.lock().await;
+        state.codex_usage_status.lock().unwrap().state = "syncing".to_string();
+        let store = state.store.clone();
+        let retention_days = state.settings.read().unwrap().usage_retention_days;
+        let result =
+            tokio::task::spawn_blocking(move || codex_usage::sync_current(&store, retention_days))
+                .await;
+        match result {
+            Ok(Ok(status)) if status.imported_count > 0 || status.matched_count > 0 => {
+                *state.codex_usage_status.lock().unwrap() = status.clone();
+                if let Some(app) = state.app_handle.as_ref() {
+                    let _ = app.emit("usage-updated", &status);
+                }
+            }
+            Ok(Ok(status)) => *state.codex_usage_status.lock().unwrap() = status,
+            Ok(Err(error)) => {
+                *state.codex_usage_status.lock().unwrap() = codex_usage::CodexUsageSyncStatus {
+                    state: "error".to_string(),
+                    warning_messages: vec![error.clone()],
+                    ..Default::default()
+                };
+                warn!(%error, "codex usage sync failed");
+            }
+            Err(error) => {
+                state.codex_usage_status.lock().unwrap().state = "error".to_string();
+                warn!(%error, "codex usage sync worker failed");
+            }
+        }
+        sleep(StdDuration::from_secs(15)).await;
+    }
+}
+
 #[tauri::command]
 fn list_providers(state: TauriState<'_, AppState>) -> Result<Vec<ProviderDto>, String> {
     Ok(state.config.read().unwrap().iter().map(dto).collect())
@@ -3082,20 +5117,6 @@ fn gateway_codex_configuration(
         port: settings.port,
         local_token: settings.local_token.clone(),
     }
-}
-
-fn codex_last_switched_at(state: &AppState) -> Option<String> {
-    setting(&state.store, "codex_last_switched_at")
-        .ok()
-        .flatten()
-        .filter(|value| !value.is_empty())
-}
-
-fn codex_last_history_migration_at(state: &AppState) -> Option<String> {
-    setting(&state.store, "codex_last_history_migration_at")
-        .ok()
-        .flatten()
-        .filter(|value| !value.is_empty())
 }
 
 fn observe_codex_config_fingerprint(state: &AppState, fingerprint: String) {
@@ -3141,13 +5162,8 @@ fn get_codex_integration_state(
     state: TauriState<'_, AppState>,
 ) -> codex_integration::CodexIntegrationState {
     let configuration = gateway_codex_configuration(&state.settings.read().unwrap());
-    let login = state.codex_login_status.lock().unwrap().clone();
-    codex_integration::integration_state(
-        &configuration,
-        codex_last_switched_at(&state),
-        codex_last_history_migration_at(&state),
-        login,
-    )
+    let environment = state.codex_environment_status.lock().unwrap().clone();
+    codex_integration::integration_state(&configuration, environment)
 }
 
 #[tauri::command]
@@ -3155,14 +5171,9 @@ fn refresh_codex_login_status(
     state: TauriState<'_, AppState>,
 ) -> codex_integration::CodexIntegrationState {
     let configuration = gateway_codex_configuration(&state.settings.read().unwrap());
-    let login = codex_integration::login_status();
-    *state.codex_login_status.lock().unwrap() = login.clone();
-    codex_integration::integration_state(
-        &configuration,
-        codex_last_switched_at(&state),
-        codex_last_history_migration_at(&state),
-        login,
-    )
+    let environment = codex_integration::environment_status();
+    *state.codex_environment_status.lock().unwrap() = environment.clone();
+    codex_integration::integration_state(&configuration, environment)
 }
 
 #[tauri::command]
@@ -3242,6 +5253,16 @@ fn switch_codex_connection_mode(
             },
             None,
         );
+        let mode = match result.current_mode {
+            codex_integration::CodexConnectionMode::Official => "official",
+            codex_integration::CodexConnectionMode::Gateway => "gateway",
+            codex_integration::CodexConnectionMode::External => unreachable!(),
+        };
+        if let Err(error) = codex_usage::record_mode(&state.store, mode) {
+            result
+                .warning_messages
+                .push(format!("模式已切换，但用量归属时间线保存失败：{error}"));
+        }
         if let Some(app) = state.app_handle.as_ref() {
             let _ = app.emit("codex-config-changed", ());
         }
@@ -3274,14 +5295,15 @@ fn save_configuration_state(state: &AppState, input: &ConfigurationInput) -> Res
     validate_probe_interval(input.probe_interval_sec)?;
     validate_log_retention_days(input.log_retention_days)?;
     validate_usage_retention_days(input.usage_retention_days)?;
-    validate_routing_policy(&input.routing_policy)?;
+    let policy = normalized_routing_policy(&input.routing_policy);
+    validate_routing_policy(&policy)?;
     persist_configuration(
         &state.store,
         input.port,
         input.probe_interval_sec,
         input.log_retention_days,
         input.usage_retention_days,
-        &input.routing_policy,
+        &policy,
     )?;
 
     // 同时持有两把写锁后再替换快照，确保事务成功前运行时永远看不到新配置。
@@ -3291,7 +5313,7 @@ fn save_configuration_state(state: &AppState, input: &ConfigurationInput) -> Res
     settings.probe_interval_sec = input.probe_interval_sec;
     settings.log_retention_days = input.log_retention_days;
     settings.usage_retention_days = input.usage_retention_days;
-    *policy = input.routing_policy.clone();
+    *policy = normalized_routing_policy(&input.routing_policy);
     drop(policy);
     drop(settings);
     // 缩短保留期限时立即清理；清理失败不回滚已提交配置，后台任务会在下一小时重试。
@@ -3427,6 +5449,7 @@ fn save_routing_policy(
     policy: RoutingPolicy,
     state: TauriState<'_, AppState>,
 ) -> Result<RoutingPolicy, String> {
+    let policy = normalized_routing_policy(&policy);
     validate_routing_policy(&policy)?;
     persist_routing_policy(&state.store, &policy)?;
     *state.policy.write().unwrap() = policy.clone();
@@ -3560,6 +5583,41 @@ fn get_usage_statistics(
     state: TauriState<'_, AppState>,
 ) -> Result<UsageStatistics, String> {
     query_usage_statistics(&state, &query)
+}
+
+#[tauri::command]
+async fn sync_codex_usage(
+    app: tauri::AppHandle,
+    state: TauriState<'_, AppState>,
+) -> Result<codex_usage::CodexUsageSyncStatus, String> {
+    let _guard = state.codex_usage_sync_lock.lock().await;
+    state.codex_usage_status.lock().unwrap().state = "syncing".to_string();
+    let store = state.store.clone();
+    let retention_days = state.settings.read().unwrap().usage_retention_days;
+    let status =
+        tokio::task::spawn_blocking(move || codex_usage::sync_current(&store, retention_days))
+            .await
+            .map_err(|error| format!("Codex 用量同步任务异常结束：{error}"))??;
+    let _ = app.emit("usage-updated", &status);
+    *state.codex_usage_status.lock().unwrap() = status.clone();
+    Ok(status)
+}
+
+#[tauri::command]
+async fn rebuild_codex_usage(
+    app: tauri::AppHandle,
+    state: TauriState<'_, AppState>,
+) -> Result<codex_usage::CodexUsageSyncStatus, String> {
+    let _guard = state.codex_usage_sync_lock.lock().await;
+    state.codex_usage_status.lock().unwrap().state = "syncing".to_string();
+    let store = state.store.clone();
+    let retention_days = state.settings.read().unwrap().usage_retention_days;
+    let status = tokio::task::spawn_blocking(move || codex_usage::rebuild(&store, retention_days))
+        .await
+        .map_err(|error| format!("Codex 用量重建任务异常结束：{error}"))??;
+    let _ = app.emit("usage-updated", &status);
+    *state.codex_usage_status.lock().unwrap() = status.clone();
+    Ok(status)
 }
 
 #[tauri::command]
@@ -4068,6 +6126,7 @@ pub fn run() {
             let monitor_state = gateway_state.clone();
             let log_cleanup_state = gateway_state.clone();
             let codex_watch_state = gateway_state.clone();
+            let codex_usage_state = gateway_state.clone();
             tauri::async_runtime::spawn(async move {
                 health_loop(monitor_state).await;
             });
@@ -4076,6 +6135,10 @@ pub fn run() {
             });
             tauri::async_runtime::spawn(async move {
                 codex_config_watch_loop(codex_watch_state).await;
+            });
+            // 首轮立即回填保留期内历史，后续只按游标读取变化文件；阻塞 I/O 不占用网关任务线程。
+            tauri::async_runtime::spawn(async move {
+                codex_usage_sync_loop(codex_usage_state).await;
             });
             tauri::async_runtime::spawn(async move {
                 let port = gateway_state.settings.read().unwrap().port;
@@ -4149,6 +6212,8 @@ pub fn run() {
             update_route_group,
             get_runtime_stats,
             get_usage_statistics,
+            sync_codex_usage,
+            rebuild_codex_usage,
             get_recent_logs,
             reload_config,
             save_router_settings,
@@ -4266,7 +6331,15 @@ mod tests {
             gateway: Arc::new(GatewayController::default()),
             codex_config_fingerprint: Arc::new(Mutex::new(None)),
             codex_history_preview: Arc::new(Mutex::new(None)),
-            codex_login_status: Arc::new(Mutex::new(codex_integration::CodexLoginStatus::Unknown)),
+            codex_environment_status: Arc::new(Mutex::new(
+                codex_integration::CodexEnvironmentStatus {
+                    desktop_status: codex_integration::CodexApplicationStatus::NotInstalled,
+                    cli_status: codex_integration::CodexApplicationStatus::NotInstalled,
+                    login_status: codex_integration::CodexLoginStatus::Unknown,
+                },
+            )),
+            codex_usage_sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+            codex_usage_status: Arc::new(Mutex::new(Default::default())),
             app_handle: None,
         }
     }
@@ -4290,7 +6363,8 @@ mod tests {
                     provider_id TEXT,
                     model TEXT,
                     event_type TEXT,
-                    routing_event_json TEXT
+                    routing_event_json TEXT,
+                    diagnostic_json TEXT
                 );
                 CREATE TABLE usage_records (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4302,10 +6376,27 @@ mod tests {
                     input_tokens INTEGER,
                     output_tokens INTEGER,
                     cached_tokens INTEGER,
+                    cache_write_tokens INTEGER,
                     reasoning_tokens INTEGER,
                     total_tokens INTEGER,
-                    usage_reported INTEGER NOT NULL
-                );",
+                    usage_reported INTEGER NOT NULL,
+                    data_source TEXT NOT NULL DEFAULT 'gateway_response',
+                    usage_origin TEXT NOT NULL DEFAULT 'gateway',
+                    client_origin TEXT NOT NULL DEFAULT 'unknown',
+                    codex_event_key TEXT,
+                    codex_usage_supplemented INTEGER NOT NULL DEFAULT 0,
+                    gateway_request_id TEXT,
+                    attempt_index INTEGER NOT NULL DEFAULT 1,
+                    is_final_attempt INTEGER NOT NULL DEFAULT 1,
+                    http_status INTEGER,
+                    outcome TEXT NOT NULL DEFAULT 'completed',
+                    token_source TEXT NOT NULL DEFAULT 'none',
+                    estimate_method TEXT,
+                    codex_previous_usage_json TEXT
+                );
+                CREATE UNIQUE INDEX idx_usage_records_gateway_attempt
+                    ON usage_records(gateway_request_id, provider_id, attempt_index)
+                    WHERE gateway_request_id IS NOT NULL;",
             )
             .unwrap();
     }
@@ -4642,6 +6733,21 @@ mod tests {
             .unwrap()
     }
 
+    async fn call_test_gateway_path(state: AppState, path: &str) -> Response<Body> {
+        gateway_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(path)
+                    .header(header::AUTHORIZATION, "Bearer local-test-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"model":"gpt-test","messages":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
     async fn call_test_gateway(state: AppState) -> Response<Body> {
         call_test_gateway_request(
             state,
@@ -4692,6 +6798,18 @@ mod tests {
         assert!(should_retry_status(StatusCode::BAD_GATEWAY));
         assert!(!should_retry_status(StatusCode::UNAUTHORIZED));
         assert!(!should_retry_status(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn recognizes_account_concurrency_as_retryable_capacity_error() {
+        let value = serde_json::json!({
+            "error": {
+                "code": "concurrency_limit_exceeded",
+                "message": "Concurrency limit exceeded for account, please retry later"
+            }
+        });
+        let error = capacity_error_from_json(&value).expect("应识别账号并发限制");
+        assert_eq!(error.code.as_deref(), Some("concurrency_limit_exceeded"));
     }
 
     #[test]
@@ -4845,7 +6963,7 @@ mod tests {
     }
 
     #[test]
-    fn old_routing_policy_json_uses_capacity_defaults() {
+    fn old_routing_policy_json_uses_unified_values_for_legacy_capacity_fields() {
         let old = serde_json::json!({
             "retry_count": 1,
             "retry_interval_sec": 1,
@@ -4856,10 +6974,18 @@ mod tests {
             "payload_too_large_action": "failover",
             "notify_switches": true
         });
-        let policy: RoutingPolicy = serde_json::from_value(old).unwrap();
-        assert_eq!(policy.capacity_retry_count, 3);
-        assert_eq!(policy.capacity_retry_interval_sec, 5);
-        assert_eq!(policy.capacity_max_retry_wait_sec, 30);
+        let mut policy: RoutingPolicy = serde_json::from_value(old).unwrap();
+        synchronize_legacy_retry_fields(&mut policy);
+        assert_eq!(policy.capacity_retry_count, policy.retry_count);
+        assert!(policy.retry_unknown_transient_errors);
+        assert_eq!(
+            policy.capacity_retry_interval_sec,
+            policy.retry_interval_sec
+        );
+        assert_eq!(
+            policy.capacity_max_retry_wait_sec,
+            policy.max_retry_wait_sec
+        );
     }
     #[test]
     fn filters_connection_specific_headers() {
@@ -4968,7 +7094,7 @@ mod tests {
     #[test]
     fn routing_policy_rejects_unbounded_retry_count() {
         let policy = RoutingPolicy {
-            retry_count: 4,
+            retry_count: 6,
             ..RoutingPolicy::default()
         };
         assert!(validate_routing_policy(&policy).is_err());
@@ -5011,6 +7137,56 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_detail_is_restored_without_sensitive_body_fields() {
+        let state = test_state(Vec::new());
+        initialize_test_settings(&state);
+        let failure = StreamFailure {
+            classification: ErrorClassification::Retryable,
+            code: Some("server_error".to_string()),
+            error_type: Some("upstream_error".to_string()),
+            message: "temporary failure".to_string(),
+            incomplete_reason: None,
+            last_sse_event: Some("response.failed".to_string()),
+            terminal_event: Some("response.failed".to_string()),
+            terminal_received: true,
+            bytes_received: 128,
+            parse_error: None,
+        };
+        let detail = stream_diagnostic_detail(
+            "request-id",
+            "primary",
+            Some("gpt-test"),
+            "/v1/responses",
+            Some(StatusCode::OK),
+            Some("upstream-id".to_string()),
+            &failure,
+            42,
+            1,
+            &RoutingPolicy::default(),
+            Some(1),
+            "retry_current_provider",
+            Vec::new(),
+            false,
+        );
+        push_diagnostic_detail_log(
+            &state,
+            "warning",
+            "检测到临时错误",
+            "sse_failure_detected",
+            detail,
+        );
+
+        let restored = load_recent_logs(&state.store).unwrap();
+        let detail = restored.back().unwrap().diagnostic_detail.as_ref().unwrap();
+        assert_eq!(detail.error_code.as_deref(), Some("server_error"));
+        assert_eq!(detail.upstream_request_id.as_deref(), Some("upstream-id"));
+        let json = serde_json::to_string(detail).unwrap();
+        assert!(!json.contains("authorization"));
+        assert!(!json.contains("api_key"));
+        assert!(!json.contains("prompt"));
+    }
+
+    #[test]
     fn expired_event_logs_are_deleted_by_retention_days() {
         let state = test_state(Vec::new());
         initialize_test_settings(&state);
@@ -5022,6 +7198,7 @@ mod tests {
             model: None,
             event_type: None,
             routing_event: None,
+            diagnostic_detail: None,
         };
         let recent = EventLog {
             timestamp: Utc::now() - Duration::days(6),
@@ -5288,19 +7465,86 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unified_retry_migration_preserves_unrelated_routing_preferences() {
+        let state = test_state(Vec::new());
+        initialize_test_settings(&state);
+        save_setting(&state.store, "retry_count", "1").unwrap();
+        save_setting(&state.store, "circuit_failure_threshold", "7").unwrap();
+        save_setting(&state.store, "payload_too_large_action", "return").unwrap();
+        save_setting(&state.store, "notify_switches", "false").unwrap();
+
+        migrate_unified_retry_policy(&state.store).unwrap();
+
+        assert_eq!(
+            setting(&state.store, "retry_count").unwrap().as_deref(),
+            Some("5")
+        );
+        assert_eq!(
+            setting(&state.store, "allow_provider_failover")
+                .unwrap()
+                .as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            setting(&state.store, "circuit_failure_threshold")
+                .unwrap()
+                .as_deref(),
+            Some("7")
+        );
+        assert_eq!(
+            setting(&state.store, "payload_too_large_action")
+                .unwrap()
+                .as_deref(),
+            Some("return")
+        );
+        assert_eq!(
+            setting(&state.store, "notify_switches").unwrap().as_deref(),
+            Some("false")
+        );
+    }
+
     #[tokio::test]
     async fn retries_backup_provider_after_server_error() {
         let primary =
             mock_upstream(StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"failed"}"#).await;
         let backup = mock_upstream(StatusCode::OK, r#"{"provider":"backup"}"#).await;
-        let response = call_test_gateway(test_state(vec![
+        let state = test_state(vec![
             test_provider("primary", primary, 1),
             test_provider("backup", backup, 2),
-        ]))
-        .await;
+        ]);
+        state.policy.write().unwrap().allow_provider_failover = true;
+        let response = call_test_gateway(state).await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body, Bytes::from_static(br#"{"provider":"backup"}"#));
+    }
+
+    #[tokio::test]
+    async fn default_policy_never_calls_backup_provider() {
+        let (primary, primary_calls) = mock_counted_sequence(vec![(
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":"failed"}"#,
+            "application/json",
+        )])
+        .await;
+        let (backup, backup_calls) = mock_counted_sequence(vec![(
+            StatusCode::OK,
+            r#"{"provider":"backup"}"#,
+            "application/json",
+        )])
+        .await;
+        let state = test_state(vec![
+            test_provider("primary", primary, 1),
+            test_provider("backup", backup, 2),
+        ]);
+        state.policy.write().unwrap().retry_count = 1;
+
+        let response = call_test_gateway(state).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(backup_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -5331,8 +7575,8 @@ mod tests {
         ]);
         {
             let mut policy = state.policy.write().unwrap();
-            policy.capacity_retry_count = 1;
-            policy.capacity_retry_interval_sec = 1;
+            policy.retry_count = 1;
+            policy.retry_interval_sec = 1;
         }
 
         let response = call_test_gateway(state.clone()).await;
@@ -5370,8 +7614,8 @@ mod tests {
         ]);
         {
             let mut policy = state.policy.write().unwrap();
-            policy.capacity_retry_count = 1;
-            policy.capacity_retry_interval_sec = 1;
+            policy.retry_count = 1;
+            policy.retry_interval_sec = 1;
         }
 
         let response = call_test_gateway(state.clone()).await;
@@ -5387,6 +7631,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn account_concurrency_uses_global_retry_without_failover() {
+        let concurrency_body = r#"{"error":{"code":"account_concurrency_limit","message":"Concurrency limit exceeded for account, please retry later"}}"#;
+        let (primary, primary_calls) = mock_counted_sequence(vec![
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                concurrency_body,
+                "application/json",
+            ),
+            (
+                StatusCode::OK,
+                r#"{"provider":"primary"}"#,
+                "application/json",
+            ),
+        ])
+        .await;
+        let (backup, backup_calls) = mock_counted_sequence(vec![(
+            StatusCode::OK,
+            r#"{"provider":"backup"}"#,
+            "application/json",
+        )])
+        .await;
+        let state = test_state(vec![
+            test_provider("primary", primary, 1),
+            test_provider("backup", backup, 2),
+        ]);
+        {
+            let mut policy = state.policy.write().unwrap();
+            policy.retry_count = 1;
+            policy.retry_interval_sec = 1;
+            policy.allow_provider_failover = true;
+        }
+
+        let response = call_test_gateway(state).await;
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+
+        assert_eq!(body, Bytes::from_static(br#"{"provider":"primary"}"#));
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(backup_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn sse_capacity_before_output_retries_without_mixing_response_ids() {
         let first = concat!(
             "data: {\"type\":\"response.created\",\"response\":{\"id\":\"failed-id\"}}\r\n\r\n",
@@ -5394,7 +7679,8 @@ mod tests {
         );
         let second = concat!(
             "data: {\"type\":\"response.created\",\"response\":{\"id\":\"success-id\"}}\n\n",
-            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n"
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"success-id\"}}\n\n"
         );
         let (primary, calls) = mock_counted_sequence(vec![
             (StatusCode::OK, first, "text/event-stream"),
@@ -5404,8 +7690,8 @@ mod tests {
         let state = test_state(vec![test_provider("primary", primary, 1)]);
         {
             let mut policy = state.policy.write().unwrap();
-            policy.capacity_retry_count = 1;
-            policy.capacity_retry_interval_sec = 1;
+            policy.retry_count = 1;
+            policy.retry_interval_sec = 1;
         }
 
         let response = call_test_gateway(state).await;
@@ -5415,6 +7701,78 @@ mod tests {
         assert!(!text.contains("failed-id"));
         assert!(text.contains("success-id"));
         assert!(text.contains("response.output_text.delta"));
+    }
+
+    #[tokio::test]
+    async fn retryable_response_failed_before_output_retries_current_provider() {
+        let failed = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"failed-id\"}}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\",\"message\":\"processing error\"}}}\n\n"
+        );
+        let completed =
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"success-id\"}}\n\n";
+        let (upstream, calls) = mock_counted_sequence(vec![
+            (StatusCode::OK, failed, "text/event-stream"),
+            (StatusCode::OK, completed, "text/event-stream"),
+        ])
+        .await;
+        let state = test_state(vec![test_provider("primary", upstream, 1)]);
+        state.policy.write().unwrap().retry_count = 1;
+
+        let response = call_test_gateway(state.clone()).await;
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(!String::from_utf8_lossy(&body).contains("failed-id"));
+        assert!(String::from_utf8_lossy(&body).contains("success-id"));
+        assert!(state.logs.lock().unwrap().iter().any(|entry| {
+            entry.event_type.as_deref() == Some("sse_failure_detected")
+                && entry.diagnostic_detail.is_some()
+        }));
+    }
+
+    #[tokio::test]
+    async fn unknown_response_failed_respects_fallback_retry_switch() {
+        let failed = "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"future_error\",\"message\":\"new failure\"}}}\n\n";
+        let completed =
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"should-not-run\"}}\n\n";
+        let (upstream, calls) = mock_counted_sequence(vec![
+            (StatusCode::OK, failed, "text/event-stream"),
+            (StatusCode::OK, completed, "text/event-stream"),
+        ])
+        .await;
+        let state = test_state(vec![test_provider("primary", upstream, 1)]);
+        {
+            let mut policy = state.policy.write().unwrap();
+            policy.retry_count = 1;
+            policy.retry_unknown_transient_errors = false;
+        }
+
+        let response = call_test_gateway(state).await;
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(String::from_utf8_lossy(&body).contains("future_error"));
+        assert!(!String::from_utf8_lossy(&body).contains("should-not-run"));
+    }
+
+    #[tokio::test]
+    async fn business_incomplete_is_forwarded_without_retry() {
+        let incomplete = "data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n";
+        let (upstream, calls) =
+            mock_counted_sequence(vec![(StatusCode::OK, incomplete, "text/event-stream")]).await;
+        let state = test_state(vec![test_provider("primary", upstream, 1)]);
+        state.policy.write().unwrap().retry_count = 1;
+
+        let response = call_test_gateway(state.clone()).await;
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(String::from_utf8_lossy(&body).contains("max_output_tokens"));
+        let health = state.health.lock().unwrap();
+        let record = health.get("primary").unwrap();
+        assert_eq!(record.consecutive_failures, 0);
+        assert_eq!(record.successful_requests, 0);
     }
 
     #[tokio::test]
@@ -5434,6 +7792,160 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn responses_sse_with_terminal_event_completes_without_synthetic_failure() {
+        let stream = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-ok\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-ok\"}}\n\n"
+        );
+        let upstream =
+            mock_upstream_with_content_type(StatusCode::OK, stream, "text/event-stream").await;
+        let state = test_state(vec![test_provider("stream", upstream, 1)]);
+
+        let response = call_test_gateway(state.clone()).await;
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body);
+
+        assert!(text.contains("response.completed"));
+        assert!(!text.contains("upstream_stream_incomplete"));
+        assert_eq!(
+            state
+                .health
+                .lock()
+                .unwrap()
+                .get("stream")
+                .unwrap()
+                .consecutive_failures,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_sse_completed_without_text_or_usage_is_successful() {
+        let stream = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-empty\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-empty\"}}\n\n"
+        );
+        let (upstream, calls) =
+            mock_counted_sequence(vec![(StatusCode::OK, stream, "text/event-stream")]).await;
+        let state = test_state(vec![test_provider("stream", upstream, 1)]);
+
+        let response = call_test_gateway(state.clone()).await;
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(String::from_utf8_lossy(&body).contains("response.completed"));
+        assert_eq!(
+            state
+                .health
+                .lock()
+                .unwrap()
+                .get("stream")
+                .unwrap()
+                .successful_requests,
+            1
+        );
+    }
+
+    #[test]
+    fn classifies_stream_error_fields_without_retrying_permanent_errors() {
+        assert_eq!(
+            classify_error_fields(Some("server_error"), None, None),
+            ErrorClassification::Retryable
+        );
+        assert_eq!(
+            classify_error_fields(None, None, Some("Our servers are currently overloaded")),
+            ErrorClassification::Retryable
+        );
+        assert_eq!(
+            classify_error_fields(Some("model_not_found"), None, None),
+            ErrorClassification::Permanent
+        );
+        assert_eq!(
+            classify_error_fields(Some("context_length_exceeded"), None, None),
+            ErrorClassification::Permanent
+        );
+        assert_eq!(
+            classify_error_fields(Some("new_unrecognized_error"), None, None),
+            ErrorClassification::Unknown
+        );
+    }
+
+    #[test]
+    fn classifies_incomplete_business_and_transient_reasons() {
+        assert_eq!(
+            classify_incomplete_reason(Some("max_output_tokens")),
+            ErrorClassification::IncompleteBusiness
+        );
+        assert_eq!(
+            classify_incomplete_reason(Some("upstream_timeout")),
+            ErrorClassification::Retryable
+        );
+        assert_eq!(
+            classify_incomplete_reason(Some("future_reason")),
+            ErrorClassification::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_sse_without_terminal_event_returns_structured_failure() {
+        let stream = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-cut\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n"
+        );
+        let (upstream, calls) =
+            mock_counted_sequence(vec![(StatusCode::OK, stream, "text/event-stream")]).await;
+        let state = test_state(vec![test_provider("stream", upstream, 1)]);
+
+        let response = call_test_gateway(state.clone()).await;
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(text.contains("partial"));
+        assert!(text.contains("upstream_stream_incomplete"));
+        assert!(text.contains("resp-cut"));
+        assert_eq!(
+            state
+                .logs
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.event_type.as_deref() == Some("stream_retry_delegated"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completions_done_marker_is_not_treated_as_missing_responses_terminal() {
+        let stream = concat!(
+            "data: {\"id\":\"chat-1\",\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let upstream =
+            mock_upstream_with_content_type(StatusCode::OK, stream, "text/event-stream").await;
+        let state = test_state(vec![test_provider("chat", upstream, 1)]);
+
+        let response = call_test_gateway_path(state.clone(), "/v1/chat/completions").await;
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body);
+
+        assert!(text.contains("[DONE]"));
+        assert!(!text.contains("upstream_stream_incomplete"));
+        assert_eq!(
+            state
+                .health
+                .lock()
+                .unwrap()
+                .get("chat")
+                .unwrap()
+                .consecutive_failures,
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn fails_over_immediately_after_payload_too_large() {
         let primary =
             mock_upstream(StatusCode::PAYLOAD_TOO_LARGE, r#"{"error":"too large"}"#).await;
@@ -5442,6 +7954,7 @@ mod tests {
             test_provider("primary", primary, 1),
             test_provider("backup", backup, 2),
         ]);
+        state.policy.write().unwrap().allow_provider_failover = true;
         let response = call_test_gateway(state.clone()).await;
         assert_eq!(response.status(), StatusCode::OK);
         let logs = state.logs.lock().unwrap();
@@ -5472,6 +7985,69 @@ mod tests {
         state.policy.write().unwrap().payload_too_large_action = PayloadTooLargeAction::Return;
         let response = call_test_gateway(state).await;
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn payload_too_large_never_calls_backup_when_failover_is_disabled() {
+        let (primary, primary_calls) = mock_counted_sequence(vec![(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            r#"{"error":"too large"}"#,
+            "application/json",
+        )])
+        .await;
+        let (backup, backup_calls) = mock_counted_sequence(vec![(
+            StatusCode::OK,
+            r#"{"provider":"backup"}"#,
+            "application/json",
+        )])
+        .await;
+        let state = test_state(vec![
+            test_provider("primary", primary, 1),
+            test_provider("backup", backup, 2),
+        ]);
+
+        let response = call_test_gateway(state).await;
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backup_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn open_primary_circuit_returns_explicit_error_without_backup() {
+        let (primary, primary_calls) = mock_counted_sequence(vec![(
+            StatusCode::OK,
+            r#"{"provider":"primary"}"#,
+            "application/json",
+        )])
+        .await;
+        let (backup, backup_calls) = mock_counted_sequence(vec![(
+            StatusCode::OK,
+            r#"{"provider":"backup"}"#,
+            "application/json",
+        )])
+        .await;
+        let state = test_state(vec![
+            test_provider("primary", primary, 1),
+            test_provider("backup", backup, 2),
+        ]);
+        state.health.lock().unwrap().insert(
+            "primary".to_string(),
+            HealthRecord {
+                state: HealthState::Open,
+                cooldown_until: Some(Utc::now() + Duration::minutes(5)),
+                ..HealthRecord::default()
+            },
+        );
+
+        let response = call_test_gateway(state).await;
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(String::from_utf8_lossy(&body).contains("自动切换已关闭"));
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backup_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -5528,7 +8104,11 @@ mod tests {
         let mut primary_provider = test_provider("slow-primary", primary, 1);
         primary_provider.timeout_ms = 1_000;
         let state = test_state(vec![primary_provider, test_provider("backup", backup, 2)]);
-        state.policy.write().unwrap().retry_count = 0;
+        {
+            let mut policy = state.policy.write().unwrap();
+            policy.retry_count = 0;
+            policy.allow_provider_failover = true;
+        }
 
         let response = call_test_gateway(state.clone()).await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -5598,7 +8178,10 @@ mod tests {
     async fn preserves_server_sent_event_response() {
         let upstream = mock_upstream_with_content_type(
             StatusCode::OK,
-            "data: {\"type\":\"response.output_text.delta\"}\n\n",
+            concat!(
+                "data: {\"type\":\"response.output_text.delta\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+            ),
             "text/event-stream",
         )
         .await;
@@ -5637,7 +8220,7 @@ mod tests {
         let chat_usage = usage_from_response_json(&chat).unwrap();
 
         assert_eq!(responses_usage.input_tokens, Some(120));
-        assert_eq!(responses_usage.cached_tokens, Some(40));
+        assert_eq!(responses_usage.cache_read_tokens, Some(40));
         assert_eq!(responses_usage.reasoning_tokens, Some(12));
         assert_eq!(responses_usage.total_tokens, Some(150));
         assert_eq!(chat_usage.input_tokens, Some(80));
@@ -5653,11 +8236,11 @@ mod tests {
         let second = Bytes::from_static(
             b"\"output_tokens\":7,\"total_tokens\":25}}}\r\n\r\ndata: [DONE]\r\n\r\n",
         );
-        let mut collector = UsageCollector::new(UsageResponseKind::Sse);
+        let mut collector = UsageCollector::new(UsageResponseKind::Sse, None, None);
 
         collector.observe(&first);
         collector.observe(&second);
-        let usage = collector.finish();
+        let usage = collector.finish(false).usage;
 
         assert_eq!(usage.input_tokens, Some(18));
         assert_eq!(usage.output_tokens, Some(7));
@@ -5691,14 +8274,26 @@ mod tests {
                 start_date: None,
                 end_date: None,
                 month: None,
+                source: UsageSource::All,
             },
         )
         .unwrap();
         assert_eq!(statistics.completed_requests, 2);
-        assert_eq!(statistics.reported_requests, 1);
-        assert_eq!(statistics.coverage_percent, 50.0);
-        assert_eq!(statistics.totals.total_tokens.value, 125);
-        assert_eq!(statistics.providers[0].provider_id, "primary");
+        assert_eq!(statistics.reported_requests, 2);
+        assert_eq!(statistics.coverage_percent, 100.0);
+        assert!(statistics.totals.total_tokens.value > 125);
+        assert_eq!(statistics.data_quality, "mixed");
+        assert_eq!(
+            statistics.providers[0].provider_id,
+            codex_usage::OFFICIAL_PROVIDER_ID
+        );
+        let primary = statistics
+            .providers
+            .iter()
+            .find(|provider| provider.provider_id == "primary")
+            .unwrap();
+        assert_eq!(primary.data_quality, "mixed");
+        assert!(primary.metrics.total_tokens.estimated_value > 0);
     }
 
     #[tokio::test]
@@ -5725,6 +8320,7 @@ mod tests {
                 start_date: None,
                 end_date: None,
                 month: None,
+                source: UsageSource::All,
             },
         )
         .unwrap();
@@ -5739,9 +8335,62 @@ mod tests {
             .iter()
             .find(|provider| provider.provider_id == "backup")
             .unwrap();
-        assert_eq!(primary.completed_requests, 0);
+        assert_eq!(primary.completed_requests, 1);
+        assert_eq!(primary.metrics.total_tokens.value, 0);
+        assert_eq!(primary.data_quality, "unknown");
         assert_eq!(backup.completed_requests, 1);
         assert_eq!(backup.metrics.total_tokens.value, 50);
+    }
+
+    #[tokio::test]
+    async fn retry_records_each_real_upstream_attempt() {
+        let upstream = mock_counted_sequence(vec![
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":{"message":"temporary"}}"#,
+                "application/json",
+            ),
+            (
+                StatusCode::OK,
+                r#"{"usage":{"input_tokens":30,"output_tokens":8,"total_tokens":38}}"#,
+                "application/json",
+            ),
+        ])
+        .await
+        .0;
+        let state = test_state(vec![test_provider("primary", upstream, 1)]);
+        initialize_test_settings(&state);
+        {
+            let mut policy = state.policy.write().unwrap();
+            policy.retry_count = 1;
+            policy.retry_interval_sec = 1;
+        }
+
+        call_test_gateway(state.clone())
+            .await
+            .into_body()
+            .collect()
+            .await
+            .unwrap();
+        let statistics = query_usage_statistics(
+            &state,
+            &UsageQuery {
+                mode: UsageQueryMode::Today,
+                start_date: None,
+                end_date: None,
+                month: None,
+                source: UsageSource::Gateway,
+            },
+        )
+        .unwrap();
+        let primary = statistics
+            .providers
+            .iter()
+            .find(|provider| provider.provider_id == "primary")
+            .unwrap();
+        assert_eq!(primary.completed_requests, 2);
+        assert_eq!(primary.reported_requests, 1);
+        assert_eq!(primary.metrics.total_tokens.value, 38);
     }
 
     #[test]
@@ -5751,18 +8400,21 @@ mod tests {
             start_date: Some("2024-01-01".to_string()),
             end_date: Some("2024-01-30".to_string()),
             month: None,
+            source: UsageSource::All,
         };
         let rejected = UsageQuery {
             mode: UsageQueryMode::Range,
             start_date: Some("2024-01-01".to_string()),
             end_date: Some("2024-01-31".to_string()),
             month: None,
+            source: UsageSource::All,
         };
         let full_month = UsageQuery {
             mode: UsageQueryMode::Month,
             start_date: None,
             end_date: None,
             month: Some("2024-01".to_string()),
+            source: UsageSource::All,
         };
 
         assert!(usage_period_bounds(&accepted).is_ok());
@@ -5790,6 +8442,17 @@ mod tests {
                         total_tokens: Some(2),
                         ..CapturedUsage::default()
                     },
+                    data_source: "gateway_response",
+                    usage_origin: "gateway",
+                    client_origin: "other",
+                    codex_event_key: None,
+                    gateway_request_id: None,
+                    attempt_index: 1,
+                    is_final_attempt: true,
+                    http_status: Some(200),
+                    outcome: "completed",
+                    token_source: "upstream",
+                    estimate_method: None,
                 },
             )
             .unwrap();

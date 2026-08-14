@@ -1,8 +1,8 @@
 use super::{
-    codex_integration, gateway_codex_configuration, persist_codex_management_metadata, push_log,
-    routing_policy_values, sanitize_base_url, save_and_verify_provider_secret,
-    validate_probe_interval, validate_routing_policy, AppState, ProviderConfig,
-    ProviderSecretStore, RoutingPolicy,
+    codex_integration, gateway_codex_configuration, normalized_routing_policy,
+    persist_codex_management_metadata, push_log, routing_policy_values, sanitize_base_url,
+    save_and_verify_provider_secret, validate_probe_interval, validate_routing_policy, AppState,
+    ProviderConfig, ProviderSecretStore, RoutingPolicy,
 };
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -315,6 +315,8 @@ fn validate_payload(mut payload: BackupPayloadData) -> Result<BackupPayloadData,
         ));
     }
     validate_probe_interval(payload.probe_interval_sec)?;
+    // 格式版本 1 的容量字段仅作兼容镜像，导入前统一以全局重试配置为准。
+    payload.routing_policy = normalized_routing_policy(&payload.routing_policy);
     validate_routing_policy(&payload.routing_policy)?;
     if !(16..=256).contains(&payload.local_token.len()) {
         return Err("备份中的本地访问令牌无效".to_string());
@@ -911,7 +913,15 @@ mod tests {
             gateway: Arc::new(crate::GatewayController::default()),
             codex_config_fingerprint: Arc::new(Mutex::new(None)),
             codex_history_preview: Arc::new(Mutex::new(None)),
-            codex_login_status: Arc::new(Mutex::new(codex_integration::CodexLoginStatus::Unknown)),
+            codex_environment_status: Arc::new(Mutex::new(
+                codex_integration::CodexEnvironmentStatus {
+                    desktop_status: codex_integration::CodexApplicationStatus::NotInstalled,
+                    cli_status: codex_integration::CodexApplicationStatus::NotInstalled,
+                    login_status: codex_integration::CodexLoginStatus::Unknown,
+                },
+            )),
+            codex_usage_sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+            codex_usage_status: Arc::new(Mutex::new(Default::default())),
             app_handle: None,
         };
         (state, secrets)

@@ -79,6 +79,7 @@ export interface EventLog {
   model: string | null;
   event_type: string | null;
   routing_event: RoutingEvent | null;
+  diagnostic_detail: DiagnosticDetail | null;
 }
 
 export type PayloadTooLargeAction = "failover" | "return";
@@ -87,6 +88,8 @@ export interface RoutingPolicy {
   retry_count: number;
   retry_interval_sec: number;
   max_retry_wait_sec: number;
+  retry_unknown_transient_errors: boolean;
+  allow_provider_failover: boolean;
   capacity_retry_count: number;
   capacity_retry_interval_sec: number;
   capacity_max_retry_wait_sec: number;
@@ -95,6 +98,34 @@ export interface RoutingPolicy {
   payload_too_large_skip_sec: number;
   payload_too_large_action: PayloadTooLargeAction;
   notify_switches: boolean;
+}
+
+export interface DiagnosticDetail {
+  request_id: string;
+  provider_id: string;
+  model: string | null;
+  request_path: string;
+  error_class: "retryable" | "permanent" | "incomplete_business" | "unknown";
+  http_status: number | null;
+  error_code: string | null;
+  error_type: string | null;
+  error_message: string | null;
+  incomplete_reason: string | null;
+  upstream_request_id: string | null;
+  last_sse_event: string | null;
+  terminal_event: string | null;
+  terminal_received: boolean;
+  business_output_started: boolean;
+  bytes_received: number;
+  elapsed_ms: number;
+  attempt_index: number;
+  max_attempts: number;
+  retry_wait_sec: number | null;
+  fallback_retry_enabled: boolean;
+  failover_enabled: boolean;
+  action: string;
+  parse_error: string | null;
+  attempts: RoutingAttempt[];
 }
 
 export interface ConfigurationSnapshot {
@@ -163,24 +194,26 @@ export interface BackupImportResult {
 }
 
 export type UsageQueryMode = "today" | "range" | "month";
+export type UsageSource = "all" | "official" | "gateway" | "unconfirmed";
 
 export interface UsageQuery {
   mode: UsageQueryMode;
   start_date?: string;
   end_date?: string;
   month?: string;
+  source: UsageSource;
 }
 
 export interface TokenMetric {
   value: number;
+  estimated_value: number;
   reported_count: number;
 }
 
 export interface UsageMetrics {
   input_tokens: TokenMetric;
   output_tokens: TokenMetric;
-  cached_tokens: TokenMetric;
-  reasoning_tokens: TokenMetric;
+  cache_hit_tokens: TokenMetric;
   total_tokens: TokenMetric;
 }
 
@@ -199,6 +232,7 @@ export interface ProviderUsageStatistics {
   completed_requests: number;
   reported_requests: number;
   coverage_percent: number;
+  data_quality: "exact" | "mixed" | "estimated" | "unknown";
   metrics: UsageMetrics;
 }
 
@@ -218,30 +252,38 @@ export interface UsageStatistics {
   completed_requests: number;
   reported_requests: number;
   coverage_percent: number;
+  data_quality: "exact" | "mixed" | "estimated" | "unknown";
+  codex_sync_status: CodexUsageSyncStatus;
+}
+
+export interface CodexUsageSyncStatus {
+  state: "idle" | "success" | "warning" | "error" | "syncing";
+  last_synced_at: string | null;
+  roots_scanned: number;
+  files_scanned: number;
+  token_events_found: number;
+  imported_count: number;
+  matched_count: number;
+  skipped_count: number;
+  deferred_count: number;
+  parser_version: number;
+  rebuild_performed: boolean;
+  warning_messages: string[];
 }
 
 export type CodexConnectionMode = "official" | "gateway" | "external";
-export type CodexLoginStatus =
-  | "logged_in"
-  | "logged_out"
-  | "cli_unavailable"
-  | "unknown";
+export type CodexLoginStatus = "logged_in" | "logged_out" | "unknown";
+export type CodexApplicationStatus =
+  | "not_installed"
+  | "installed_stopped"
+  | "installed_running";
 
 export interface CodexIntegrationState {
-  detected_mode: CodexConnectionMode;
-  config_path: string;
-  config_exists: boolean;
+  desktop_status: CodexApplicationStatus;
+  cli_status: CodexApplicationStatus;
   login_status: CodexLoginStatus;
-  gateway_configuration_current: boolean;
-  shared_provider_current: boolean;
-  official_features_available: boolean;
-  history_unified: boolean;
-  history_provider_counts: HistoryProviderCount[];
-  history_migration_required: boolean;
-  external_provider_id: string | null;
-  config_error: string | null;
-  last_switched_at: string | null;
-  last_history_migration_at: string | null;
+  current_mode: CodexConnectionMode;
+  gateway_configured: boolean;
 }
 
 export interface HistoryProviderCount {
@@ -401,6 +443,14 @@ export async function getRuntimeStats() {
 
 export async function getUsageStatistics(query: UsageQuery) {
   return invoke<UsageStatistics>("get_usage_statistics", { query });
+}
+
+export async function syncCodexUsage() {
+  return invoke<CodexUsageSyncStatus>("sync_codex_usage");
+}
+
+export async function rebuildCodexUsage() {
+  return invoke<CodexUsageSyncStatus>("rebuild_codex_usage");
 }
 
 export async function getRecentLogs() {

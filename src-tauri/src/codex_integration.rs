@@ -3,15 +3,17 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     env, fs,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::Command,
     sync::Mutex,
 };
+use sysinfo::{Pid, System};
 use toml_edit::{value, DocumentMut, InlineTable, Item, Table};
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 const MANAGED_PROVIDER_ID: &str = "custom";
 const CONFIG_BACKUP_LIMIT: usize = 10;
@@ -34,26 +36,31 @@ pub enum CodexConnectionMode {
 pub enum CodexLoginStatus {
     LoggedIn,
     LoggedOut,
-    CliUnavailable,
     Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexApplicationStatus {
+    NotInstalled,
+    InstalledStopped,
+    InstalledRunning,
+}
+
+#[derive(Clone, Debug)]
+pub struct CodexEnvironmentStatus {
+    pub desktop_status: CodexApplicationStatus,
+    pub cli_status: CodexApplicationStatus,
+    pub login_status: CodexLoginStatus,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CodexIntegrationState {
-    pub detected_mode: CodexConnectionMode,
-    pub config_path: String,
-    pub config_exists: bool,
+    pub desktop_status: CodexApplicationStatus,
+    pub cli_status: CodexApplicationStatus,
     pub login_status: CodexLoginStatus,
-    pub gateway_configuration_current: bool,
-    pub shared_provider_current: bool,
-    pub official_features_available: bool,
-    pub history_unified: bool,
-    pub history_provider_counts: Vec<HistoryProviderCount>,
-    pub history_migration_required: bool,
-    pub external_provider_id: Option<String>,
-    pub config_error: Option<String>,
-    pub last_switched_at: Option<String>,
-    pub last_history_migration_at: Option<String>,
+    pub current_mode: CodexConnectionMode,
+    pub gateway_configured: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -110,7 +117,6 @@ pub struct GatewayCodexConfiguration {
 struct ParsedConfig {
     document: DocumentMut,
     hash: String,
-    exists: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -155,7 +161,7 @@ pub fn config_path() -> Result<PathBuf, String> {
     Ok(home.join("config.toml"))
 }
 
-fn codex_home() -> Result<PathBuf, String> {
+pub(crate) fn codex_home() -> Result<PathBuf, String> {
     config_path()?
         .parent()
         .map(Path::to_path_buf)
@@ -183,7 +189,6 @@ fn read_config(path: &Path) -> Result<ParsedConfig, String> {
         return Ok(ParsedConfig {
             document: DocumentMut::new(),
             hash: hash_bytes(&[]),
-            exists: false,
         });
     }
     let bytes = fs::read(path).map_err(|error| format!("无法读取 Codex 配置：{error}"))?;
@@ -195,7 +200,6 @@ fn read_config(path: &Path) -> Result<ParsedConfig, String> {
     Ok(ParsedConfig {
         document,
         hash: hash_bytes(&bytes),
-        exists: true,
     })
 }
 
@@ -253,7 +257,7 @@ fn is_gateway_provider_shape(table: &Table) -> bool {
         && table.get("wire_api").and_then(Item::as_str) == Some("responses")
         && table.get("requires_openai_auth").and_then(Item::as_bool) == Some(true)
         && table.get("request_max_retries").and_then(Item::as_integer) == Some(0)
-        && table.get("stream_max_retries").and_then(Item::as_integer) == Some(0)
+        && table.get("stream_max_retries").and_then(Item::as_integer) == Some(2)
         && header_token(table).is_some_and(|token| !token.is_empty())
 }
 
@@ -277,7 +281,7 @@ fn gateway_configuration_current(
         && table.get("wire_api").and_then(Item::as_str) == Some("responses")
         && table.get("requires_openai_auth").and_then(Item::as_bool) == Some(true)
         && table.get("request_max_retries").and_then(Item::as_integer) == Some(0)
-        && table.get("stream_max_retries").and_then(Item::as_integer) == Some(0)
+        && table.get("stream_max_retries").and_then(Item::as_integer) == Some(2)
         && header_token(table) == Some(configuration.local_token.as_str())
 }
 
@@ -289,7 +293,8 @@ fn build_managed_provider(configuration: &GatewayCodexConfiguration) -> Table {
     // 固定启用 Codex 官方认证识别；本地网关会在转发前剥离所有官方身份头。
     provider["requires_openai_auth"] = value(true);
     provider["request_max_retries"] = value(0);
-    provider["stream_max_retries"] = value(0);
+    // 网关只重试尚未输出的请求；输出后的 SSE 恢复交给了解会话状态的 Codex。
+    provider["stream_max_retries"] = value(2);
     let mut headers = InlineTable::new();
     headers.insert(
         "X-AI-Gateway-Token",
@@ -659,41 +664,6 @@ pub fn scan_history() -> Result<HistoryPreviewSnapshot, String> {
         sessions,
         index_entries,
     })
-}
-
-pub fn history_summary() -> Result<(bool, Vec<HistoryProviderCount>, bool), String> {
-    let home = codex_home()?;
-    let mut counts = BTreeMap::<String, usize>::new();
-    for (root, _) in session_roots(&home) {
-        let mut paths = Vec::new();
-        collect_jsonl_files(&root, &mut paths)?;
-        for path in paths {
-            let mut first_line = String::new();
-            BufReader::new(
-                fs::File::open(&path).map_err(|error| format!("无法读取会话文件：{error}"))?,
-            )
-            .read_line(&mut first_line)
-            .map_err(|error| format!("无法读取会话首行：{error}"))?;
-            let value: serde_json::Value = serde_json::from_str(first_line.trim_end())
-                .map_err(|error| format!("会话首行不是有效 JSON：{}：{error}", path.display()))?;
-            let provider = value
-                .pointer("/payload/model_provider")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("openai");
-            *counts.entry(provider.to_string()).or_default() += 1;
-        }
-    }
-    let migration_required = counts
-        .iter()
-        .any(|(provider, count)| provider != MANAGED_PROVIDER_ID && *count > 0);
-    Ok((
-        !migration_required,
-        counts
-            .into_iter()
-            .map(|(provider, count)| HistoryProviderCount { provider, count })
-            .collect(),
-        migration_required,
-    ))
 }
 
 fn codex_is_running() -> Result<bool, String> {
@@ -1093,117 +1063,207 @@ pub fn restore_latest_history_migration() -> Result<CodexHistoryRestoreResult, S
     })
 }
 
-pub fn login_status() -> CodexLoginStatus {
-    let mut command = Command::new("codex");
-    command.args(["login", "status"]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
-    }
-    match command.output() {
+#[derive(Deserialize)]
+struct LocalAuthDocument {
+    #[serde(rename = "OPENAI_API_KEY")]
+    api_key: Option<String>,
+    tokens: Option<LocalAuthTokens>,
+}
+
+#[derive(Deserialize)]
+struct LocalAuthTokens {
+    access_token: Option<String>,
+    id_token: Option<String>,
+    refresh_token: Option<String>,
+}
+
+fn non_empty_string(value: Option<&String>) -> bool {
+    value.is_some_and(|value| !value.trim().is_empty())
+}
+
+/// 只判断本地是否保存了可识别的认证凭据。这里不解码、复制或输出任何 Token 内容。
+fn login_status_from_auth_path(path: &Path) -> CodexLoginStatus {
+    let contents = match fs::read(path) {
+        Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            CodexLoginStatus::CliUnavailable
+            return CodexLoginStatus::LoggedOut
         }
-        Err(_) => CodexLoginStatus::Unknown,
-        Ok(output) => {
-            let combined = format!(
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            )
-            .to_ascii_lowercase();
-            if output.status.success()
-                && (combined.contains("logged in") || combined.contains("登录"))
-            {
-                CodexLoginStatus::LoggedIn
-            } else if combined.contains("not logged in")
-                || combined.contains("logged out")
-                || combined.contains("未登录")
-            {
-                CodexLoginStatus::LoggedOut
-            } else {
-                CodexLoginStatus::Unknown
-            }
+        Err(_) => return CodexLoginStatus::Unknown,
+    };
+    let mut document: LocalAuthDocument = match serde_json::from_slice(&contents) {
+        Ok(document) => document,
+        Err(_) => return CodexLoginStatus::Unknown,
+    };
+    let api_key_present = non_empty_string(document.api_key.as_ref());
+    let oauth_token_present = document.tokens.as_ref().is_some_and(|tokens| {
+        non_empty_string(tokens.access_token.as_ref())
+            || non_empty_string(tokens.id_token.as_ref())
+            || non_empty_string(tokens.refresh_token.as_ref())
+    });
+    let login_status = if api_key_present || oauth_token_present {
+        CodexLoginStatus::LoggedIn
+    } else {
+        // 文件格式发生变化时不误报为退出登录，交给界面显示“无法判断”。
+        CodexLoginStatus::Unknown
+    };
+    if let Some(api_key) = document.api_key.as_mut() {
+        api_key.zeroize();
+    }
+    if let Some(tokens) = document.tokens.as_mut() {
+        for token in [
+            tokens.access_token.as_mut(),
+            tokens.id_token.as_mut(),
+            tokens.refresh_token.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            token.zeroize();
         }
+    }
+    login_status
+}
+
+fn normalized_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+}
+
+fn is_desktop_package_path(path: &Path) -> bool {
+    let path = normalized_path(path);
+    path.contains("\\windowsapps\\openai.codex_")
+}
+
+fn application_status(installed: bool, running: bool) -> CodexApplicationStatus {
+    match (installed, running) {
+        (_, true) => CodexApplicationStatus::InstalledRunning,
+        (true, false) => CodexApplicationStatus::InstalledStopped,
+        (false, false) => CodexApplicationStatus::NotInstalled,
+    }
+}
+
+fn process_has_ancestor(system: &System, process_id: Pid, ancestor_ids: &HashSet<Pid>) -> bool {
+    let mut current = system
+        .process(process_id)
+        .and_then(|process| process.parent());
+    let mut visited = HashSet::new();
+    while let Some(parent_id) = current {
+        if ancestor_ids.contains(&parent_id) {
+            return true;
+        }
+        if !visited.insert(parent_id) {
+            break;
+        }
+        current = system
+            .process(parent_id)
+            .and_then(|process| process.parent());
+    }
+    false
+}
+
+#[cfg(windows)]
+fn desktop_app_installed() -> bool {
+    use std::os::windows::process::CommandExt;
+
+    // AppX 没有稳定的普通文件别名，通过包注册信息判断关闭状态下是否仍已安装。
+    let mut command = Command::new("powershell.exe");
+    command.args([
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "if (Get-AppxPackage -Name OpenAI.Codex -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }",
+    ]);
+    command.creation_flags(0x0800_0000);
+    command.status().is_ok_and(|status| status.success())
+}
+
+#[cfg(not(windows))]
+fn desktop_app_installed() -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn cli_installed() -> bool {
+    use std::os::windows::process::CommandExt;
+
+    let mut command = Command::new("where.exe");
+    command.arg("codex");
+    command.creation_flags(0x0800_0000);
+    command.output().is_ok_and(|output| {
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(Path::new)
+                .any(|path| !is_desktop_package_path(path))
+    })
+}
+
+#[cfg(not(windows))]
+fn cli_installed() -> bool {
+    false
+}
+
+pub fn environment_status() -> CodexEnvironmentStatus {
+    let mut system = System::new_all();
+    system.refresh_all();
+
+    let desktop_process_ids: HashSet<Pid> = system
+        .processes()
+        .iter()
+        .filter_map(|(id, process)| {
+            let executable = process.exe()?;
+            (process.name().eq_ignore_ascii_case("ChatGPT.exe")
+                && is_desktop_package_path(executable))
+            .then_some(*id)
+        })
+        .collect();
+    let desktop_running = !desktop_process_ids.is_empty();
+
+    // 桌面端会启动自己的 codex.exe。通过安装路径和父进程链排除它，只保留独立 CLI。
+    let cli_running = system.processes().iter().any(|(id, process)| {
+        let process_name = process.name().to_string_lossy();
+        let is_codex_process = process_name.eq_ignore_ascii_case("codex.exe")
+            || process_name.eq_ignore_ascii_case("codex");
+        is_codex_process
+            && !process.exe().is_some_and(is_desktop_package_path)
+            && !process_has_ancestor(&system, *id, &desktop_process_ids)
+    });
+
+    let desktop_installed = desktop_running || desktop_app_installed();
+    let cli_installed = cli_running || cli_installed();
+    let login_status = codex_home()
+        .map(|home| login_status_from_auth_path(&home.join("auth.json")))
+        .unwrap_or(CodexLoginStatus::Unknown);
+
+    CodexEnvironmentStatus {
+        desktop_status: application_status(desktop_installed, desktop_running),
+        cli_status: application_status(cli_installed, cli_running),
+        login_status,
     }
 }
 
 pub fn integration_state(
     configuration: &GatewayCodexConfiguration,
-    last_switched_at: Option<String>,
-    last_history_migration_at: Option<String>,
-    login: CodexLoginStatus,
+    environment: CodexEnvironmentStatus,
 ) -> CodexIntegrationState {
-    let (history_unified, history_provider_counts, history_migration_required) =
-        history_summary().unwrap_or((false, Vec::new(), false));
-    let path = match config_path() {
-        Ok(path) => path,
-        Err(error) => {
-            return CodexIntegrationState {
-                detected_mode: CodexConnectionMode::External,
-                config_path: String::new(),
-                config_exists: false,
-                login_status: login.clone(),
-                gateway_configuration_current: false,
-                shared_provider_current: false,
-                official_features_available: false,
-                history_unified,
-                history_provider_counts,
-                history_migration_required,
-                external_provider_id: None,
-                config_error: Some(error),
-                last_switched_at,
-                last_history_migration_at,
-            }
-        }
-    };
-    match read_config(&path) {
-        Ok(parsed) => {
-            let (mode, external_provider_id) = detected_mode(&parsed.document);
-            CodexIntegrationState {
-                detected_mode: mode.clone(),
-                config_path: path.display().to_string(),
-                config_exists: parsed.exists,
-                login_status: login.clone(),
-                gateway_configuration_current: gateway_configuration_current(
-                    &parsed.document,
-                    configuration,
-                ),
-                shared_provider_current: matches!(
-                    mode,
-                    CodexConnectionMode::Official | CodexConnectionMode::Gateway
-                ),
-                official_features_available: login == CodexLoginStatus::LoggedIn
-                    && matches!(
-                        mode,
-                        CodexConnectionMode::Official | CodexConnectionMode::Gateway
-                    ),
-                history_unified,
-                history_provider_counts,
-                history_migration_required,
-                external_provider_id,
-                config_error: None,
-                last_switched_at,
-                last_history_migration_at,
-            }
-        }
-        Err(error) => CodexIntegrationState {
-            detected_mode: CodexConnectionMode::External,
-            config_path: path.display().to_string(),
-            config_exists: path.exists(),
-            login_status: login,
-            gateway_configuration_current: false,
-            shared_provider_current: false,
-            official_features_available: false,
-            history_unified,
-            history_provider_counts,
-            history_migration_required,
-            external_provider_id: None,
-            config_error: Some(error),
-            last_switched_at,
-            last_history_migration_at,
-        },
+    let (current_mode, gateway_configured) = config_path()
+        .and_then(|path| read_config(&path))
+        .map(|parsed| {
+            let (mode, _) = detected_mode(&parsed.document);
+            let gateway_current = mode == CodexConnectionMode::Gateway
+                && gateway_configuration_current(&parsed.document, configuration);
+            (mode, gateway_current)
+        })
+        .unwrap_or((CodexConnectionMode::External, false));
+
+    CodexIntegrationState {
+        desktop_status: environment.desktop_status,
+        cli_status: environment.cli_status,
+        login_status: environment.login_status,
+        current_mode,
+        gateway_configured,
     }
 }
 
@@ -1332,12 +1392,13 @@ mod tests {
             fs::write(home.join("config.toml"), "model_provider = \"custom\"\n[model_providers.custom]\nname = \"CC-Switch\"\nbase_url = \"http://127.0.0.1:15721/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\n").unwrap();
             let state = integration_state(
                 &gateway(8765, "token"),
-                None,
-                None,
-                CodexLoginStatus::Unknown,
+                CodexEnvironmentStatus {
+                    desktop_status: CodexApplicationStatus::NotInstalled,
+                    cli_status: CodexApplicationStatus::NotInstalled,
+                    login_status: CodexLoginStatus::Unknown,
+                },
             );
-            assert_eq!(state.detected_mode, CodexConnectionMode::External);
-            assert_eq!(state.external_provider_id.as_deref(), Some("custom"));
+            assert_eq!(state.current_mode, CodexConnectionMode::External);
 
             // 用户点击模式按钮即构成明确接管，之后配置固定为共享 custom Provider。
             switch_mode(CodexConnectionMode::Gateway, &gateway(8765, "token")).unwrap();
@@ -1367,13 +1428,14 @@ mod tests {
 
             let state = integration_state(
                 &gateway(8765, "token"),
-                None,
-                None,
-                CodexLoginStatus::Unknown,
+                CodexEnvironmentStatus {
+                    desktop_status: CodexApplicationStatus::NotInstalled,
+                    cli_status: CodexApplicationStatus::NotInstalled,
+                    login_status: CodexLoginStatus::Unknown,
+                },
             );
 
-            assert_eq!(state.detected_mode, CodexConnectionMode::External);
-            assert_eq!(state.external_provider_id.as_deref(), Some("cc_switch"));
+            assert_eq!(state.current_mode, CodexConnectionMode::External);
             assert_eq!(
                 fs::read_to_string(home.join("config.toml")).unwrap(),
                 original
@@ -1396,6 +1458,70 @@ mod tests {
             assert!(updated.contains("new-token"));
             assert!(!updated.contains("old-token"));
         });
+    }
+
+    #[test]
+    fn auth_status_is_read_only_and_recognizes_saved_oauth_tokens() {
+        with_temp_codex_home(|home| {
+            let auth_path = home.join("auth.json");
+            let contents = br#"{"auth_mode":"chatgpt","tokens":{"access_token":"secret"}}"#;
+            fs::write(&auth_path, contents).unwrap();
+            let modified_before = fs::metadata(&auth_path).unwrap().modified().unwrap();
+
+            assert_eq!(
+                login_status_from_auth_path(&auth_path),
+                CodexLoginStatus::LoggedIn
+            );
+            assert_eq!(fs::read(&auth_path).unwrap(), contents);
+            assert_eq!(
+                fs::metadata(&auth_path).unwrap().modified().unwrap(),
+                modified_before
+            );
+        });
+    }
+
+    #[test]
+    fn auth_status_distinguishes_missing_and_unrecognized_files() {
+        with_temp_codex_home(|home| {
+            let auth_path = home.join("auth.json");
+            assert_eq!(
+                login_status_from_auth_path(&auth_path),
+                CodexLoginStatus::LoggedOut
+            );
+
+            fs::write(&auth_path, br#"{"auth_mode":"chatgpt"}"#).unwrap();
+            assert_eq!(
+                login_status_from_auth_path(&auth_path),
+                CodexLoginStatus::Unknown
+            );
+            fs::write(&auth_path, b"not-json").unwrap();
+            assert_eq!(
+                login_status_from_auth_path(&auth_path),
+                CodexLoginStatus::Unknown
+            );
+        });
+    }
+
+    #[test]
+    fn application_status_and_desktop_paths_are_classified_without_cli_confusion() {
+        assert_eq!(
+            application_status(false, false),
+            CodexApplicationStatus::NotInstalled
+        );
+        assert_eq!(
+            application_status(true, false),
+            CodexApplicationStatus::InstalledStopped
+        );
+        assert_eq!(
+            application_status(true, true),
+            CodexApplicationStatus::InstalledRunning
+        );
+        assert!(is_desktop_package_path(Path::new(
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_1.0_x64\app\resources\codex.exe"
+        )));
+        assert!(!is_desktop_package_path(Path::new(
+            r"C:\Users\test\AppData\Roaming\npm\codex.exe"
+        )));
     }
 
     #[test]

@@ -151,6 +151,7 @@ export function buildDemoData(): DemoData {
       model: isProbe ? null : demoModels[index % demoModels.length],
       event_type: null,
       routing_event: null,
+      diagnostic_detail: null,
     };
   });
   logs.unshift({
@@ -161,6 +162,7 @@ export function buildDemoData(): DemoData {
     model: switchEvent.model,
     event_type: "auto_switch",
     routing_event: switchEvent,
+    diagnostic_detail: null,
   });
   return {
     providers,
@@ -190,11 +192,13 @@ export function buildDemoData(): DemoData {
     },
     logs,
     routingPolicy: {
-    retry_count: 1,
+    retry_count: 5,
     retry_interval_sec: 1,
-    max_retry_wait_sec: 10,
-    capacity_retry_count: 3,
-    capacity_retry_interval_sec: 5,
+    max_retry_wait_sec: 30,
+    retry_unknown_transient_errors: true,
+    allow_provider_failover: false,
+    capacity_retry_count: 5,
+    capacity_retry_interval_sec: 1,
     capacity_max_retry_wait_sec: 30,
       circuit_failure_threshold: 3,
       circuit_cooldown_sec: 60,
@@ -212,19 +216,48 @@ function localDateString(date: Date) {
   return `${year}-${month}-${day}`;
 }
 
-function demoMetrics(input: number, output: number, records: number): UsageMetrics {
+function demoMetrics(
+  input: number,
+  output: number,
+  records: number,
+  estimatedRatio = 0.12,
+): UsageMetrics {
+  const estimatedInput = Math.round(input * estimatedRatio);
+  const estimatedOutput = Math.round(output * estimatedRatio);
   return {
-    input_tokens: { value: input, reported_count: records },
-    output_tokens: { value: output, reported_count: records },
-    cached_tokens: {
+    input_tokens: { value: input, estimated_value: estimatedInput, reported_count: records },
+    output_tokens: { value: output, estimated_value: estimatedOutput, reported_count: records },
+    cache_hit_tokens: {
       value: Math.round(input * 0.42),
+      estimated_value: 0,
       reported_count: Math.max(0, records - 2),
     },
-    reasoning_tokens: {
-      value: Math.round(output * 0.31),
-      reported_count: Math.max(0, records - 4),
+    total_tokens: {
+      value: input + output,
+      estimated_value: estimatedInput + estimatedOutput,
+      reported_count: records,
     },
-    total_tokens: { value: input + output, reported_count: records },
+  };
+}
+
+function sumDemoMetrics(items: UsageMetrics[]): UsageMetrics {
+  const sumMetric = (select: (metrics: UsageMetrics) => UsageMetrics["total_tokens"]) =>
+    items.reduce(
+      (sum, metrics) => {
+        const metric = select(metrics);
+        return {
+          value: sum.value + metric.value,
+          estimated_value: sum.estimated_value + metric.estimated_value,
+          reported_count: sum.reported_count + metric.reported_count,
+        };
+      },
+      { value: 0, estimated_value: 0, reported_count: 0 },
+    );
+  return {
+    total_tokens: sumMetric((metrics) => metrics.total_tokens),
+    input_tokens: sumMetric((metrics) => metrics.input_tokens),
+    output_tokens: sumMetric((metrics) => metrics.output_tokens),
+    cache_hit_tokens: sumMetric((metrics) => metrics.cache_hit_tokens),
   };
 }
 
@@ -275,14 +308,13 @@ export function buildDemoUsageStatistics(query: UsageQuery): UsageStatistics {
     }),
     { input: 0, output: 0, completed: 0, reported: 0 },
   );
-  const providerShares = [0.62, 0.27, 0.11];
-  const providers = ["主力中转", "备用中转", "经济线路"].map((name, index) => {
-    const input = index === 2
-      ? totals.input - Math.round(totals.input * providerShares[0]) - Math.round(totals.input * providerShares[1])
-      : Math.round(totals.input * providerShares[index]);
-    const output = index === 2
-      ? totals.output - Math.round(totals.output * providerShares[0]) - Math.round(totals.output * providerShares[1])
-      : Math.round(totals.output * providerShares[index]);
+  // 演示数据按官方 18%、第三方 77%、未确认 5% 分配，保证线路合计与总览一致。
+  const officialInput = Math.round(totals.input * 0.18);
+  const officialOutput = Math.round(totals.output * 0.18);
+  const providerShares = [0.47, 0.20, 0.10];
+  const gatewayProviders = ["主力中转", "备用中转", "经济线路"].map((name, index) => {
+    const input = Math.round(totals.input * providerShares[index]);
+    const output = Math.round(totals.output * providerShares[index]);
     const completed = Math.round(totals.completed * providerShares[index]);
     const reported = Math.min(completed, Math.round(totals.reported * providerShares[index]));
     return {
@@ -292,9 +324,75 @@ export function buildDemoUsageStatistics(query: UsageQuery): UsageStatistics {
       completed_requests: completed,
       reported_requests: reported,
       coverage_percent: completed ? Math.round((reported / completed) * 1000) / 10 : 0,
-      metrics: demoMetrics(input, output, reported),
+      data_quality: index === 0 ? "mixed" as const : "exact" as const,
+      metrics: demoMetrics(input, output, reported, index === 0 ? 0.12 : 0),
     };
   });
+  const allocatedInput = officialInput + gatewayProviders.reduce(
+    (sum, provider) => sum + provider.metrics.input_tokens.value,
+    0,
+  );
+  const allocatedOutput = officialOutput + gatewayProviders.reduce(
+    (sum, provider) => sum + provider.metrics.output_tokens.value,
+    0,
+  );
+  const allProviders = [
+    {
+      provider_id: "_openai_official",
+      provider_name: "OpenAI 官方",
+      deleted: false,
+      completed_requests: Math.round(totals.completed * 0.18),
+      reported_requests: Math.round(totals.reported * 0.18),
+      coverage_percent: 100,
+      data_quality: "exact" as const,
+      metrics: demoMetrics(officialInput, officialOutput, Math.round(totals.reported * 0.18), 0),
+    },
+    ...gatewayProviders,
+    {
+      provider_id: "_codex_unconfirmed",
+      provider_name: "Codex 历史（来源未确认）",
+      deleted: false,
+      completed_requests: Math.max(1, totals.completed - Math.round(totals.completed * 0.95)),
+      reported_requests: Math.max(1, totals.reported - Math.round(totals.reported * 0.95)),
+      coverage_percent: 100,
+      data_quality: "exact" as const,
+      metrics: demoMetrics(
+        totals.input - allocatedInput,
+        totals.output - allocatedOutput,
+        Math.max(1, totals.reported - Math.round(totals.reported * 0.95)),
+        0,
+      ),
+    },
+  ];
+  const providers = allProviders.filter((provider) => {
+    if (query.source === "all") return true;
+    if (query.source === "official") return provider.provider_id === "_openai_official";
+    if (query.source === "unconfirmed") return provider.provider_id === "_codex_unconfirmed";
+    return !provider.provider_id.startsWith("_");
+  });
+  const selectedMetrics = sumDemoMetrics(providers.map((provider) => provider.metrics));
+  const selectedCompleted = providers.reduce((sum, provider) => sum + provider.completed_requests, 0);
+  const selectedReported = providers.reduce((sum, provider) => sum + provider.reported_requests, 0);
+  const sourceRatio = query.source === "official"
+    ? 0.18
+    : query.source === "gateway"
+      ? 0.77
+      : query.source === "unconfirmed"
+        ? 0.05
+        : 1;
+  const selectedSeries = sourceRatio === 1
+    ? series
+    : series.map((point) => ({
+        ...point,
+        completed_requests: Math.round(point.completed_requests * sourceRatio),
+        reported_requests: Math.round(point.reported_requests * sourceRatio),
+        metrics: demoMetrics(
+          Math.round(point.metrics.input_tokens.value * sourceRatio),
+          Math.round(point.metrics.output_tokens.value * sourceRatio),
+          Math.round(point.reported_requests * sourceRatio),
+          query.source === "gateway" ? 0.12 : 0,
+        ),
+      }));
   return {
     period: {
       mode: query.mode,
@@ -303,13 +401,28 @@ export function buildDemoUsageStatistics(query: UsageQuery): UsageStatistics {
       label,
       resolution,
     },
-    totals: demoMetrics(totals.input, totals.output, totals.reported),
+    totals: selectedMetrics,
     providers,
-    series,
-    completed_requests: totals.completed,
-    reported_requests: totals.reported,
-    coverage_percent: totals.completed
-      ? Math.round((totals.reported / totals.completed) * 1000) / 10
+    series: selectedSeries,
+    completed_requests: selectedCompleted,
+    reported_requests: selectedReported,
+    coverage_percent: selectedCompleted
+      ? Math.round((selectedReported / selectedCompleted) * 1000) / 10
       : 0,
+    data_quality: providers.some((provider) => provider.data_quality === "mixed") ? "mixed" : "exact",
+    codex_sync_status: {
+      state: "success",
+      last_synced_at: new Date().toISOString(),
+      roots_scanned: 1,
+      files_scanned: 48,
+      token_events_found: 144,
+      imported_count: 0,
+      matched_count: 0,
+      skipped_count: 0,
+      deferred_count: 0,
+      parser_version: 2,
+      rebuild_performed: false,
+      warning_messages: [],
+    },
   };
 }

@@ -55,6 +55,7 @@ import {
   RouterSettings,
   GatewayTestResult,
   RoutingEvent,
+  DiagnosticDetail,
   RoutingPolicy,
   ConfigurationInput,
   ConfigurationSnapshot,
@@ -78,10 +79,8 @@ import {
   switchCodexConnectionMode,
   refreshCodexLoginStatus,
   repairCodexGatewayConfiguration,
-  CodexHistoryMigrationPreview,
-  previewCodexHistoryMigration,
-  applyCodexHistoryMigration,
-  restoreCodexHistoryMigration,
+  syncCodexUsage,
+  rebuildCodexUsage,
 } from "./api";
 import { buildDemoData, buildDemoUsageStatistics } from "./demo";
 
@@ -115,11 +114,13 @@ type AppView = "monitor" | "usage" | "providers" | "codex" | "logs" | "settings"
 type ConfigurationSaveStatus = "idle" | "saving" | "saved" | "error";
 
 const DEFAULT_ROUTING_POLICY: RoutingPolicy = {
-  retry_count: 1,
+  retry_count: 5,
   retry_interval_sec: 1,
-  max_retry_wait_sec: 10,
-  capacity_retry_count: 3,
-  capacity_retry_interval_sec: 5,
+  max_retry_wait_sec: 30,
+  retry_unknown_transient_errors: true,
+  allow_provider_failover: false,
+  capacity_retry_count: 5,
+  capacity_retry_interval_sec: 1,
   capacity_max_retry_wait_sec: 30,
   circuit_failure_threshold: 3,
   circuit_cooldown_sec: 60,
@@ -162,12 +163,9 @@ function validateConfigurationDraft(draft: ConfigurationInput) {
     [draft.probe_interval_sec, 5, 3600, "健康探测间隔"],
     [draft.log_retention_days, 1, 365, "日志保留天数"],
     [draft.usage_retention_days, 30, 3650, "用量数据保留天数"],
-    [draft.routing_policy.retry_count, 0, 3, "瞬时错误重试次数"],
-    [draft.routing_policy.retry_interval_sec, 0, 60, "重试间隔"],
-    [draft.routing_policy.max_retry_wait_sec, 1, 300, "单次请求最大等待"],
-    [draft.routing_policy.capacity_retry_count, 0, 5, "模型容量重试次数"],
-    [draft.routing_policy.capacity_retry_interval_sec, 1, 60, "模型容量重试间隔"],
-    [draft.routing_policy.capacity_max_retry_wait_sec, 1, 600, "模型容量最大等待"],
+    [draft.routing_policy.retry_count, 0, 5, "重试次数"],
+    [draft.routing_policy.retry_interval_sec, 1, 60, "重试间隔"],
+    [draft.routing_policy.max_retry_wait_sec, 1, 600, "最大累计等待"],
     [draft.routing_policy.circuit_failure_threshold, 1, 10, "连续失败阈值"],
     [draft.routing_policy.circuit_cooldown_sec, 10, 3600, "熔断冷却时间"],
     [draft.routing_policy.payload_too_large_skip_sec, 0, 86400, "413 跳过时间"],
@@ -195,11 +193,16 @@ function shiftLocalDate(value: string, days: number) {
 
 const TODAY_VALUE = localDateValue(new Date());
 const CURRENT_MONTH_VALUE = TODAY_VALUE.slice(0, 7);
-const DEFAULT_USAGE_QUERY: UsageQuery = { mode: "today" };
+
+function formatTime(value: string) {
+  return new Date(value).toLocaleString("zh-CN", { hour12: false });
+}
+const DEFAULT_USAGE_QUERY: UsageQuery = { mode: "today", source: "all" };
 
 function defaultUsageDraft(): UsageQuery {
   return {
     mode: "today",
+    source: "all",
     start_date: shiftLocalDate(TODAY_VALUE, -6),
     end_date: TODAY_VALUE,
     month: CURRENT_MONTH_VALUE,
@@ -250,9 +253,6 @@ function App() {
   const [codexState, setCodexState] = useState<CodexIntegrationState | null>(null);
   const [codexBusy, setCodexBusy] = useState(false);
   const [codexError, setCodexError] = useState<string | null>(null);
-  const [codexHistoryPreview, setCodexHistoryPreview] =
-    useState<CodexHistoryMigrationPreview | null>(null);
-  const [codexHistoryConfirming, setCodexHistoryConfirming] = useState(false);
   const [configurationSnapshot, setConfigurationSnapshot] =
     useState<ConfigurationSnapshot | null>(null);
   const [configurationDraft, setConfigurationDraft] =
@@ -280,6 +280,7 @@ function App() {
   });
   const [notice, setNotice] = useState<AppNotice | string | null>(null);
   const [routingDetail, setRoutingDetail] = useState<RoutingEvent | null>(null);
+  const [diagnosticDetail, setDiagnosticDetail] = useState<DiagnosticDetail | null>(null);
   const [lastUpdatedAt, setLastUpdatedAt] = useState<Date | null>(null);
   const configurationDirty = !configurationInputsEqual(
     configurationDraft,
@@ -327,23 +328,11 @@ function App() {
         setRuntime(demo.runtime);
         setLogs(demo.logs);
         setCodexState((current) => current ?? {
-          detected_mode: "gateway",
-          config_path: "C:\\Users\\demo\\.codex\\config.toml",
-          config_exists: true,
+          desktop_status: "installed_running",
+          cli_status: "installed_stopped",
           login_status: "logged_in",
-          gateway_configuration_current: true,
-          shared_provider_current: true,
-          official_features_available: true,
-          history_unified: false,
-          history_provider_counts: [
-            { provider: "custom", count: 41 },
-            { provider: "openai", count: 7 },
-          ],
-          history_migration_required: true,
-          external_provider_id: null,
-          config_error: null,
-          last_switched_at: new Date().toISOString(),
-          last_history_migration_at: null,
+          current_mode: "gateway",
+          gateway_configured: true,
         });
         setLastUpdatedAt(new Date());
       }
@@ -433,6 +422,7 @@ function App() {
             model: routingEvent.model,
             event_type: routingEvent.event_type,
             routing_event: routingEvent,
+            diagnostic_detail: null,
           }, ...current].slice(0, 2000));
       if (isAutoSwitch && routingPolicy?.notify_switches !== false) {
         const source = routingEvent.attempts.find(
@@ -678,14 +668,15 @@ function App() {
       return;
     }
     const next: UsageQuery = usageDraft.mode === "today"
-      ? { mode: "today" }
+      ? { mode: "today", source: usageDraft.source }
       : usageDraft.mode === "range"
         ? {
             mode: "range",
             start_date: usageDraft.start_date,
             end_date: usageDraft.end_date,
+            source: usageDraft.source,
           }
-        : { mode: "month", month: usageDraft.month };
+        : { mode: "month", month: usageDraft.month, source: usageDraft.source };
     setUsageError(null);
     setUsageQuery(next);
   }
@@ -752,11 +743,11 @@ function App() {
       const result = await switchCodexConnectionMode(mode);
       await refresh();
       setNotice({
-        level: result.warning_messages.length ? "warning" : "info",
+        level: "info",
         title: result.changed ? "Codex 接入模式已修改" : "Codex 接入配置无需修改",
-        message: `${result.restart_required
-          ? "请完全退出并重新启动 Codex，新的接入模式才会生效。"
-          : "当前配置已经是目标模式。"}${result.warning_messages.length ? ` ${result.warning_messages.join("；")}` : ""}`,
+        message: result.restart_required
+          ? "配置已修改，请完全退出并重新启动 Codex"
+          : "当前配置已经是目标模式。",
       });
     } catch (error) {
       setCodexError(String(error));
@@ -789,58 +780,6 @@ function App() {
         message: `${result.restart_required
           ? "请完全退出并重新启动 Codex。"
           : "AI Gateway Provider 配置已经是最新状态。"}${result.warning_messages.length ? ` ${result.warning_messages.join("；")}` : ""}`,
-      });
-    } catch (error) {
-      setCodexError(String(error));
-    } finally {
-      setCodexBusy(false);
-    }
-  }
-
-  async function handlePreviewCodexHistory() {
-    setCodexBusy(true);
-    setCodexError(null);
-    try {
-      setCodexHistoryPreview(await previewCodexHistoryMigration());
-    } catch (error) {
-      setCodexError(String(error));
-    } finally {
-      setCodexBusy(false);
-    }
-  }
-
-  async function handleApplyCodexHistory() {
-    if (!codexHistoryPreview) return;
-    setCodexBusy(true);
-    setCodexError(null);
-    try {
-      const result = await applyCodexHistoryMigration(codexHistoryPreview.preview_id);
-      setCodexHistoryPreview(null);
-      setCodexHistoryConfirming(false);
-      await refresh();
-      setNotice({
-        level: result.warning_messages.length ? "warning" : "info",
-        title: "Codex 会话历史已统一",
-        message: `已迁移 ${result.migrated_session_count} 个会话并更新 ${result.updated_index_count} 条索引。备份：${result.backup_name}${result.warning_messages.length ? `；${result.warning_messages.join("；")}` : ""}`,
-      });
-    } catch (error) {
-      setCodexError(String(error));
-    } finally {
-      setCodexBusy(false);
-    }
-  }
-
-  async function handleRestoreCodexHistory() {
-    setCodexBusy(true);
-    setCodexError(null);
-    try {
-      const result = await restoreCodexHistoryMigration();
-      setCodexHistoryPreview(null);
-      await refresh();
-      setNotice({
-        level: result.warning_messages.length ? "warning" : "info",
-        title: "最近一次会话迁移已恢复",
-        message: `已恢复 ${result.restored_session_count} 个会话和 ${result.restored_index_count} 条索引${result.warning_messages.length ? `；${result.warning_messages.join("；")}` : ""}`,
       });
     } catch (error) {
       setCodexError(String(error));
@@ -935,7 +874,7 @@ function App() {
             <ShieldCheck size={16} />
             <span>仅本机访问</span>
           </div>
-          <span className="version">v0.3.0</span>
+          <span className="version">v0.3.4</span>
         </div>
       </aside>
       <main className="main-content">
@@ -999,6 +938,7 @@ function App() {
             error={usageError}
             onDraftChange={setUsageDraft}
             onSubmit={submitUsageQuery}
+            onRefresh={() => void refreshUsage(usageQuery)}
           />
         ) : view === "providers" ? (
           <>
@@ -1108,25 +1048,14 @@ function App() {
         ) : view === "codex" ? (
           <CodexIntegrationPanel
             state={codexState}
-            settings={settings}
-            providers={providers}
-            health={health}
-            routeGroup={routeGroup}
             busy={codexBusy}
             error={codexError}
             onSwitch={handleSwitchCodexMode}
             onRefreshLogin={() => void handleRefreshCodexLogin()}
             onRepair={() => void handleRepairCodexGateway()}
-            historyPreview={codexHistoryPreview}
-            historyConfirming={codexHistoryConfirming}
-            onScanHistory={() => void handlePreviewCodexHistory()}
-            onConfirmHistory={() => setCodexHistoryConfirming(true)}
-            onCancelHistory={() => setCodexHistoryConfirming(false)}
-            onApplyHistory={() => void handleApplyCodexHistory()}
-            onRestoreHistory={() => void handleRestoreCodexHistory()}
           />
         ) : view === "logs" ? (
-          <LogsPanel logs={logs} providers={providers} runtime={runtime} onOpenRoutingEvent={setRoutingDetail} />
+          <LogsPanel logs={logs} providers={providers} runtime={runtime} onOpenRoutingEvent={setRoutingDetail} onOpenDiagnostic={setDiagnosticDetail} />
         ) : (
           <ConfigurationCenter
             settings={settings}
@@ -1194,6 +1123,9 @@ function App() {
       )}
       {routingDetail && (
         <RoutingDetailModal event={routingDetail} onClose={() => setRoutingDetail(null)} />
+      )}
+      {diagnosticDetail && (
+        <DiagnosticDetailModal detail={diagnosticDetail} onClose={() => setDiagnosticDetail(null)} />
       )}
       {pendingView && (
         <UnsavedChangesModal
@@ -1277,92 +1209,60 @@ function tokenMetricText(metric: TokenMetric, completedRequests: number) {
   return formatTokenCount(metric.value);
 }
 
+function usageQualityLabel(quality: "exact" | "mixed" | "estimated" | "unknown") {
+  return {
+    exact: "精确",
+    mixed: "含估算",
+    estimated: "估算",
+    unknown: "未统计",
+  }[quality];
+}
+
 function CodexIntegrationPanel({
   state,
-  settings,
-  providers,
-  health,
-  routeGroup,
   busy,
   error,
   onSwitch,
   onRefreshLogin,
   onRepair,
-  historyPreview,
-  historyConfirming,
-  onScanHistory,
-  onConfirmHistory,
-  onCancelHistory,
-  onApplyHistory,
-  onRestoreHistory,
 }: {
   state: CodexIntegrationState | null;
-  settings: RouterSettings | null;
-  providers: Provider[];
-  health: HealthSnapshot[];
-  routeGroup: RouteGroup | null;
   busy: boolean;
   error: string | null;
   onSwitch: (mode: "official" | "gateway") => Promise<void>;
   onRefreshLogin: () => void;
   onRepair: () => void;
-  historyPreview: CodexHistoryMigrationPreview | null;
-  historyConfirming: boolean;
-  onScanHistory: () => void;
-  onConfirmHistory: () => void;
-  onCancelHistory: () => void;
-  onApplyHistory: () => void;
-  onRestoreHistory: () => void;
 }) {
-  const activeProvider = providers.find(
-    (provider) => provider.id === routeGroup?.locked_provider_id,
-  ) ?? providers.find((provider) =>
-    provider.enabled && health.find((item) => item.provider_id === provider.id)?.state !== "open"
-  );
-  const availableProviders = providers.filter((provider) => provider.enabled).length;
   const loginLabel = state?.login_status === "logged_in"
     ? "已登录"
     : state?.login_status === "logged_out"
       ? "未登录"
-      : state?.login_status === "cli_unavailable"
-        ? "无法检测（未找到 Codex CLI）"
-        : "尚未检测";
-  const external = state?.detected_mode === "external";
-  const officialFeaturesLabel = state?.official_features_available
-    ? "当前可用"
-    : state?.login_status === "logged_out"
-      ? "需要重新登录"
-      : "等待登录状态检测";
+      : "无法判断";
+  const applicationLabel = (status: CodexIntegrationState["desktop_status"] | undefined) => {
+    if (status === "installed_running") return "已安装，运行中";
+    if (status === "installed_stopped") return "已安装，未运行";
+    if (status === "not_installed") return "未安装";
+    return "检测中";
+  };
+  const currentMode = state?.current_mode;
 
   return (
     <div className="codex-page">
-      {external && (
-        <div className="codex-external-banner">
-          <div>
-            <strong>检测到外部配置</strong>
-            <span>
-              当前 model_provider 为 {state.external_provider_id ?? "未知 Provider"}。AI Gateway 不会静默覆盖它，请明确选择下面的模式。
-              使用 CC-Switch 时请先关闭其路由接管，避免两个工具重复改写 custom Provider。
-            </span>
-          </div>
-        </div>
-      )}
-      {state?.config_error && (
-        <div className="codex-error-banner">
-          <strong>无法读取 Codex 配置</strong>
-          <span>{state.config_error}</span>
-        </div>
-      )}
       {error && <div className="codex-error-banner"><strong>操作失败</strong><span>{error}</span></div>}
 
-      <section className="panel codex-account-strip">
-        <div><span>ChatGPT 登录</span><strong>{loginLabel}</strong></div>
-        <div><span>官方账号能力</span><strong>{officialFeaturesLabel}</strong></div>
-        <div><span>连接模式</span><strong>{state?.detected_mode === "official" ? "官方直连" : state?.detected_mode === "gateway" ? "AI Gateway 第三方" : "外部配置"}</strong></div>
+      <section className="panel codex-status-panel">
+        <div className="codex-status-list">
+          <div><span>Codex 桌面端</span><strong>{applicationLabel(state?.desktop_status)}</strong></div>
+          <div><span>Codex CLI</span><strong>{applicationLabel(state?.cli_status)}</strong></div>
+          <div><span>ChatGPT 登录</span><strong>{loginLabel}</strong></div>
+        </div>
+        <button className="secondary-button" disabled={busy} onClick={onRefreshLogin}>
+          <RefreshCw size={15} />重新检测
+        </button>
       </section>
 
       <section className="codex-mode-grid">
-        <article className={`codex-mode-card ${state?.detected_mode === "official" ? "active" : ""}`}>
+        <article className={`codex-mode-card ${currentMode === "official" ? "active" : ""}`}>
           <div className="codex-mode-heading">
             <span className="codex-mode-icon official"><ShieldCheck size={19} /></span>
             <div>
@@ -1370,23 +1270,13 @@ function CodexIntegrationPanel({
               <p>使用 Codex 原生 ChatGPT 登录，完全绕过 AI Gateway</p>
             </div>
             <span className="codex-mode-status">
-              {state?.detected_mode === "official" ? "当前模式" : "未启用"}
+              {currentMode === "official" ? "当前模式" : "未启用"}
             </span>
           </div>
-          <dl className="codex-facts">
-            <div><dt>连接方式</dt><dd>OpenAI 官方直连</dd></div>
-            <div><dt>ChatGPT 登录</dt><dd>{loginLabel}</dd></div>
-            <div><dt>共享 Provider</dt><dd>custom · 保留官方认证</dd></div>
-            <div><dt>自动切换</dt><dd>不会进入第三方路由池</dd></div>
-            <div><dt>用量统计</dt><dd>官方直连期间不采集</dd></div>
-          </dl>
           <div className="codex-mode-actions">
-            <button className="secondary-button" disabled={busy} onClick={onRefreshLogin}>
-              <RefreshCw size={15} />重新检测登录状态
-            </button>
             <button
               className="primary-button"
-              disabled={busy || state?.detected_mode === "official"}
+              disabled={busy || currentMode === "official"}
               onClick={() => void onSwitch("official")}
             >
               切换到官方
@@ -1394,7 +1284,7 @@ function CodexIntegrationPanel({
           </div>
         </article>
 
-        <article className={`codex-mode-card ${state?.detected_mode === "gateway" ? "active" : ""}`}>
+        <article className={`codex-mode-card ${currentMode === "gateway" ? "active" : ""}`}>
           <div className="codex-mode-heading">
             <span className="codex-mode-icon gateway"><Router size={19} /></span>
             <div>
@@ -1402,30 +1292,23 @@ function CodexIntegrationPanel({
               <p>Codex 固定连接本地网关，中转选择由 AI Gateway 统一管理</p>
             </div>
             <span className="codex-mode-status">
-              {state?.detected_mode === "gateway" ? "当前模式" : "未启用"}
+              {currentMode === "gateway" ? "当前模式" : "未启用"}
             </span>
           </div>
-          <dl className="codex-facts">
-            <div><dt>本地 Base URL</dt><dd>http://127.0.0.1:{settings?.port ?? 8765}/v1</dd></div>
-            <div><dt>网关状态</dt><dd>{settings?.gateway_listening ? "正在监听" : "未监听"}</dd></div>
-            <div><dt>当前中转</dt><dd>{activeProvider?.name ?? "等待可用中转"}</dd></div>
-            <div><dt>可用配置</dt><dd>{availableProviders} 个已启用中转</dd></div>
-            <div><dt>官方登录</dt><dd>保留，身份头不转发</dd></div>
-          </dl>
-          {!state?.gateway_configuration_current && state?.detected_mode === "gateway" && (
-            <p className="codex-repair-hint">当前 Codex Provider 与本地端口或令牌不一致，需要修复后重启 Codex。</p>
+          {!state?.gateway_configured && currentMode === "gateway" && (
+            <p className="codex-repair-hint">当前接入配置需要修复，修复后请重新启动 Codex。</p>
           )}
           <div className="codex-mode-actions">
             <button
               className="secondary-button"
-              disabled={busy || state?.detected_mode !== "gateway"}
+              disabled={busy || currentMode !== "gateway"}
               onClick={onRepair}
             >
               <RefreshCw size={15} />修复接入配置
             </button>
             <button
               className="primary-button"
-              disabled={busy || (state?.detected_mode === "gateway" && state.gateway_configuration_current)}
+              disabled={busy || (currentMode === "gateway" && state?.gateway_configured)}
               onClick={() => void onSwitch("gateway")}
             >
               切换到第三方
@@ -1434,65 +1317,6 @@ function CodexIntegrationPanel({
         </article>
       </section>
 
-      <section className="panel codex-history-panel">
-        <div className="codex-history-heading">
-          <div>
-            <h2>统一会话历史</h2>
-            <p>将普通和归档会话的 Provider 元数据统一为 custom，让本地历史不再因接入模式隐藏。</p>
-          </div>
-          <span className={`codex-history-status ${state?.history_unified ? "complete" : "pending"}`}>
-            {state?.history_unified ? "已统一" : "待扫描"}
-          </span>
-        </div>
-        <div className="codex-history-summary">
-          <div><span>Provider 分布</span><strong>{(historyPreview?.provider_counts ?? state?.history_provider_counts ?? []).map((item) => `${item.provider} ${item.count}`).join(" · ") || "暂无会话"}</strong></div>
-          <div><span>普通会话</span><strong>{historyPreview?.normal_session_count ?? "扫描后显示"}</strong></div>
-          <div><span>归档会话</span><strong>{historyPreview?.archived_session_count ?? "保持归档"}</strong></div>
-          <div><span>需要迁移</span><strong>{historyPreview?.migration_required_count ?? (state?.history_migration_required ? "待扫描" : "0")}</strong></div>
-        </div>
-        {historyPreview && (
-          <div className="codex-history-preview">
-            <p>本地索引 {historyPreview.indexed_record_count} 条；包含 encrypted_content 的会话 {historyPreview.encrypted_content_session_count} 个。</p>
-            {historyPreview.warning_messages.map((warning) => <p key={warning} className="warning">{warning}</p>)}
-          </div>
-        )}
-        <div className="codex-history-actions">
-          <button className="secondary-button" disabled={busy || !(historyPreview?.can_restore_latest || state?.last_history_migration_at)} onClick={onRestoreHistory}>
-            <RefreshCw size={15} />恢复最近备份
-          </button>
-          <button className="secondary-button" disabled={busy} onClick={onScanHistory}>
-            <ScrollText size={15} />扫描会话
-          </button>
-          <button className="primary-button" disabled={busy || !historyPreview || historyPreview.migration_required_count === 0} onClick={onConfirmHistory}>
-            确认迁移
-          </button>
-        </div>
-      </section>
-
-      <section className="panel codex-config-panel">
-        <div>
-          <h2>配置来源</h2>
-          <p>{state?.config_path || "正在检测 Codex config.toml"}</p>
-        </div>
-        <div className="codex-config-note">
-          <ShieldCheck size={17} />
-          <span>AI Gateway 只修改 config.toml 中自己拥有的 Provider 配置，永远不读取或修改 auth.json。</span>
-        </div>
-      </section>
-
-      {historyConfirming && historyPreview && (
-        <div className="modal-backdrop" role="presentation">
-          <section className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="history-migration-title">
-            <h2 id="history-migration-title">确认统一 Codex 会话历史</h2>
-            <p>请先完全退出 Codex。即将修改 {historyPreview.migration_required_count} 个会话的首条 Provider 元数据并同步本地索引，归档会话不会恢复到普通列表。</p>
-            <p className="confirm-warning">旧会话可能包含第三方无法继续处理的 encrypted_content；迁移只保证历史可见。</p>
-            <div className="confirm-actions">
-              <button className="secondary-button" disabled={busy} onClick={onCancelHistory}>取消</button>
-              <button className="primary-button" disabled={busy} onClick={onApplyHistory}>{busy ? "迁移中" : "开始迁移"}</button>
-            </div>
-          </section>
-        </div>
-      )}
     </div>
   );
 }
@@ -1504,6 +1328,7 @@ function UsagePanel({
   error,
   onDraftChange,
   onSubmit,
+  onRefresh,
 }: {
   draft: UsageQuery;
   statistics: UsageStatistics | null;
@@ -1511,7 +1336,11 @@ function UsagePanel({
   error: string | null;
   onDraftChange: (query: UsageQuery) => void;
   onSubmit: () => void;
+  onRefresh: () => void;
 }) {
+  const [syncBusy, setSyncBusy] = useState(false);
+  const [rebuildConfirming, setRebuildConfirming] = useState(false);
+  const [syncError, setSyncError] = useState<string | null>(null);
   const rangeEndMax = draft.start_date
     ? [TODAY_VALUE, shiftLocalDate(draft.start_date, 29)].sort()[0]
     : TODAY_VALUE;
@@ -1522,13 +1351,17 @@ function UsagePanel({
   const labelStep = Math.max(1, Math.ceil((statistics?.series.length ?? 1) / 8));
   const summaryItems = statistics
     ? [
-        ["总 Token", statistics.totals.total_tokens, "全部已上报用量"],
+        ["总 Token", statistics.totals.total_tokens, "精确值与本地估算合计"],
         ["输入 Token", statistics.totals.input_tokens, "Prompt 与输入上下文"],
         ["输出 Token", statistics.totals.output_tokens, "文本、工具与推理输出"],
-        ["缓存 Token", statistics.totals.cached_tokens, "上游明确返回的缓存命中"],
-        ["推理 Token", statistics.totals.reasoning_tokens, "上游明确返回的推理细项"],
+        ["缓存命中 Token", statistics.totals.cache_hit_tokens, "仅统计明确上报的缓存命中"],
       ] as const
     : [];
+  const syncStatus = statistics?.codex_sync_status;
+  const syncNeedsAttention = Boolean(
+    syncError
+    || syncStatus?.warning_messages.length,
+  );
 
   return (
     <div className="usage-page">
@@ -1537,7 +1370,7 @@ function UsagePanel({
           <div>
             <p className="section-kicker">TOKEN USAGE</p>
             <h2>用量查询</h2>
-            <span>仅汇总中转明确返回的 usage，不修改请求，也不本地估算。</span>
+            <span>官方使用 Codex 本地记录；第三方优先使用 usage，缺失时进行本地估算。</span>
           </div>
           {statistics && (
             <div className="usage-period-label">
@@ -1634,6 +1467,45 @@ function UsagePanel({
             <BarChart3 size={16} />
             {loading ? "查询中…" : "查询"}
           </button>
+          <button
+            type="button"
+            className="icon-button usage-refresh-button"
+            title="同步 Codex 用量并刷新"
+            aria-label="同步 Codex 用量并刷新"
+            disabled={loading || syncBusy}
+            onClick={async () => {
+              setSyncBusy(true);
+              setSyncError(null);
+              try {
+                await syncCodexUsage();
+                onRefresh();
+              } catch (syncFailure) {
+                setSyncError(String(syncFailure));
+              } finally {
+                setSyncBusy(false);
+              }
+            }}
+          >
+            <RefreshCw size={16} className={syncBusy ? "spin" : ""} />
+          </button>
+        </div>
+        <div className="usage-source-row">
+          <span>数据来源</span>
+          <div className="usage-source-switch" role="group" aria-label="用量数据来源">
+            {([[
+              "all", "全部"], ["official", "OpenAI 官方"], ["gateway", "第三方中转"], ["unconfirmed", "来源未确认"],
+            ] as const).map(([source, label]) => (
+              <button
+                type="button"
+                key={source}
+                aria-pressed={draft.source === source}
+                className={draft.source === source ? "active" : ""}
+                onClick={() => onDraftChange({ ...draft, source })}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
         </div>
         {draft.mode === "range" && (
           <div className="usage-range-hint">自定义日期范围最多 30 个自然日；月份查询可覆盖完整 31 天月份。</div>
@@ -1643,6 +1515,25 @@ function UsagePanel({
 
       {statistics ? (
         <>
+          {syncNeedsAttention && (
+            <section className="usage-sync-warning">
+              <span>{syncError ?? statistics.codex_sync_status.warning_messages[0] ?? "Codex 本地用量没有成功导入"}</span>
+              <button type="button" onClick={() => setRebuildConfirming(true)}>重建 Codex 用量</button>
+            </section>
+          )}
+
+          <div className="usage-sync-summary">
+            <span>
+              Codex 本地同步：扫描 {statistics.codex_sync_status.files_scanned} 个文件，
+              本轮发现 {statistics.codex_sync_status.token_events_found} 条用量，
+              新增 {statistics.codex_sync_status.imported_count} 条
+              {statistics.codex_sync_status.matched_count > 0
+                ? `，关联 ${statistics.codex_sync_status.matched_count} 条`
+                : ""}
+            </span>
+            {statistics.codex_sync_status.rebuild_performed && <strong>已完成自动重建</strong>}
+          </div>
+
           <section className="usage-summary-grid">
             {summaryItems.map(([label, metric, detail]) => (
               <div className="usage-summary-card" key={label}>
@@ -1651,12 +1542,40 @@ function UsagePanel({
                   {tokenMetricText(metric, statistics.completed_requests)}
                 </strong>
                 <small>
-                  {metric.reported_count
-                    ? `${metric.reported_count}/${statistics.completed_requests} 次请求上报`
+                  {metric.estimated_value > 0
+                    ? `其中估算 ${fullTokenFormatter.format(metric.estimated_value)}`
                     : detail}
                 </small>
               </div>
             ))}
+          </section>
+
+          <section className="panel usage-provider-panel">
+            <div className="usage-section-heading compact">
+              <div>
+                <p className="section-kicker">PROVIDERS</p>
+                <h2>线路用量明细</h2>
+              </div>
+              <span className="privacy-note">官方数据来自 Codex 本地 token_count，不等同于 OpenAI 账单</span>
+            </div>
+            <div className="usage-provider-table">
+              <div className="usage-provider-header">
+                <span>线路 / 来源</span><span>总 Token</span><span>输入 Token</span><span>输出 Token</span><span>缓存命中 Token</span>
+              </div>
+              {statistics.providers.map((provider) => (
+                <div className="usage-provider-row" key={provider.provider_id}>
+                  <div>
+                    <strong>{provider.provider_name}</strong>
+                    <span className={`usage-quality ${provider.data_quality}`}>{usageQualityLabel(provider.data_quality)}</span>
+                    {provider.deleted && <small>已删除中转</small>}
+                  </div>
+                  <strong>{tokenMetricText(provider.metrics.total_tokens, provider.completed_requests)}</strong>
+                  <span>{tokenMetricText(provider.metrics.input_tokens, provider.completed_requests)}</span>
+                  <span>{tokenMetricText(provider.metrics.output_tokens, provider.completed_requests)}</span>
+                  <span>{tokenMetricText(provider.metrics.cache_hit_tokens, provider.completed_requests)}</span>
+                </div>
+              ))}
+            </div>
           </section>
 
           <section className="panel usage-chart-panel">
@@ -1666,18 +1585,14 @@ function UsagePanel({
                 <h2>用量趋势</h2>
                 <span>{statistics.period.resolution === "hour" ? "按小时" : "按天"}汇总输入与输出 Token</span>
               </div>
-              <div className="usage-coverage">
-                <span>上报覆盖率</span>
-                <strong>{statistics.coverage_percent}%</strong>
-                <small>{statistics.reported_requests}/{statistics.completed_requests} 次完成请求</small>
-              </div>
+              <span className={`usage-quality ${statistics.data_quality}`}>{usageQualityLabel(statistics.data_quality)}</span>
             </div>
             {statistics.series.some((point) => point.metrics.total_tokens.value > 0) ? (
               <div className="usage-chart" style={{ gridTemplateColumns: `repeat(${statistics.series.length}, minmax(8px, 1fr))` }}>
                 {statistics.series.map((point, index) => {
                   const inputHeight = (point.metrics.input_tokens.value / peakTokens) * 100;
                   const outputHeight = (point.metrics.output_tokens.value / peakTokens) * 100;
-                  const tooltip = `${point.label}\n输入 ${fullTokenFormatter.format(point.metrics.input_tokens.value)}\n输出 ${fullTokenFormatter.format(point.metrics.output_tokens.value)}\n缓存 ${fullTokenFormatter.format(point.metrics.cached_tokens.value)}\n推理 ${fullTokenFormatter.format(point.metrics.reasoning_tokens.value)}\n总计 ${fullTokenFormatter.format(point.metrics.total_tokens.value)}`;
+                  const tooltip = `${point.label}\n总计 ${fullTokenFormatter.format(point.metrics.total_tokens.value)}\n输入 ${fullTokenFormatter.format(point.metrics.input_tokens.value)}\n输出 ${fullTokenFormatter.format(point.metrics.output_tokens.value)}\n缓存命中 ${fullTokenFormatter.format(point.metrics.cache_hit_tokens.value)}`;
                   return (
                     <div className="usage-chart-column" key={point.key} title={tooltip}>
                       <div className="usage-bar-track">
@@ -1690,7 +1605,7 @@ function UsagePanel({
                 })}
               </div>
             ) : (
-              <div className="usage-empty-chart">当前周期没有中转上报 Token 用量</div>
+              <div className="usage-empty-chart">当前周期没有 Token 用量</div>
             )}
             <div className="usage-chart-legend">
               <span><i className="input" />输入 Token</span>
@@ -1698,32 +1613,36 @@ function UsagePanel({
             </div>
           </section>
 
-          <section className="panel usage-provider-panel">
-            <div className="usage-section-heading compact">
-              <div>
-                <p className="section-kicker">PROVIDERS</p>
-                <h2>中转用量明细</h2>
-              </div>
-              <span className="privacy-note">统计来自中转返回的 usage，不等同于中转账单</span>
-            </div>
-            <div className="usage-provider-table">
-              <div className="usage-provider-header">
-                <span>中转</span><span>完成请求</span><span>覆盖率</span><span>输入</span><span>输出</span><span>缓存</span><span>推理</span><span>总 Token</span>
-              </div>
-              {statistics.providers.map((provider) => (
-                <div className="usage-provider-row" key={provider.provider_id}>
-                  <div><strong>{provider.provider_name}</strong>{provider.deleted && <small>已删除中转</small>}</div>
-                  <span>{provider.completed_requests}</span>
-                  <span className={provider.coverage_percent < 100 && provider.completed_requests ? "partial" : ""}>{provider.completed_requests ? `${provider.coverage_percent}%` : "—"}</span>
-                  <span>{tokenMetricText(provider.metrics.input_tokens, provider.completed_requests)}</span>
-                  <span>{tokenMetricText(provider.metrics.output_tokens, provider.completed_requests)}</span>
-                  <span>{tokenMetricText(provider.metrics.cached_tokens, provider.completed_requests)}</span>
-                  <span>{tokenMetricText(provider.metrics.reasoning_tokens, provider.completed_requests)}</span>
-                  <strong>{tokenMetricText(provider.metrics.total_tokens, provider.completed_requests)}</strong>
+          {rebuildConfirming && (
+            <div className="modal-backdrop" role="presentation">
+              <section className="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="rebuild-usage-title">
+                <h3 id="rebuild-usage-title">重建 Codex 用量？</h3>
+                <p>将删除已导入的 Codex 会话记录并重新扫描本地 JSONL，不会删除网关响应记录或原始会话。</p>
+                <div className="confirm-actions">
+                  <button type="button" className="secondary-button" onClick={() => setRebuildConfirming(false)}>取消</button>
+                  <button
+                    type="button"
+                    className="danger-button"
+                    disabled={syncBusy}
+                    onClick={async () => {
+                      setSyncBusy(true);
+                      setSyncError(null);
+                      try {
+                        await rebuildCodexUsage();
+                        setRebuildConfirming(false);
+                        onRefresh();
+                      } catch (error) {
+                        setSyncError(String(error));
+                        setRebuildConfirming(false);
+                      } finally {
+                        setSyncBusy(false);
+                      }
+                    }}
+                  >确认重建</button>
                 </div>
-              ))}
+              </section>
             </div>
-          </section>
+          )}
         </>
       ) : (
         <section className="panel usage-loading-state">
@@ -2466,11 +2385,13 @@ function LogsPanel({
   providers,
   runtime,
   onOpenRoutingEvent,
+  onOpenDiagnostic,
 }: {
   logs: EventLog[];
   providers: Provider[];
   runtime: RuntimeStats | null;
   onOpenRoutingEvent: (event: RoutingEvent) => void;
+  onOpenDiagnostic: (detail: DiagnosticDetail) => void;
 }) {
   const providerNames = new Map(
     providers.map((provider) => [provider.id, provider.name]),
@@ -2522,9 +2443,12 @@ function LogsPanel({
             <div className="log-list">
               {pageLogs.map((entry, index) => (
                 <div
-                  className={`log-row ${entry.routing_event ? "clickable" : ""}`}
+                  className={`log-row ${entry.routing_event || entry.diagnostic_detail ? "clickable" : ""}`}
                   key={`${entry.timestamp}-${index}`}
-                  onClick={() => entry.routing_event && onOpenRoutingEvent(entry.routing_event)}
+                  onClick={() => {
+                    if (entry.routing_event) onOpenRoutingEvent(entry.routing_event);
+                    else if (entry.diagnostic_detail) onOpenDiagnostic(entry.diagnostic_detail);
+                  }}
                 >
                   <span className={`log-level ${entry.level}`} />
                   <time>
@@ -2618,13 +2542,15 @@ function ErrorHandlingMatrix() {
           <span>错误类型</span><span>当前处理</span><span>重试</span><span>切换</span>
         </div>
         {[
-          ["模型容量不足", "仅在当前中转按独立策略重试", "是", "否"],
-          ["连接失败 / 超时", "按策略等待后重试", "是", "重试失败后"],
-          ["408", "按策略等待后重试", "是", "重试失败后"],
-          ["429", "遵循 Retry-After，过长则切换", "是", "等待过长后"],
-          ["413", "记录请求体阈值并立即切换", "否", "是"],
-          ["5xx", "按策略等待后重试", "是", "重试失败后"],
-          ["400 / 401 / 403 / 404", "原样返回请求错误", "否", "否"],
+          ["模型容量 / 账号并发", "只在当前中转按统一策略重试", "是", "否"],
+          ["连接失败 / 超时", "按统一策略等待后重试", "是", "开关开启后"],
+          ["408 / 429", "按 Retry-After 和统一策略重试", "是", "开关开启后"],
+          ["SSE failed / 临时 incomplete", "仅在业务输出前按分类重试", "是", "开关开启后"],
+          ["未知 SSE / 协议错误", "受兜底开关控制；输出后委托 Codex", "输出前", "开关开启后"],
+          ["max_output_tokens / 内容过滤", "按业务终态原样透传", "否", "否"],
+          ["413", "开关关闭时原样返回", "否", "开关开启且策略允许"],
+          ["5xx", "按统一策略等待后重试", "是", "开关开启后"],
+          ["400 / 401 / 403 / 404 / 422", "原样返回请求错误", "否", "否"],
         ].map(([kind, handling, retry, switchTo]) => (
           <div className="matrix-row" key={kind}>
             <strong>{kind}</strong><span>{handling}</span><span>{retry}</span><span>{switchTo}</span>
@@ -2634,8 +2560,8 @@ function ErrorHandlingMatrix() {
       <div className="matrix-explanation">
         <CircleHelp size={17} />
         <div>
-          <strong>为什么 413 不重复等待？</strong>
-          <p>413 是请求体超过上游限制。相同请求在一分钟后仍然一样大，重复发送只会延迟 Codex；网关会记录被拒绝的大小，后续相同或更大的请求在跳过期内直接尝试下一条线路。</p>
+          <strong>为什么默认不自动切换？</strong>
+          <p>关闭开关可以保证请求始终落在你选择的中转，避免普通 503、并发限制或熔断状态造成意外换线。打开后才会按优先级尝试备用线路。</p>
         </div>
       </div>
       <div className="matrix-explanation">
@@ -2751,6 +2677,42 @@ function RoutingDetailModal({ event, onClose }: { event: RoutingEvent; onClose: 
       <div className="routing-reason"><strong>处理原因</strong><span>{event.reason}</span></div>
       <h3>{isCapacityEvent ? "同一中转重试过程" : "中转尝试过程"}</h3>
       <div className="attempt-list">{event.attempts.map((attempt, index) => <div className="attempt-row" key={`${attempt.provider_id}-${index}`}><span className="attempt-index">{index + 1}</span><div><strong>{attempt.provider_name}</strong><span>{attempt.error ?? `响应 ${attempt.status_code ?? "成功"}`} · {attempt.latency_ms ?? "--"} ms</span></div><b>{attempt.switched ? "已切换" : attempt.retry_count ? `重试 ${attempt.retry_count}` : "已尝试"}</b></div>)}</div>
+    </div>
+  </div></div>;
+}
+
+function DiagnosticDetailModal({ detail, onClose }: { detail: DiagnosticDetail; onClose: () => void }) {
+  const classLabels: Record<DiagnosticDetail["error_class"], string> = {
+    retryable: "明确临时错误",
+    permanent: "明确永久错误",
+    incomplete_business: "业务性不完整结束",
+    unknown: "未识别错误",
+  };
+  return <div className="modal-backdrop" role="presentation" onClick={onClose}><div className="routing-modal panel" role="dialog" aria-modal="true" onClick={(click) => click.stopPropagation()}>
+    <div className="panel-heading"><div><p className="section-kicker">DIAGNOSTIC DETAIL</p><h2>流式错误诊断详情</h2><p>请求标识 {detail.request_id}</p></div><button className="icon-button" title="关闭详情" onClick={onClose}><X size={17} /></button></div>
+    <div className="routing-detail-body">
+      <div className="routing-detail-grid">
+        <DetailLine label="错误分类" value={classLabels[detail.error_class]} />
+        <DetailLine label="最终处理" value={detail.action} />
+        <DetailLine label="模型" value={detail.model ?? "未提供"} />
+        <DetailLine label="接口路径" value={detail.request_path} />
+        <DetailLine label="HTTP 状态" value={detail.http_status ? String(detail.http_status) : "未收到"} />
+        <DetailLine label="上游请求标识" value={detail.upstream_request_id ?? "未提供"} />
+        <DetailLine label="错误代码" value={detail.error_code ?? "未提供"} />
+        <DetailLine label="错误类型" value={detail.error_type ?? "未提供"} />
+        <DetailLine label="Incomplete 原因" value={detail.incomplete_reason ?? "不适用"} />
+        <DetailLine label="最后 SSE 事件" value={detail.last_sse_event ?? "无"} />
+        <DetailLine label="合法终态" value={detail.terminal_received ? (detail.terminal_event ?? "已收到") : "未收到"} />
+        <DetailLine label="业务输出已开始" value={detail.business_output_started ? "是，不由网关重放" : "否"} />
+        <DetailLine label="接收字节" value={detail.bytes_received.toLocaleString()} />
+        <DetailLine label="耗时" value={`${detail.elapsed_ms} ms`} />
+        <DetailLine label="当前尝试" value={`${detail.attempt_index} / ${detail.max_attempts}`} />
+        <DetailLine label="自动切换" value={detail.failover_enabled ? "已开启" : "已关闭"} />
+      </div>
+      <div className="routing-reason"><strong>标准错误消息</strong><span>{detail.error_message ?? "上游未提供标准错误消息"}</span></div>
+      {detail.parse_error && <div className="routing-reason"><strong>解析错误</strong><span>{detail.parse_error}</span></div>}
+      <h3>已记录的尝试</h3>
+      <div className="attempt-list">{detail.attempts.length ? detail.attempts.map((attempt, index) => <div className="attempt-row" key={`${attempt.provider_id}-${index}`}><span className="attempt-index">{index + 1}</span><div><strong>{attempt.provider_name}</strong><span>{attempt.error ?? `响应 ${attempt.status_code ?? "成功"}`} · {attempt.latency_ms ?? "--"} ms</span></div><b>{attempt.switched ? "准备切换" : attempt.retry_count ? `重试 ${attempt.retry_count}` : "已尝试"}</b></div>) : <p className="empty-state">本次诊断发生在尝试记录写入前。</p>}</div>
     </div>
   </div></div>;
 }
@@ -3107,16 +3069,22 @@ function ConfigurationCenter({
             <div>
               <p className="section-kicker">RETRY</p>
               <h2>请求重试</h2>
-              <p>仅对连接失败、408、429 和 5xx 等瞬时错误生效。</p>
+            <p>默认只在当前中转重试；只有开启自动切换后才会尝试备用中转。</p>
             </div>
           </div>
           <div className="configuration-body rules-fields">
-            <NumberStepper label="瞬时错误重试次数" hint="每个中转最多一次初始请求加 0–3 次重试。" value={policy.retry_count} min={0} max={3} onChange={(value) => setPolicyNumber("retry_count", value)} />
-            <NumberStepper label="重试间隔（秒）" hint="429 优先遵循 Retry-After。" value={policy.retry_interval_sec} min={0} max={60} onChange={(value) => setPolicyNumber("retry_interval_sec", value)} />
-            <NumberStepper label="单次请求最大重试等待（秒）" hint="超过该值直接尝试备用中转。" value={policy.max_retry_wait_sec} min={1} max={300} onChange={(value) => setPolicyNumber("max_retry_wait_sec", value)} />
-            <NumberStepper label="模型容量重试次数" hint="只重试原中转，初始请求外最多再试 0–5 次。" value={policy.capacity_retry_count} min={0} max={5} onChange={(value) => setPolicyNumber("capacity_retry_count", value)} />
-            <NumberStepper label="模型容量重试间隔（秒）" hint="存在 Retry-After 时优先遵循上游要求。" value={policy.capacity_retry_interval_sec} min={1} max={60} onChange={(value) => setPolicyNumber("capacity_retry_interval_sec", value)} />
-            <NumberStepper label="模型容量最大等待（秒）" hint="耗尽后保留上游最后一次容量错误，不切换中转。" value={policy.capacity_max_retry_wait_sec} min={1} max={600} onChange={(value) => setPolicyNumber("capacity_max_retry_wait_sec", value)} />
+            <NumberStepper label="统一重试次数" hint="初始请求外最多再试 0–5 次；普通错误、容量和账号并发错误共用。" value={policy.retry_count} min={0} max={5} onChange={(value) => setPolicyNumber("retry_count", value)} />
+            <NumberStepper label="重试间隔（秒）" hint="429 和容量错误优先遵循 Retry-After。" value={policy.retry_interval_sec} min={1} max={60} onChange={(value) => setPolicyNumber("retry_interval_sec", value)} />
+            <NumberStepper label="最大累计等待（秒）" hint="超过该值停止重试；关闭自动切换时直接返回当前中转错误。" value={policy.max_retry_wait_sec} min={1} max={600} onChange={(value) => setPolicyNumber("max_retry_wait_sec", value)} />
+          </div>
+          <div className="option-row">
+            <div>
+              <strong>未识别临时错误兜底重试</strong>
+              <span>仅在尚未输出文本、推理或工具调用时生效。重试耗尽后是否尝试备用中转，服从“允许自动切换中转”总开关。</span>
+            </div>
+            <button type="button" className={`toggle ${policy.retry_unknown_transient_errors ? "checked" : ""}`} role="switch" aria-checked={policy.retry_unknown_transient_errors} title={policy.retry_unknown_transient_errors ? "关闭未知错误兜底重试" : "开启未知错误兜底重试"} onClick={() => onChange({ ...draft, routing_policy: { ...policy, retry_unknown_transient_errors: !policy.retry_unknown_transient_errors } })}>
+              <span />
+            </button>
           </div>
         </div>
       </div>
@@ -3141,14 +3109,14 @@ function ConfigurationCenter({
               <button type="button" aria-pressed={policy.payload_too_large_action === "failover"} className={policy.payload_too_large_action === "failover" ? "selected" : ""} onClick={() => onChange({ ...draft, routing_policy: { ...policy, payload_too_large_action: "failover" } })}>立即切换备用中转</button>
               <button type="button" aria-pressed={policy.payload_too_large_action === "return"} className={policy.payload_too_large_action === "return" ? "selected" : ""} onClick={() => onChange({ ...draft, routing_policy: { ...policy, payload_too_large_action: "return" } })}>直接返回 413</button>
             </div>
-            <small>请求体大小不会随等待改变，因此默认立即尝试备用中转。</small>
+            <small>只有打开“允许自动切换中转”且选择此项时，413 才会尝试备用中转。</small>
           </div>
           <div className="option-row">
             <div>
-              <strong>自动切换提示</strong>
-              <span>应用内 Toast 和托盘 tooltip 会显示切换结果，运行日志始终保留。</span>
+              <strong>允许自动切换中转</strong>
+              <span>默认关闭。关闭后始终坚持当前中转，熔断或重试耗尽也不会改走备用线路。</span>
             </div>
-            <button type="button" className={`toggle ${policy.notify_switches ? "checked" : ""}`} role="switch" aria-checked={policy.notify_switches} title={policy.notify_switches ? "关闭自动切换提示" : "开启自动切换提示"} onClick={() => onChange({ ...draft, routing_policy: { ...policy, notify_switches: !policy.notify_switches } })}>
+            <button type="button" className={`toggle ${policy.allow_provider_failover ? "checked" : ""}`} role="switch" aria-checked={policy.allow_provider_failover} title={policy.allow_provider_failover ? "关闭自动切换中转" : "开启自动切换中转"} onClick={() => onChange({ ...draft, routing_policy: { ...policy, allow_provider_failover: !policy.allow_provider_failover } })}>
               <span />
             </button>
           </div>

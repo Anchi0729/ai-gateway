@@ -1,101 +1,108 @@
 # AI Gateway
 
-AI Gateway 是一个 Windows 优先的本地桌面路由器。它可以直接管理 Codex 的官方直连与第三方接入模式；第三方模式下 Codex 只连接固定的本地 OpenAI 兼容地址，应用负责真实中转、健康探测、熔断和优先级故障转移。
+AI Gateway 是一个 Windows 优先的本地桌面网关，用于管理 Codex 的 OpenAI 官方直连与第三方中转接入。Codex 在第三方模式下只连接固定的本地 OpenAI 兼容地址，中转选择、请求重试、健康探测、熔断和用量统计由 AI Gateway 统一处理。
 
-## Codex 接入
+当前版本：`0.3.5`
 
-- OpenAI 官方：固定使用共享 `model_providers.custom`，不设置 `base_url`，Codex 使用原生 ChatGPT 登录并完全绕过本地网关。
-- 第三方中转：仍使用同一个 `custom` Provider，只把 `base_url` 指向本地网关。第三方中转之间的切换由网关内部完成，不需要重启 Codex。
-- 两种模式都设置 `requires_openai_auth = true`，因此切换第三方后仍保留 ChatGPT 账号、额度和依赖官方登录的能力。
-- 官方和第三方模式互相切换后，需要完全退出并重新启动 Codex。
-- AI Gateway 永远不读取、修改或备份 `auth.json`，官方登录态由 Codex 自己维护。
-- 配置路径优先使用 `CODEX_HOME`，否则使用 `%USERPROFILE%\.codex\config.toml`。写入前会在同目录创建备份并保留最近 10 份。
+## 工作方式
 
-第三方模式支持 `X-AI-Gateway-Token` 本地鉴权头，同时继续兼容 cc-switch 使用的 `Authorization: Bearer <本地令牌>`。网关转发前会删除官方 Authorization、Cookie、账号、组织、项目及 `X-OpenAI-*` 身份头，再写入中转自己的 API Key。
+```text
+OpenAI 官方模式
+Codex -> OpenAI 官方
+         完全绕过 AI Gateway
 
-“统一会话历史”会在用户预览并确认后，将普通和归档 JSONL 首条 `session_meta.payload.model_provider` 及 Codex 本地索引统一为 `custom`。归档会话仍保持归档，聊天正文不修改，备份最多保留 3 份。该操作只保证历史可见；包含 `encrypted_content` 的旧会话不保证能由任意第三方继续推理。使用 CC-Switch 时请先关闭其路由接管，避免两个工具同时改写 `custom` Provider。
+第三方模式
+Codex -> AI Gateway -> 第三方中转
+```
 
-## 技术栈
+官方和第三方模式使用同一个 Codex `custom` Provider，并保持 `requires_openai_auth = true`。AI Gateway 只读检查 `auth.json` 中是否存在可识别的本地登录凭据，不会修改、备份或展示其中内容；官方登录仍由 Codex 自己管理。
 
-- Tauri 2
-- Rust、Tokio、Axum、Reqwest
-- React、TypeScript、Vite
-- SQLite
-- Windows Credential Manager
+## 核心功能
 
-## 本地开发
+- 在 Codex 官方直连和第三方中转模式之间切换。
+- 管理多个 OpenAI 兼容中转及其模型路由、优先级和健康状态。
+- 默认在当前中转额外重试 5 次，自动切换中转默认关闭。
+- 识别 HTTP、Responses SSE、模型容量和账号并发错误。
+- 响应头超时不会截断已经建立的长时间 SSE 流。
+- 统计第三方返回的 `usage`，并同步 Codex 本地记录的官方 Token 用量。
+- 使用 Windows Credential Manager 保存第三方 API Key。
+- 使用密码加密的 `.aigateway` 文件备份中转、密钥和路由配置。
+- 同时提供 Windows NSIS 安装版和免安装便携版。
 
-前置依赖：
+## 快速开始
 
-- Node.js 20+
-- Rust stable MSVC toolchain
-- Visual Studio Build Tools，包含 Desktop development with C++
-- WebView2 Runtime
+1. 下载并启动 NSIS 安装版或便携版，二者不要同时运行。
+2. 在“中转管理”中添加第三方中转，填写 Base URL 和真实 API Key。
+3. 在“Codex 接入”中选择“第三方中转”，然后完全退出并重新启动 Codex。
+4. 第三方中转之间的切换由网关内部完成，不需要重启 Codex。
 
-安装依赖并启动：
+默认本地地址：
+
+```text
+http://127.0.0.1:8765/v1
+```
+
+端口可以在配置中心修改为 `1024-65535`。保存新端口前会先检查能否绑定；失败时旧端口继续提供服务。
+
+### cc-switch 接入
+
+在 cc-switch 中添加 OpenAI 兼容 Provider：
+
+```text
+Base URL: http://127.0.0.1:8765/v1
+API Key: 配置中心显示的本地访问令牌
+```
+
+这里填写的是 AI Gateway 的本地访问令牌，不是第三方中转的 API Key。真实中转密钥只在 AI Gateway 中配置。
+
+## 重要默认值
+
+| 项目         | 默认值      |
+| ------------ | ----------- |
+| 监听地址     | `127.0.0.1` |
+| 监听端口     | `8765`      |
+| 请求体上限   | `200 MiB`   |
+| 额外重试次数 | `5`         |
+| 重试间隔     | `1` 秒      |
+| 最大累计等待 | `30` 秒     |
+| 自动切换中转 | 关闭        |
+| 日志保留     | `7` 天      |
+| 用量保留     | `365` 天    |
+
+模型容量不足和账号并发限制始终只重试当前中转，即使自动切换开关已经开启。已经产生文本、推理或工具调用后的流式请求不会由网关重放，以避免重复内容、重复计费和重复执行工具。
+
+## 数据与安全
+
+- 本地服务只监听回环地址，不对局域网公开。
+- 第三方 API Key 保存到 Windows Credential Manager，不写入普通日志。
+- 转发第三方请求前会删除官方 Authorization、Cookie、账号、组织、项目和 `X-OpenAI-*` 身份头。
+- 日志和用量记录不保存 prompt、响应正文或完整鉴权头。
+- 官方用量来自 Codex Desktop 本地 `token_count`，升级到 `0.3.5` 后会自动重建一次保留期内的历史。输入 Token 已包含缓存命中，总 Token 等于输入加输出，不等同于 OpenAI 账单。
+- 第三方用量优先采用上游 `usage`；缺失时使用 `tiktoken` 本地估算并明确标记，不等同于中转账单。
+- 重试和自动切换产生的每次实际上游调用分别计入对应线路。
+- 第三方模式下请求内容会发送给用户配置的中转服务，请只使用可信服务商。
+
+安装版和便携版共用 `%APPDATA%\com.ai-gateway.desktop` 中的数据库，以及 Windows Credential Manager 中的中转密钥。删除便携目录不会删除这些数据。
+
+## 文档
+
+- [使用指南](docs/user-guide.md)：安装、配置、Codex/cc-switch 接入、备份和用量统计。
+- [设计文档](docs/design.md)：内部架构、请求链路、路由重试、SSE 和数据设计。
+- [开发与构建](docs/development.md)：开发环境、运行、测试、NSIS 和便携版构建。
+- [故障排查](docs/troubleshooting.md)：常见错误、处理步骤和已知限制。
+- [安全说明](SECURITY.md)：密钥、隐私边界和漏洞反馈。
+- [贡献指南](CONTRIBUTING.md)：代码规范和提交前检查。
+- [更新日志](CHANGELOG.md)：版本变化记录。
+
+## 开发预览
 
 ```powershell
 npm install
 npm run tauri dev
 ```
 
-仅验证前端：
+完整环境和发布流程见[开发与构建](docs/development.md)。
 
-```powershell
-npm run build
-```
+## 许可证与声明
 
-验证 Rust：
-
-```powershell
-cargo check --manifest-path src-tauri/Cargo.toml
-cargo test --manifest-path src-tauri/Cargo.toml
-```
-
-## Windows 发布
-
-生成 NSIS 安装包：
-
-```powershell
-npm run tauri -- build --bundles nsis
-```
-
-安装包、便携版目录、数据库、运行日志和本地 QA 截图均属于本机产物，不提交到 Git。安装版与便携版共用 `%APPDATA%\com.ai-gateway.desktop` 中的配置和 Windows Credential Manager 中的中转密钥。
-
-`0.3.0` 将 Codex 官方和第三方接入统一到共享 `custom` Provider，并增加本地会话历史迁移与恢复。此前 `0.2.8` 修复了旧版未启用 Windows 原生凭据后端的问题：旧版已经丢失的 API Key 不存在于 SQLite，无法自动恢复；升级后需要重新填写一次。删除便携版目录不会删除 Windows Credential Manager 中的密钥。
-
-## cc-switch 接入
-
-应用启动后，在 cc-switch 新增 OpenAI 兼容 Provider：
-
-```text
-Base URL: http://127.0.0.1:8765/v1
-API Key: 网关设置页面显示的本地访问令牌
-```
-
-`8765` 是默认端口，可在配置中心修改为 `1024–65535` 范围内的其他端口。保存前会检查新端口是否可用；切换成功后需要同步更新 cc-switch 的 Base URL，本地 API Key 不变。端口被占用时保存失败，原端口会继续提供服务。
-
-只填写 Base URL 会收到 `401 本地访问令牌无效`；API Key 不是任意真实中转密钥，必须复制“配置中心”中的本地访问令牌。若 cc-switch 自动拼接接口路径，请保持 Base URL 以 `/v1` 结尾，不要重复填写 `/v1`。
-
-真实中转的 Base URL 和 API Key 只在 AI Gateway 内配置。API Key 保存到操作系统密钥库，普通日志不会记录请求正文或鉴权头。
-
-AI Gateway 在验证本地访问令牌后读取请求体，本地上限为 200 MiB。该限制用于避免本机异常进程无限占用内存，并高于 Axum 默认的 2 MiB。超过本地限制时错误类型为 `local_request_body_too_large`，不会触发中转切换或熔断；真实中转返回的 HTTP 413 才会进入下方的故障转移规则。
-
-## Token 用量
-
-“用量统计”页面按中转展示输入、输出、缓存、推理和总 Token，默认查询当天，也支持最多 30 个自然日的日期范围和完整自然月。统计只读取中转明确返回的 `usage`，不会修改请求或本地估算，因此页面会同时显示上报覆盖率。用量从安装支持该功能的版本后开始累计，无法从旧运行日志准确补录。
-
-用量数据默认保留 365 天，可在配置中心调整为 30–3650 天。历史记录保存在本机 SQLite 中，不包含 prompt、响应正文或 API Key，也不会写入 `.aigateway` 配置备份。
-
-## 故障转移边界
-
-- 连接失败、超时、HTTP 408、429 和 5xx 会尝试下一个可用中转。
-- 模型容量不足会按独立策略重试当前中转，不触发熔断，也不会自动切换到其他中转。
-- HTTP 413 默认立即尝试备用中转，并在配置的跳过期内避开无法承载相同或更大请求体的线路。
-- 400、401、403、404 等请求或配置错误直接返回，不做级联切换。
-- 上游已经返回响应头并开始流式输出后，不重放当前请求，避免重复执行和重复计费。
-- 连续失败阈值、熔断冷却、重试、健康探测、日志和用量保留期限均可在配置中心调整；429 优先使用 `Retry-After`。
-
-## 配置备份
-
-中转管理支持导出和导入 `.aigateway` 加密备份。备份可包含中转 API Key、本地访问令牌和路由规则，导出密码不会保存到应用或日志中。监听端口属于每台电脑的本机配置，不会被备份覆盖。跨电脑迁移时使用加密备份，不要复制数据库或导出明文密钥。
+本项目采用 [MIT License](LICENSE)。本项目是独立开源项目，与 OpenAI、Codex、CC-Switch 及第三方中转服务商不存在官方隶属或背书关系。
