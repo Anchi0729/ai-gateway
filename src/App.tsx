@@ -1275,7 +1275,8 @@ function CodexIntegrationPanel({
           </div>
           <div className="codex-mode-actions">
             <button
-              className="primary-button"
+              className={`primary-button${busy ? " is-loading" : ""}`}
+              aria-busy={busy}
               disabled={busy || currentMode === "official"}
               onClick={() => void onSwitch("official")}
             >
@@ -1307,7 +1308,8 @@ function CodexIntegrationPanel({
               <RefreshCw size={15} />修复接入配置
             </button>
             <button
-              className="primary-button"
+              className={`primary-button${busy ? " is-loading" : ""}`}
+              aria-busy={busy}
               disabled={busy || (currentMode === "gateway" && state?.gateway_configured)}
               onClick={() => void onSwitch("gateway")}
             >

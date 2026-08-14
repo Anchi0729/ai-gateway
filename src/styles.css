@@ -724,6 +724,10 @@ h3 {
 }
 .primary-button:disabled {
   opacity: 0.55;
+  cursor: default;
+}
+/* 当前模式也会长期禁用按钮，只有真实异步操作才显示等待光标。 */
+.primary-button.is-loading:disabled {
   cursor: wait;
 }
 .secondary-button {
