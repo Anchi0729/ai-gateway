@@ -63,6 +63,8 @@ const MAX_HEALTH_PROBES: usize = 24;
 const MAX_ERROR_BODY_BYTES: usize = 1024 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 256 * 1024;
 const MAX_SSE_PREFLIGHT_BYTES: usize = 1024 * 1024;
+// 配置经由 JavaScript 前端传输；不设置业务上限，但必须保持整数可无损往返。
+const MAX_SAFE_CONFIG_INTEGER: u64 = 9_007_199_254_740_991;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderConfig {
@@ -102,6 +104,20 @@ pub enum HealthState {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthIssueKind {
+    #[default]
+    None,
+    Transport,
+    Upstream,
+    Model,
+    RateLimit,
+    Stream,
+    Payload,
+    Configuration,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct HealthProbeSample {
     pub sequence: u64,
@@ -118,6 +134,7 @@ pub struct HealthSnapshot {
     pub latency_ms: Option<u64>,
     pub consecutive_failures: u32,
     pub last_error: Option<String>,
+    pub last_issue_kind: HealthIssueKind,
     pub cooldown_until: Option<DateTime<Utc>>,
     pub total_requests: u64,
     pub successful_requests: u64,
@@ -270,7 +287,7 @@ struct UsageRecord {
     client_origin: &'static str,
     codex_event_key: Option<String>,
     gateway_request_id: Option<String>,
-    attempt_index: u32,
+    attempt_index: u64,
     is_final_attempt: bool,
     http_status: Option<u16>,
     outcome: &'static str,
@@ -297,13 +314,13 @@ pub enum PayloadTooLargeAction {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RoutingPolicy {
-    pub retry_count: u8,
+    pub retry_count: u64,
     pub retry_interval_sec: u64,
     pub max_retry_wait_sec: u64,
     pub retry_unknown_transient_errors: bool,
     pub allow_provider_failover: bool,
     // 旧版备份仍包含容量专用字段；保存时与统一重试配置同步，避免破坏格式版本 1。
-    pub capacity_retry_count: u8,
+    pub capacity_retry_count: u64,
     pub capacity_retry_interval_sec: u64,
     pub capacity_max_retry_wait_sec: u64,
     pub circuit_failure_threshold: u8,
@@ -380,8 +397,8 @@ pub struct DiagnosticDetail {
     pub business_output_started: bool,
     pub bytes_received: u64,
     pub elapsed_ms: u64,
-    pub attempt_index: u8,
-    pub max_attempts: u8,
+    pub attempt_index: u64,
+    pub max_attempts: u64,
     pub retry_wait_sec: Option<u64>,
     pub fallback_retry_enabled: bool,
     pub failover_enabled: bool,
@@ -398,7 +415,7 @@ pub struct RoutingAttempt {
     pub status_code: Option<u16>,
     pub error: Option<String>,
     pub latency_ms: Option<u64>,
-    pub retry_count: u8,
+    pub retry_count: u64,
     pub switched: bool,
 }
 
@@ -413,7 +430,7 @@ pub struct RoutingEvent {
     pub source_provider_id: Option<String>,
     pub target_provider_id: Option<String>,
     pub status_code: Option<u16>,
-    pub retry_count: u8,
+    pub retry_count: u64,
     pub attempts: Vec<RoutingAttempt>,
     pub reason: String,
     pub final_result: String,
@@ -425,6 +442,7 @@ struct HealthRecord {
     latency_ms: Option<u64>,
     consecutive_failures: u32,
     last_error: Option<String>,
+    last_issue_kind: HealthIssueKind,
     cooldown_until: Option<DateTime<Utc>>,
     total_requests: u64,
     successful_requests: u64,
@@ -441,6 +459,7 @@ impl Default for HealthRecord {
             latency_ms: None,
             consecutive_failures: 0,
             last_error: None,
+            last_issue_kind: HealthIssueKind::None,
             cooldown_until: None,
             total_requests: 0,
             successful_requests: 0,
@@ -702,6 +721,37 @@ impl AppState {
                 CREATE TABLE IF NOT EXISTS codex_mode_history (
                     changed_at TEXT PRIMARY KEY,
                     mode TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS codex_usage_events (
+                    event_key TEXT PRIMARY KEY,
+                    event_time TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cached_tokens INTEGER,
+                    cache_write_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    total_tokens INTEGER,
+                    model_provider TEXT,
+                    observed_mode TEXT,
+                    has_rate_limits INTEGER NOT NULL DEFAULT 0,
+                    classification TEXT NOT NULL,
+                    counted INTEGER NOT NULL DEFAULT 0,
+                    usage_record_id INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_codex_usage_events_time
+                    ON codex_usage_events(event_time);
+                CREATE INDEX IF NOT EXISTS idx_codex_usage_events_usage_record
+                    ON codex_usage_events(usage_record_id)
+                    WHERE usage_record_id IS NOT NULL;
+                CREATE TABLE IF NOT EXISTS codex_usage_event_sources (
+                    event_key TEXT NOT NULL,
+                    source_key TEXT NOT NULL,
+                    file_identity TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    PRIMARY KEY(event_key, source_key)
                 );",
             )
             .map_err(|e| e.to_string())?;
@@ -839,7 +889,38 @@ fn migrate_usage_schema(connection: &Connection) -> Result<(), String> {
                  ON usage_records(usage_origin, completed_at);
              CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_records_gateway_attempt
                  ON usage_records(gateway_request_id, provider_id, attempt_index)
-                 WHERE gateway_request_id IS NOT NULL;",
+                 WHERE gateway_request_id IS NOT NULL;
+             CREATE TABLE IF NOT EXISTS codex_usage_events (
+                 event_key TEXT PRIMARY KEY,
+                 event_time TEXT NOT NULL,
+                 model TEXT NOT NULL,
+                 input_tokens INTEGER,
+                 output_tokens INTEGER,
+                 cached_tokens INTEGER,
+                 cache_write_tokens INTEGER,
+                 reasoning_tokens INTEGER,
+                 total_tokens INTEGER,
+                 model_provider TEXT,
+                 observed_mode TEXT,
+                 has_rate_limits INTEGER NOT NULL DEFAULT 0,
+                 classification TEXT NOT NULL,
+                 counted INTEGER NOT NULL DEFAULT 0,
+                 usage_record_id INTEGER,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_codex_usage_events_time
+                 ON codex_usage_events(event_time);
+             CREATE INDEX IF NOT EXISTS idx_codex_usage_events_usage_record
+                 ON codex_usage_events(usage_record_id)
+                 WHERE usage_record_id IS NOT NULL;
+             CREATE TABLE IF NOT EXISTS codex_usage_event_sources (
+                 event_key TEXT NOT NULL,
+                 source_key TEXT NOT NULL,
+                 file_identity TEXT NOT NULL,
+                 observed_at TEXT NOT NULL,
+                 PRIMARY KEY(event_key, source_key)
+             );",
         )
         .map_err(|error| format!("无法创建用量去重索引：{error}"))?;
     // 旧版本没有记录 Token 来源；按现有来源和上报状态进行一次可重复的兼容回填。
@@ -1016,23 +1097,23 @@ fn normalized_routing_policy(policy: &RoutingPolicy) -> RoutingPolicy {
 }
 
 fn validate_routing_policy(policy: &RoutingPolicy) -> Result<(), String> {
-    if policy.retry_count > 5 {
-        return Err("重试次数必须在 0 到 5 之间".to_string());
+    if policy.retry_count > MAX_SAFE_CONFIG_INTEGER {
+        return Err("重试次数超出可安全保存的整数范围".to_string());
     }
     if !(1..=60).contains(&policy.retry_interval_sec) {
         return Err("重试间隔必须在 1 到 60 秒之间".to_string());
     }
-    if !(1..=600).contains(&policy.max_retry_wait_sec) {
-        return Err("单次请求最大重试等待必须在 1 到 600 秒之间".to_string());
+    if policy.max_retry_wait_sec > 600 {
+        return Err("单次请求最大重试等待必须在 0 到 600 秒之间".to_string());
     }
-    if policy.capacity_retry_count > 5 {
-        return Err("模型容量重试次数必须在 0 到 5 之间".to_string());
+    if policy.capacity_retry_count > MAX_SAFE_CONFIG_INTEGER {
+        return Err("模型容量重试次数超出可安全保存的整数范围".to_string());
     }
     if !(1..=60).contains(&policy.capacity_retry_interval_sec) {
         return Err("模型容量重试间隔必须在 1 到 60 秒之间".to_string());
     }
-    if !(1..=600).contains(&policy.capacity_max_retry_wait_sec) {
-        return Err("模型容量最大等待必须在 1 到 600 秒之间".to_string());
+    if policy.capacity_max_retry_wait_sec > 600 {
+        return Err("模型容量最大等待必须在 0 到 600 秒之间".to_string());
     }
     if !(1..=10).contains(&policy.circuit_failure_threshold) {
         return Err("连续失败阈值必须在 1 到 10 之间".to_string());
@@ -1242,6 +1323,7 @@ fn health_snapshot(id: &str, record: &HealthRecord) -> HealthSnapshot {
         latency_ms: record.latency_ms,
         consecutive_failures: record.consecutive_failures,
         last_error: record.last_error.clone(),
+        last_issue_kind: record.last_issue_kind,
         cooldown_until: record.cooldown_until,
         total_requests: record.total_requests,
         successful_requests: record.successful_requests,
@@ -1373,6 +1455,10 @@ fn sqlite_token(value: Option<u64>) -> Result<Option<i64>, String> {
         .transpose()
 }
 
+fn sqlite_attempt_index(value: u64) -> Result<i64, String> {
+    i64::try_from(value).map_err(|_| "上游尝试序号超出可保存范围".to_string())
+}
+
 fn persist_usage_record(store: &Store, record: &UsageRecord) -> Result<bool, String> {
     let conn = store
         .connection
@@ -1407,7 +1493,7 @@ fn persist_usage_record(store: &Store, record: &UsageRecord) -> Result<bool, Str
             record.client_origin,
             record.codex_event_key,
             record.gateway_request_id,
-            i64::from(record.attempt_index),
+            sqlite_attempt_index(record.attempt_index)?,
             i64::from(record.is_final_attempt),
             record.http_status.map(i64::from),
             record.outcome,
@@ -1458,7 +1544,7 @@ fn collect_prepared_usage(
 #[allow(clippy::too_many_arguments)]
 fn gateway_usage_record(
     request_id: &str,
-    attempt_index: u32,
+    attempt_index: u64,
     provider_id: &str,
     provider_name: &str,
     model: Option<String>,
@@ -1710,6 +1796,7 @@ fn query_usage_statistics(state: &AppState, query: &UsageQuery) -> Result<UsageS
         .connection
         .lock()
         .map_err(|_| "数据库锁已损坏".to_string())?;
+    let codex_parser_current = codex_usage::parser_is_current(&conn);
     let mut statement = conn
         .prepare(
             "SELECT completed_at,provider_id,provider_name,
@@ -1719,12 +1806,17 @@ fn query_usage_statistics(state: &AppState, query: &UsageQuery) -> Result<UsageS
              WHERE completed_at >= ?1 AND completed_at < ?2
                AND (data_source='codex_session' OR request_path='/v1/responses'
                     OR request_path='/v1/chat/completions')
-             ORDER BY completed_at ASC",
+               AND (?3=1 OR token_source<>'codex_session')
+              ORDER BY completed_at ASC",
         )
         .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map(
-            params![log_timestamp(start_at), log_timestamp(end_at)],
+            params![
+                log_timestamp(start_at),
+                log_timestamp(end_at),
+                i64::from(codex_parser_current)
+            ],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -2007,7 +2099,7 @@ fn stream_diagnostic_detail(
     upstream_request_id: Option<String>,
     failure: &StreamFailure,
     elapsed_ms: u64,
-    attempt_index: u8,
+    attempt_index: u64,
     policy: &RoutingPolicy,
     retry_wait_sec: Option<u64>,
     action: &str,
@@ -2049,8 +2141,8 @@ fn push_routing_event(state: &AppState, message: String, event: RoutingEvent) {
         EventLog {
             timestamp: event.timestamp,
             level: match event.event_type.as_str() {
-                "capacity_recovered" => "info",
-                "capacity_exhausted" => "error",
+                "model_availability_recovered" => "info",
+                "model_temporarily_unavailable" => "error",
                 _ => "warning",
             }
             .to_string(),
@@ -2068,7 +2160,7 @@ fn push_routing_event(state: &AppState, message: String, event: RoutingEvent) {
         return;
     };
     let _ = app.emit("routing-event", &event);
-    // 容量重试只进入日志和详情，不复用自动切换的 Toast 与托盘提示。
+    // 模型级重试只进入日志和详情，不复用自动切换的 Toast 与托盘提示。
     if !notify || event.event_type != "auto_switch" {
         return;
     }
@@ -2096,22 +2188,22 @@ fn push_routing_event(state: &AppState, message: String, event: RoutingEvent) {
     }
 }
 
-fn push_capacity_event(
+fn push_model_retry_event(
     state: &AppState,
     provider: &ProviderConfig,
     model: Option<&str>,
     request_path: &str,
     request_body_bytes: usize,
     attempts: Vec<RoutingAttempt>,
-    capacity: &CapacityError,
+    model_error: &ModelTemporaryError,
     recovered: bool,
     status_code: Option<u16>,
 ) {
-    let retry_count = attempts.len().saturating_sub(1).min(usize::from(u8::MAX)) as u8;
+    let retry_count = u64::try_from(attempts.len().saturating_sub(1)).unwrap_or(u64::MAX);
     let event_type = if recovered {
-        "capacity_recovered"
+        "model_availability_recovered"
     } else {
-        "capacity_exhausted"
+        "model_temporarily_unavailable"
     };
     let event = RoutingEvent {
         id: Uuid::new_v4().to_string(),
@@ -2125,50 +2217,111 @@ fn push_capacity_event(
         status_code,
         retry_count,
         attempts,
-        reason: capacity.message.clone(),
+        reason: model_error.message.clone(),
         final_result: event_type.to_string(),
     };
-    let code = capacity.code.as_deref().unwrap_or("model_capacity");
+    let code = model_error
+        .code
+        .as_deref()
+        .unwrap_or("model_temporarily_unavailable");
     let message = if recovered {
-        format!("模型容量恢复，已在 {} 完成重试（{code}）", provider.name)
+        format!("模型或分组恢复，已在 {} 完成重试（{code}）", provider.name)
     } else {
-        format!("模型容量重试已耗尽：{}（{code}）", provider.name)
+        format!(
+            "模型或分组暂不可用，重试已耗尽：{}（{code}）",
+            provider.name
+        )
     };
     push_routing_event(state, message, event);
 }
-fn can_use(record: &mut HealthRecord) -> bool {
-    if record.state != HealthState::Open {
-        return true;
-    }
-    // 冷却到期只放行一次半开探测，后续成功或失败会重新确定熔断状态。
-    if record.cooldown_until.is_some_and(|at| at <= Utc::now()) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CircuitImpact {
+    None,
+    DegradedOnly,
+    ProviderCircuit,
+}
+
+fn refresh_circuit_state(record: &mut HealthRecord) -> bool {
+    if record.state == HealthState::Open && record.cooldown_until.is_some_and(|at| at <= Utc::now())
+    {
+        // 冷却到期只转为半开；必须由下一次真实模型请求确认是否恢复。
         record.state = HealthState::HalfOpen;
         return true;
     }
     false
 }
-fn mark_success(state: &AppState, id: &str, latency: u64) -> HealthState {
-    let mut health = state.health.lock().unwrap();
-    let record = health.entry(id.to_string()).or_default();
-    record.state = HealthState::Healthy;
-    record.latency_ms = Some(latency);
-    record.consecutive_failures = 0;
-    record.last_error = None;
-    record.cooldown_until = None;
-    record.total_requests += 1;
-    record.successful_requests += 1;
-    record.state.clone()
+
+fn can_use(record: &mut HealthRecord) -> bool {
+    refresh_circuit_state(record);
+    record.state != HealthState::Open
+}
+
+fn mark_probe_success(state: &AppState, id: &str, latency: u64) -> HealthState {
+    let (new_state, recovered) = {
+        let mut health = state.health.lock().unwrap();
+        let record = health.entry(id.to_string()).or_default();
+        let connection_issue = matches!(
+            record.last_issue_kind,
+            HealthIssueKind::Transport
+                | HealthIssueKind::Upstream
+                | HealthIssueKind::Configuration
+                | HealthIssueKind::None
+        );
+        let recovered = connection_issue
+            && (matches!(record.state, HealthState::Open | HealthState::HalfOpen)
+                || record.consecutive_failures > 0);
+        record.latency_ms = Some(latency);
+        record.total_requests += 1;
+        record.successful_requests += 1;
+        if connection_issue {
+            // /models 只证明基础连接和鉴权可用，不能清除具体模型、限流或流式问题。
+            record.state = HealthState::Healthy;
+            record.consecutive_failures = 0;
+            record.last_error = None;
+            record.last_issue_kind = HealthIssueKind::None;
+            record.cooldown_until = None;
+        }
+        (record.state.clone(), recovered)
+    };
+    if recovered {
+        push_diagnostic_log(
+            state,
+            "info",
+            "基础连接探测成功，连接级熔断已恢复",
+            Some(id),
+            None,
+            Some("circuit_recovered"),
+        );
+    }
+    new_state
 }
 
 fn mark_response_started(state: &AppState, id: &str, latency: u64) {
-    let mut health = state.health.lock().unwrap();
-    let record = health.entry(id.to_string()).or_default();
-    // 收到响应头只说明上游已经建立响应，完整成功必须等响应体正常结束后再计数。
-    record.state = HealthState::Healthy;
-    record.latency_ms = Some(latency);
-    record.consecutive_failures = 0;
-    record.last_error = None;
-    record.cooldown_until = None;
+    let recovered = {
+        let mut health = state.health.lock().unwrap();
+        let record = health.entry(id.to_string()).or_default();
+        let recovered = matches!(record.state, HealthState::Open | HealthState::HalfOpen)
+            || record.consecutive_failures > 0
+            || record.last_issue_kind != HealthIssueKind::None;
+        // 收到成功响应头说明真实模型端点已接受请求；完整成功仍等响应体结束后计数。
+        record.state = HealthState::Healthy;
+        record.latency_ms = Some(latency);
+        record.consecutive_failures = 0;
+        record.last_error = None;
+        record.last_issue_kind = HealthIssueKind::None;
+        record.cooldown_until = None;
+        recovered
+    };
+    if recovered {
+        push_diagnostic_log(
+            state,
+            "info",
+            "真实模型请求已建立响应，中转线路已恢复",
+            Some(id),
+            None,
+            Some("circuit_recovered"),
+        );
+    }
 }
 
 fn mark_response_completed(state: &AppState, id: &str) {
@@ -2186,49 +2339,97 @@ fn record_incomplete_business_response(state: &AppState, id: &str, latency: u64)
     record.latency_ms = Some(latency);
 }
 
-fn record_capacity_exhausted(state: &AppState, id: &str, message: &str, latency: u64) {
-    let mut health = state.health.lock().unwrap();
-    let record = health.entry(id.to_string()).or_default();
-    // 模型容量是模型级瞬时状态，只计入请求结果，不累计中转失败或触发熔断。
-    record.total_requests += 1;
-    record.latency_ms = Some(latency);
-    record.last_error = Some(message.chars().take(180).collect());
+fn record_model_temporarily_unavailable(state: &AppState, id: &str, message: &str, latency: u64) {
+    record_degraded_issue(state, id, message, latency, HealthIssueKind::Model, None);
 }
 
 fn mark_upstream_rejection(state: &AppState, id: &str, status: StatusCode, latency: u64) {
-    let mut health = state.health.lock().unwrap();
-    let record = health.entry(id.to_string()).or_default();
-    record.state = HealthState::Degraded;
-    record.latency_ms = Some(latency);
-    record.consecutive_failures += 1;
-    record.last_error = Some(format!("上游返回 {status}"));
-    record.total_requests += 1;
+    let issue_kind = if matches!(
+        status,
+        StatusCode::BAD_REQUEST
+            | StatusCode::UNAUTHORIZED
+            | StatusCode::FORBIDDEN
+            | StatusCode::NOT_FOUND
+            | StatusCode::UNPROCESSABLE_ENTITY
+    ) {
+        HealthIssueKind::Configuration
+    } else {
+        HealthIssueKind::Upstream
+    };
+    record_degraded_issue(
+        state,
+        id,
+        &format!("上游返回 {status}"),
+        latency,
+        issue_kind,
+        None,
+    );
 }
 
-fn mark_failure(
+fn record_degraded_issue(
     state: &AppState,
     id: &str,
-    message: String,
+    message: &str,
+    latency: u64,
+    issue_kind: HealthIssueKind,
     cooldown_until: Option<DateTime<Utc>>,
-    policy: &RoutingPolicy,
 ) -> HealthState {
     let mut health = state.health.lock().unwrap();
     let record = health.entry(id.to_string()).or_default();
-    record.total_requests += 1;
-    record.consecutive_failures += 1;
+    // 模型、限流和请求级问题只降低可观测状态，不增加线路连续失败次数。
+    record.state = HealthState::Degraded;
+    record.latency_ms = Some(latency);
+    record.consecutive_failures = 0;
     record.last_error = Some(message.chars().take(180).collect());
-    // 429 按 Retry-After 直接冷却；其余瞬时错误按用户策略累计后熔断。
-    if let Some(until) = cooldown_until {
-        record.cooldown_until = Some(until);
-        record.state = HealthState::Open;
-    } else if record.consecutive_failures >= u32::from(policy.circuit_failure_threshold) {
-        record.cooldown_until =
-            Some(Utc::now() + Duration::seconds(policy.circuit_cooldown_sec as i64));
-        record.state = HealthState::Open;
-    } else {
-        record.state = HealthState::Degraded;
-    }
+    record.last_issue_kind = issue_kind;
+    record.cooldown_until = cooldown_until;
+    record.total_requests += 1;
     record.state.clone()
+}
+
+fn mark_provider_failure(
+    state: &AppState,
+    id: &str,
+    message: String,
+    issue_kind: HealthIssueKind,
+    policy: &RoutingPolicy,
+) -> HealthState {
+    debug_assert!(matches!(
+        issue_kind,
+        HealthIssueKind::Transport | HealthIssueKind::Upstream | HealthIssueKind::Stream
+    ));
+    let (new_state, opened) = {
+        let mut health = state.health.lock().unwrap();
+        let record = health.entry(id.to_string()).or_default();
+        let was_open = record.state == HealthState::Open;
+        record.total_requests += 1;
+        record.consecutive_failures += 1;
+        record.last_error = Some(message.chars().take(180).collect());
+        record.last_issue_kind = issue_kind;
+        // 只有整个客户端请求的同一中转重试耗尽后才调用这里，因此一次请求至多累计一次。
+        if record.consecutive_failures >= u32::from(policy.circuit_failure_threshold) {
+            record.cooldown_until =
+                Some(Utc::now() + Duration::seconds(policy.circuit_cooldown_sec as i64));
+            record.state = HealthState::Open;
+        } else {
+            record.state = HealthState::Degraded;
+        }
+        (
+            record.state.clone(),
+            !was_open && record.state == HealthState::Open,
+        )
+    };
+    if opened {
+        push_diagnostic_log(
+            state,
+            "error",
+            "线路级故障达到阈值，中转已进入冷却",
+            Some(id),
+            None,
+            Some("circuit_opened"),
+        );
+    }
+    new_state
 }
 
 fn record_health_probe(
@@ -2265,7 +2466,10 @@ fn mark_payload_too_large(
     let record = health.entry(id.to_string()).or_default();
     record.state = HealthState::Degraded;
     record.latency_ms = Some(latency);
+    record.consecutive_failures = 0;
     record.last_error = Some(format!("上游拒绝了 {body_bytes} 字节的请求体（413）"));
+    record.last_issue_kind = HealthIssueKind::Payload;
+    record.cooldown_until = None;
     record.total_requests += 1;
     record.payload_rejected_size = Some(body_bytes);
     record.payload_rejected_until =
@@ -2355,6 +2559,18 @@ fn retry_after_seconds(headers: &HeaderMap) -> Option<u64> {
         .ok()
         .map(|at| (at.with_timezone(&Utc) - Utc::now()).num_seconds().max(0) as u64)
 }
+
+fn retry_budget_allows(
+    retry_index: u64,
+    retry_count: u64,
+    waited_seconds: u64,
+    next_wait_seconds: u64,
+    max_retry_wait_sec: u64,
+) -> bool {
+    retry_index < retry_count
+        && (max_retry_wait_sec == 0
+            || waited_seconds.saturating_add(next_wait_seconds) <= max_retry_wait_sec)
+}
 #[derive(Deserialize)]
 struct RequestMetadata {
     model: Option<String>,
@@ -2368,7 +2584,7 @@ fn request_model(body: &Bytes) -> Option<String> {
 }
 
 #[derive(Clone, Debug)]
-struct CapacityError {
+struct ModelTemporaryError {
     code: Option<String>,
     message: String,
 }
@@ -2519,6 +2735,70 @@ fn classify_incomplete_reason(reason: Option<&str>) -> ErrorClassification {
     ErrorClassification::Unknown
 }
 
+fn error_text_matches_model_temporary(
+    code: Option<&str>,
+    error_type: Option<&str>,
+    message: Option<&str>,
+) -> bool {
+    [code, error_type, message]
+        .into_iter()
+        .flatten()
+        .any(model_temporary_message_matches)
+}
+
+fn http_error_impact(
+    status: StatusCode,
+    failure: &StreamFailure,
+) -> (CircuitImpact, HealthIssueKind) {
+    if error_text_matches_model_temporary(
+        failure.code.as_deref(),
+        failure.error_type.as_deref(),
+        Some(&failure.message),
+    ) {
+        return (CircuitImpact::DegradedOnly, HealthIssueKind::Model);
+    }
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return (CircuitImpact::DegradedOnly, HealthIssueKind::RateLimit);
+    }
+    if matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    ) {
+        return (CircuitImpact::ProviderCircuit, HealthIssueKind::Upstream);
+    }
+    (CircuitImpact::None, HealthIssueKind::Upstream)
+}
+
+fn stream_failure_impact(failure: &StreamFailure) -> (CircuitImpact, HealthIssueKind) {
+    if error_text_matches_model_temporary(
+        failure.code.as_deref(),
+        failure.error_type.as_deref(),
+        Some(&failure.message),
+    ) {
+        return (CircuitImpact::DegradedOnly, HealthIssueKind::Model);
+    }
+    if failure.classification == ErrorClassification::IncompleteBusiness
+        || failure.classification == ErrorClassification::Permanent
+    {
+        return (CircuitImpact::None, HealthIssueKind::Upstream);
+    }
+    let stream_transport = failure
+        .code
+        .as_deref()
+        .is_some_and(|code| code.contains("stream") || code.contains("upstream"))
+        || failure
+            .error_type
+            .as_deref()
+            .is_some_and(|kind| kind.contains("stream") || kind.contains("unexpected_eof"));
+    if stream_transport || failure.classification == ErrorClassification::Retryable {
+        return (CircuitImpact::ProviderCircuit, HealthIssueKind::Stream);
+    }
+    (CircuitImpact::None, HealthIssueKind::Stream)
+}
+
 fn response_error_fields(
     value: &serde_json::Value,
 ) -> (Option<String>, Option<String>, Option<String>) {
@@ -2544,8 +2824,8 @@ fn response_error_fields(
     (code, error_type, message)
 }
 
-fn capacity_message_matches(message: &str) -> bool {
-    let normalized = message.to_ascii_lowercase();
+fn model_temporary_message_matches(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase().replace(['_', '-'], " ");
     let model_capacity = normalized.contains("model")
         && (normalized.contains("at capacity")
             || normalized.contains("capacity exceeded")
@@ -2553,10 +2833,19 @@ fn capacity_message_matches(message: &str) -> bool {
     let account_concurrency = normalized.contains("concurrency")
         && normalized.contains("limit")
         && (normalized.contains("account") || normalized.contains("exceeded"));
-    model_capacity || account_concurrency
+    let model_route_unavailable = [
+        "no available channel",
+        "no channel available",
+        "model unavailable",
+        "group unavailable",
+        "no route available for model",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    model_capacity || account_concurrency || model_route_unavailable
 }
 
-fn capacity_error_from_json(value: &serde_json::Value) -> Option<CapacityError> {
+fn model_temporary_error_from_json(value: &serde_json::Value) -> Option<ModelTemporaryError> {
     let error = if value.get("type").and_then(|item| item.as_str()) == Some("response.failed") {
         value.pointer("/response/error")
     } else {
@@ -2589,11 +2878,15 @@ fn capacity_error_from_json(value: &serde_json::Value) -> Option<CapacityError> 
             (identifier.contains("capacity") && identifier.contains("model"))
                 || identifier.contains("concurrency_limit")
                 || identifier.contains("account_concurrency")
+                || identifier.contains("model_unavailable")
+                || identifier.contains("group_unavailable")
+                || identifier.contains("no_available_channel")
+                || identifier.contains("no_route_available")
         });
-    if !identifier_matches && !capacity_message_matches(message) {
+    if !identifier_matches && !model_temporary_message_matches(message) {
         return None;
     }
-    Some(CapacityError {
+    Some(ModelTemporaryError {
         code,
         message: message.chars().take(180).collect(),
     })
@@ -2959,7 +3252,7 @@ async fn inspect_json_error_response(
     mut response: PreparedUpstreamResponse,
 ) -> (
     PreparedUpstreamResponse,
-    Option<CapacityError>,
+    Option<ModelTemporaryError>,
     StreamFailure,
 ) {
     let mut body = Vec::new();
@@ -3028,7 +3321,18 @@ async fn inspect_json_error_response(
         }
     }
     let parsed = serde_json::from_slice::<serde_json::Value>(&body);
-    let capacity = parsed.as_ref().ok().and_then(capacity_error_from_json);
+    let capacity = parsed
+        .as_ref()
+        .ok()
+        .and_then(model_temporary_error_from_json)
+        .or_else(|| {
+            let plain_text = String::from_utf8_lossy(&body);
+            model_temporary_message_matches(&plain_text).then(|| ModelTemporaryError {
+                code: Some("model_temporarily_unavailable".to_string()),
+                // 纯文本正文只用于内存分类，日志使用固定消息，避免保存上游响应正文。
+                message: "上游报告模型或分组暂不可用".to_string(),
+            })
+        });
     let (code, error_type, message) = parsed
         .as_ref()
         .ok()
@@ -3061,7 +3365,7 @@ async fn inspect_json_error_response(
 
 enum SsePreflightResult {
     Forward(PreparedUpstreamResponse),
-    Capacity(PreparedUpstreamResponse, CapacityError),
+    Capacity(PreparedUpstreamResponse, ModelTemporaryError),
     Failure(PreparedUpstreamResponse, StreamFailure),
     TrackingDisabled(PreparedUpstreamResponse, StreamFailure),
 }
@@ -3203,7 +3507,7 @@ async fn inspect_sse_before_output(
                     );
                 }
             };
-            if let Some(capacity) = capacity_error_from_json(&value) {
+            if let Some(capacity) = model_temporary_error_from_json(&value) {
                 return SsePreflightResult::Capacity(response, capacity);
             }
             let event_type = value.get("type").and_then(|item| item.as_str());
@@ -3439,45 +3743,50 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
     if !policy.allow_provider_failover {
         candidates.truncate(1);
     }
-    if !policy.allow_provider_failover {
-        if let Some(provider) = candidates.first() {
-            let available = {
-                let mut health = state.health.lock().unwrap();
-                can_use(health.entry(provider.id.clone()).or_default())
-            };
-            if !available {
-                push_diagnostic_log(
-                    &state,
-                    "warning",
-                    "当前中转暂不可用，自动切换已关闭",
-                    Some(&provider.id),
-                    model.as_deref(),
-                    Some("provider_failover_blocked"),
-                );
-                return json_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "当前中转暂不可用，自动切换已关闭",
-                );
-            }
-        }
-    }
     let mut last_error = "没有可用的中转".to_string();
     let mut last_status = None;
     let mut only_payload_failures = true;
     let mut first_failed_provider = None;
     let mut first_failure_reason = None;
     let mut attempts = Vec::new();
-    let mut upstream_attempt_index = 0_u32;
+    let mut upstream_attempt_index = 0_u64;
     for provider in candidates {
-        let (available, payload_allowed) = {
+        let (available, payload_allowed, circuit_bypassed, half_opened) = {
             let mut health = state.health.lock().unwrap();
             let record = health.entry(provider.id.clone()).or_default();
+            let was_open = record.state == HealthState::Open;
             // 自动切换关闭时仍把当前首选交给上游，避免健康缓存悄悄改变用户选择。
-            let available = !policy.allow_provider_failover || can_use(record);
+            let route_available = can_use(record);
+            let available = !policy.allow_provider_failover || route_available;
             let payload_allowed =
                 !policy.allow_provider_failover || payload_size_allowed(record, body_bytes);
-            (available, payload_allowed)
+            (
+                available,
+                payload_allowed,
+                !policy.allow_provider_failover && was_open && !route_available,
+                was_open && record.state == HealthState::HalfOpen,
+            )
         };
+        if circuit_bypassed {
+            push_diagnostic_log(
+                &state,
+                "warning",
+                "自动切换已关闭，忽略内部熔断状态并继续尝试当前中转",
+                Some(&provider.id),
+                model.as_deref(),
+                Some("circuit_bypassed_failover_disabled"),
+            );
+        }
+        if half_opened {
+            push_diagnostic_log(
+                &state,
+                "info",
+                "中转冷却已结束，下一次真实请求进入半开试探",
+                Some(&provider.id),
+                model.as_deref(),
+                Some("circuit_half_open"),
+            );
+        }
         if !available {
             continue;
         }
@@ -3606,9 +3915,13 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                                 || (failure.classification == ErrorClassification::Unknown
                                     && policy.retry_unknown_transient_errors);
                             let can_retry = retry_allowed
-                                && retry_index < policy.retry_count
-                                && waited_seconds.saturating_add(wait_seconds)
-                                    <= policy.max_retry_wait_sec;
+                                && retry_budget_allows(
+                                    retry_index,
+                                    policy.retry_count,
+                                    waited_seconds,
+                                    wait_seconds,
+                                    policy.max_retry_wait_sec,
+                                );
                             let collected = collect_prepared_usage(
                                 &prepared,
                                 request_token_estimate.clone(),
@@ -3758,13 +4071,40 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                                 }
                                 return response_to_axum(prepared, None);
                             }
-                            mark_failure(
-                                &state,
-                                &provider.id,
-                                failure.message.clone(),
-                                None,
-                                &policy,
-                            );
+                            let (impact, issue_kind) = stream_failure_impact(&failure);
+                            match impact {
+                                CircuitImpact::ProviderCircuit => {
+                                    mark_provider_failure(
+                                        &state,
+                                        &provider.id,
+                                        failure.message.clone(),
+                                        issue_kind,
+                                        &policy,
+                                    );
+                                }
+                                CircuitImpact::DegradedOnly => {
+                                    record_degraded_issue(
+                                        &state,
+                                        &provider.id,
+                                        &failure.message,
+                                        latency,
+                                        issue_kind,
+                                        None,
+                                    );
+                                    if issue_kind == HealthIssueKind::Model {
+                                        push_diagnostic_log(
+                                            &state,
+                                            "warning",
+                                            "当前模型或分组暂不可用，未触发整个中转熔断",
+                                            Some(&provider.id),
+                                            model.as_deref(),
+                                            Some("model_temporarily_unavailable"),
+                                        );
+                                    }
+                                    return response_to_axum(prepared, None);
+                                }
+                                CircuitImpact::None => return response_to_axum(prepared, None),
+                            }
                             if !policy.allow_provider_failover {
                                 return response_to_axum(prepared, None);
                             }
@@ -3780,9 +4120,13 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                         if let Some(capacity) = capacity {
                             let attempt_latency = started.elapsed().as_millis() as u64;
                             let wait_seconds = retry_after.unwrap_or(policy.retry_interval_sec);
-                            let can_retry = retry_index < policy.retry_count
-                                && waited_seconds.saturating_add(wait_seconds)
-                                    <= policy.max_retry_wait_sec;
+                            let can_retry = retry_budget_allows(
+                                retry_index,
+                                policy.retry_count,
+                                waited_seconds,
+                                wait_seconds,
+                                policy.max_retry_wait_sec,
+                            );
                             let collected = collect_prepared_usage(
                                 &prepared,
                                 request_token_estimate.clone(),
@@ -3821,7 +4165,7 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                                     &state,
                                     "warning",
                                     format!(
-                                        "模型容量不足，{wait_seconds} 秒后重试同一中转（{}/{})",
+                                        "模型或分组暂不可用，{wait_seconds} 秒后重试同一中转（{}/{})",
                                         retry_index + 1,
                                         policy.retry_count
                                     ),
@@ -3832,13 +4176,13 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                                 sleep(StdDuration::from_secs(wait_seconds)).await;
                                 continue 'transient_retry;
                             }
-                            record_capacity_exhausted(
+                            record_model_temporarily_unavailable(
                                 &state,
                                 &provider.id,
                                 &capacity.message,
                                 attempt_latency,
                             );
-                            push_capacity_event(
+                            push_model_retry_event(
                                 &state,
                                 &provider,
                                 model.as_deref(),
@@ -3866,7 +4210,7 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
 
                         if !capacity_attempts.is_empty() {
                             let capacity =
-                                last_capacity.as_ref().expect("容量重试必须保留错误原因");
+                                last_capacity.as_ref().expect("模型级重试必须保留错误原因");
                             if status.is_success() {
                                 capacity_attempts.push(RoutingAttempt {
                                     provider_id: provider.id.clone(),
@@ -3877,7 +4221,7 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                                     retry_count: retry_index,
                                     switched: false,
                                 });
-                                push_capacity_event(
+                                push_model_retry_event(
                                     &state,
                                     &provider,
                                     model.as_deref(),
@@ -3889,7 +4233,7 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                                     Some(status.as_u16()),
                                 );
                             } else {
-                                let message = format!("容量重试后上游返回 {status}");
+                                let message = format!("模型级重试后上游返回 {status}");
                                 capacity_attempts.push(RoutingAttempt {
                                     provider_id: provider.id.clone(),
                                     provider_name: provider.name.clone(),
@@ -3899,8 +4243,13 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                                     retry_count: retry_index,
                                     switched: false,
                                 });
-                                record_capacity_exhausted(&state, &provider.id, &message, latency);
-                                push_capacity_event(
+                                record_model_temporarily_unavailable(
+                                    &state,
+                                    &provider.id,
+                                    &message,
+                                    latency,
+                                );
+                                push_model_retry_event(
                                     &state,
                                     &provider,
                                     model.as_deref(),
@@ -4020,9 +4369,13 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                             } else {
                                 policy.retry_interval_sec
                             };
-                            let can_retry = retry_index < policy.retry_count
-                                && waited_seconds.saturating_add(wait_seconds)
-                                    <= policy.max_retry_wait_sec;
+                            let can_retry = retry_budget_allows(
+                                retry_index,
+                                policy.retry_count,
+                                waited_seconds,
+                                wait_seconds,
+                                policy.max_retry_wait_sec,
+                            );
                             attempts.push(RoutingAttempt {
                                 provider_id: provider.id.clone(),
                                 provider_name: provider.name.clone(),
@@ -4099,13 +4452,29 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                                             as i64,
                                     )
                             });
-                            mark_failure(
-                                &state,
-                                &provider.id,
-                                last_error.clone(),
-                                cooldown,
-                                &policy,
-                            );
+                            let (impact, issue_kind) = http_error_impact(status, &failure);
+                            match impact {
+                                CircuitImpact::ProviderCircuit => {
+                                    mark_provider_failure(
+                                        &state,
+                                        &provider.id,
+                                        last_error.clone(),
+                                        issue_kind,
+                                        &policy,
+                                    );
+                                }
+                                CircuitImpact::DegradedOnly => {
+                                    record_degraded_issue(
+                                        &state,
+                                        &provider.id,
+                                        &last_error,
+                                        latency,
+                                        issue_kind,
+                                        cooldown,
+                                    );
+                                }
+                                CircuitImpact::None => {}
+                            }
                             let detail = stream_diagnostic_detail(
                                 &request_id,
                                 &provider.id,
@@ -4182,12 +4551,9 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                                     source_provider_id: Some(source_provider_id),
                                     target_provider_id: Some(provider.id.clone()),
                                     status_code: Some(status.as_u16()),
-                                    retry_count: attempts
-                                        .iter()
-                                        .map(|item| u32::from(item.retry_count))
-                                        .sum::<u32>()
-                                        .min(u32::from(u8::MAX))
-                                        as u8,
+                                    retry_count: attempts.iter().fold(0_u64, |total, item| {
+                                        total.saturating_add(item.retry_count)
+                                    }),
                                     attempts: attempts.clone(),
                                     reason: first_failure_reason
                                         .clone()
@@ -4303,9 +4669,13 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                             }
                         };
                         let wait_seconds = policy.retry_interval_sec;
-                        let can_retry = retry_index < policy.retry_count
-                            && waited_seconds.saturating_add(wait_seconds)
-                                <= policy.max_retry_wait_sec;
+                        let can_retry = retry_budget_allows(
+                            retry_index,
+                            policy.retry_count,
+                            waited_seconds,
+                            wait_seconds,
+                            policy.max_retry_wait_sec,
+                        );
                         attempts.push(RoutingAttempt {
                             provider_id: provider.id.clone(),
                             provider_name: provider.name.clone(),
@@ -4358,7 +4728,7 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                         }
                         if !capacity_attempts.is_empty() {
                             let capacity =
-                                last_capacity.as_ref().expect("容量重试必须保留错误原因");
+                                last_capacity.as_ref().expect("模型级重试必须保留错误原因");
                             capacity_attempts.push(RoutingAttempt {
                                 provider_id: provider.id.clone(),
                                 provider_name: provider.name.clone(),
@@ -4368,8 +4738,13 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                                 retry_count: retry_index,
                                 switched: false,
                             });
-                            record_capacity_exhausted(&state, &provider.id, &last_error, latency);
-                            push_capacity_event(
+                            record_model_temporarily_unavailable(
+                                &state,
+                                &provider.id,
+                                &last_error,
+                                latency,
+                            );
+                            push_model_retry_event(
                                 &state,
                                 &provider,
                                 model.as_deref(),
@@ -4382,7 +4757,13 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                             );
                             return json_error(StatusCode::SERVICE_UNAVAILABLE, &last_error);
                         }
-                        mark_failure(&state, &provider.id, last_error.clone(), None, &policy);
+                        mark_provider_failure(
+                            &state,
+                            &provider.id,
+                            last_error.clone(),
+                            HealthIssueKind::Transport,
+                            &policy,
+                        );
                         push_diagnostic_log(
                             &state,
                             "error",
@@ -4453,8 +4834,8 @@ struct ResponseStreamContext {
     client_origin: &'static str,
     validate_responses_terminal: bool,
     upstream_request_id: Option<String>,
-    attempt_index: u8,
-    usage_attempt_index: u32,
+    attempt_index: u64,
+    usage_attempt_index: u64,
     attempts: Vec<RoutingAttempt>,
     started_at: Instant,
 }
@@ -4655,11 +5036,11 @@ impl Stream for ObservedResponseStream {
                         self.context.request_path, detail
                     );
                     // 响应头之后无法迁移当前请求，但这次传输失败必须影响后续请求的健康路由。
-                    mark_failure(
+                    mark_provider_failure(
                         &self.context.state,
                         &self.context.provider_id,
                         message.clone(),
-                        None,
+                        HealthIssueKind::Stream,
                         &self.context.policy,
                     );
                     let failure = StreamFailure {
@@ -4718,11 +5099,11 @@ impl Stream for ObservedResponseStream {
                     );
                     let message =
                         format!("流式响应不完整（{}）：{detail}", self.context.request_path);
-                    mark_failure(
+                    mark_provider_failure(
                         &self.context.state,
                         &self.context.provider_id,
                         message.clone(),
-                        None,
+                        HealthIssueKind::Stream,
                         &self.context.policy,
                     );
                     let failure = StreamFailure {
@@ -4791,22 +5172,6 @@ impl Stream for ObservedResponseStream {
                             self.sse.error_message.as_deref(),
                         )
                     };
-                    if classification != ErrorClassification::IncompleteBusiness {
-                        mark_failure(
-                            &self.context.state,
-                            &self.context.provider_id,
-                            message.clone(),
-                            None,
-                            &self.context.policy,
-                        );
-                    } else {
-                        // max_output_tokens/内容过滤属于业务性结束：只计请求量，不误计成功，也不降低线路健康度。
-                        record_incomplete_business_response(
-                            &self.context.state,
-                            &self.context.provider_id,
-                            self.context.started_at.elapsed().as_millis() as u64,
-                        );
-                    }
                     let failure = StreamFailure {
                         classification,
                         code: self.sse.error_code.clone(),
@@ -4823,6 +5188,46 @@ impl Stream for ObservedResponseStream {
                         bytes_received: self.sse.bytes_received,
                         parse_error: self.sse.parse_error.clone(),
                     };
+                    let (impact, issue_kind) = stream_failure_impact(&failure);
+                    match impact {
+                        CircuitImpact::ProviderCircuit => {
+                            mark_provider_failure(
+                                &self.context.state,
+                                &self.context.provider_id,
+                                message.clone(),
+                                issue_kind,
+                                &self.context.policy,
+                            );
+                        }
+                        CircuitImpact::DegradedOnly => {
+                            record_degraded_issue(
+                                &self.context.state,
+                                &self.context.provider_id,
+                                &failure.message,
+                                self.context.started_at.elapsed().as_millis() as u64,
+                                issue_kind,
+                                None,
+                            );
+                            if issue_kind == HealthIssueKind::Model {
+                                push_diagnostic_log(
+                                    &self.context.state,
+                                    "warning",
+                                    "当前模型或分组暂不可用，未触发整个中转熔断",
+                                    Some(&self.context.provider_id),
+                                    self.context.model.as_deref(),
+                                    Some("model_temporarily_unavailable"),
+                                );
+                            }
+                        }
+                        CircuitImpact::None => {
+                            // max_output_tokens、内容过滤和普通业务失败均不降低线路健康度。
+                            record_incomplete_business_response(
+                                &self.context.state,
+                                &self.context.provider_id,
+                                self.context.started_at.elapsed().as_millis() as u64,
+                            );
+                        }
+                    }
                     let diagnostic = stream_diagnostic_detail(
                         &self.context.request_id,
                         &self.context.provider_id,
@@ -4940,7 +5345,14 @@ async fn health_probe(state: AppState, provider: ProviderConfig) {
     let url = match normalize_url(&provider.base_url, "/v1/models", None) {
         Ok(url) => url,
         Err(error) => {
-            let probe_state = mark_failure(&state, &provider.id, error.clone(), None, &policy);
+            let probe_state = record_degraded_issue(
+                &state,
+                &provider.id,
+                &error,
+                0,
+                HealthIssueKind::Configuration,
+                None,
+            );
             record_health_probe(&state, &provider.id, probe_state, None, Some(error));
             return;
         }
@@ -4959,12 +5371,31 @@ async fn health_probe(state: AppState, provider: ProviderConfig) {
     let latency = started.elapsed().as_millis() as u64;
     match result {
         Ok(response) if response.status().is_success() => {
-            let probe_state = mark_success(&state, &provider.id, latency);
+            let probe_state = mark_probe_success(&state, &provider.id, latency);
             record_health_probe(&state, &provider.id, probe_state, Some(latency), None);
         }
         Ok(response) => {
-            let error = format!("探测返回 {}", response.status());
-            let probe_state = mark_failure(&state, &provider.id, error.clone(), None, &policy);
+            let status = response.status();
+            let error = format!("探测返回 {status}");
+            let probe_state = if status.is_server_error() {
+                mark_provider_failure(
+                    &state,
+                    &provider.id,
+                    error.clone(),
+                    HealthIssueKind::Upstream,
+                    &policy,
+                )
+            } else {
+                // /models 的普通 4xx 只说明探测接口或鉴权异常，不能代表模型请求线路熔断。
+                record_degraded_issue(
+                    &state,
+                    &provider.id,
+                    &error,
+                    latency,
+                    HealthIssueKind::Configuration,
+                    None,
+                )
+            };
             record_health_probe(
                 &state,
                 &provider.id,
@@ -4975,7 +5406,13 @@ async fn health_probe(state: AppState, provider: ProviderConfig) {
         }
         Err(error) => {
             let error = error.to_string();
-            let probe_state = mark_failure(&state, &provider.id, error.clone(), None, &policy);
+            let probe_state = mark_provider_failure(
+                &state,
+                &provider.id,
+                error.clone(),
+                HealthIssueKind::Transport,
+                &policy,
+            );
             record_health_probe(
                 &state,
                 &provider.id,
@@ -5053,7 +5490,12 @@ async fn codex_usage_sync_loop(state: AppState) {
             tokio::task::spawn_blocking(move || codex_usage::sync_current(&store, retention_days))
                 .await;
         match result {
-            Ok(Ok(status)) if status.imported_count > 0 || status.matched_count > 0 => {
+            Ok(Ok(status))
+                if status.rebuild_performed
+                    || status.imported_count > 0
+                    || status.matched_count > 0
+                    || status.removed_stale_events > 0 =>
+            {
                 *state.codex_usage_status.lock().unwrap() = status.clone();
                 if let Some(app) = state.app_handle.as_ref() {
                     let _ = app.emit("usage-updated", &status);
@@ -5083,14 +5525,35 @@ fn list_providers(state: TauriState<'_, AppState>) -> Result<Vec<ProviderDto>, S
 }
 #[tauri::command]
 fn get_health_snapshots(state: TauriState<'_, AppState>) -> Result<Vec<HealthSnapshot>, String> {
-    let health = state
-        .health
-        .lock()
-        .map_err(|_| "健康状态不可用".to_string())?;
-    Ok(health
-        .iter()
-        .map(|(id, record)| health_snapshot(id, record))
-        .collect())
+    let (snapshots, half_open_ids) = {
+        let mut health = state
+            .health
+            .lock()
+            .map_err(|_| "健康状态不可用".to_string())?;
+        let mut half_open_ids = Vec::new();
+        let snapshots = health
+            .iter_mut()
+            .map(|(id, record)| {
+                // 查询时同步刷新冷却过期状态，避免页面一直显示为已熔断。
+                if refresh_circuit_state(record) {
+                    half_open_ids.push(id.clone());
+                }
+                health_snapshot(id, record)
+            })
+            .collect();
+        (snapshots, half_open_ids)
+    };
+    for id in half_open_ids {
+        push_diagnostic_log(
+            &state,
+            "info",
+            "中转冷却已结束，等待下一次真实请求进行半开试探",
+            Some(&id),
+            None,
+            Some("circuit_half_open"),
+        );
+    }
+    Ok(snapshots)
 }
 #[tauri::command]
 fn get_router_settings(state: TauriState<'_, AppState>) -> Result<RouterSettings, String> {
@@ -5882,18 +6345,43 @@ async fn test_provider(
     match result {
         Ok(response) if response.status().is_success() => {
             let latency = started.elapsed().as_millis() as u64;
-            mark_success(&state, &id, latency);
-            Ok(serde_json::json!({"ok": true, "message": "连接成功", "latency_ms": latency}))
+            mark_probe_success(&state, &id, latency);
+            Ok(serde_json::json!({"ok": true, "message": "基础连接正常", "latency_ms": latency}))
         }
         Ok(response) => {
-            let message = format!("上游返回 {}", response.status());
+            let latency = started.elapsed().as_millis() as u64;
+            let status = response.status();
+            let message = format!("上游返回 {status}");
             let policy = state.policy.read().unwrap().clone();
-            mark_failure(&state, &id, message.clone(), None, &policy);
+            if status.is_server_error() {
+                mark_provider_failure(
+                    &state,
+                    &id,
+                    message.clone(),
+                    HealthIssueKind::Upstream,
+                    &policy,
+                );
+            } else {
+                record_degraded_issue(
+                    &state,
+                    &id,
+                    &message,
+                    latency,
+                    HealthIssueKind::Configuration,
+                    None,
+                );
+            }
             Ok(serde_json::json!({"ok": false, "message": message}))
         }
         Err(error) => {
             let policy = state.policy.read().unwrap().clone();
-            mark_failure(&state, &id, error.to_string(), None, &policy);
+            mark_provider_failure(
+                &state,
+                &id,
+                error.to_string(),
+                HealthIssueKind::Transport,
+                &policy,
+            );
             Ok(serde_json::json!({"ok": false, "message": error.to_string()}))
         }
     }
@@ -6808,7 +7296,7 @@ mod tests {
                 "message": "Concurrency limit exceeded for account, please retry later"
             }
         });
-        let error = capacity_error_from_json(&value).expect("应识别账号并发限制");
+        let error = model_temporary_error_from_json(&value).expect("应识别账号并发限制");
         assert_eq!(error.code.as_deref(), Some("concurrency_limit_exceeded"));
     }
 
@@ -6929,7 +7417,7 @@ mod tests {
     }
 
     #[test]
-    fn identifies_only_structured_model_capacity_errors() {
+    fn identifies_structured_and_plain_model_temporary_errors() {
         let exact = serde_json::json!({
             "error": {
                 "code": "model_at_capacity",
@@ -6955,11 +7443,21 @@ mod tests {
                 "message": "Please retry later"
             }
         });
+        let unavailable_channel = serde_json::json!({
+            "error": {
+                "code": "no_available_channel",
+                "message": "No available channel for model gpt-test under group default"
+            }
+        });
 
-        assert!(capacity_error_from_json(&exact).is_some());
-        assert!(capacity_error_from_json(&responses_event).is_some());
-        assert!(capacity_error_from_json(&capacity_type).is_some());
-        assert!(capacity_error_from_json(&unrelated).is_none());
+        assert!(model_temporary_error_from_json(&exact).is_some());
+        assert!(model_temporary_error_from_json(&responses_event).is_some());
+        assert!(model_temporary_error_from_json(&capacity_type).is_some());
+        assert!(model_temporary_error_from_json(&unavailable_channel).is_some());
+        assert!(model_temporary_message_matches(
+            "No channel available for model gpt-test"
+        ));
+        assert!(model_temporary_error_from_json(&unrelated).is_none());
     }
 
     #[test]
@@ -7052,7 +7550,8 @@ mod tests {
     #[test]
     fn probe_history_is_bounded_and_ignores_regular_requests() {
         let state = test_state(Vec::new());
-        mark_success(&state, "provider", 20);
+        mark_response_started(&state, "provider", 20);
+        mark_response_completed(&state, "provider");
         assert!(state
             .health
             .lock()
@@ -7092,12 +7591,69 @@ mod tests {
     }
 
     #[test]
-    fn routing_policy_rejects_unbounded_retry_count() {
+    fn routing_policy_accepts_large_retry_count_and_unlimited_wait() {
         let policy = RoutingPolicy {
-            retry_count: 6,
+            retry_count: 1_000,
+            max_retry_wait_sec: 0,
+            capacity_retry_count: 1_000,
+            capacity_max_retry_wait_sec: 0,
             ..RoutingPolicy::default()
         };
-        assert!(validate_routing_policy(&policy).is_err());
+        assert!(validate_routing_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn retry_budget_zero_wait_limit_only_uses_retry_count() {
+        assert!(retry_budget_allows(999, 1_000, 86_400, 60, 0));
+        assert!(!retry_budget_allows(1_000, 1_000, 86_400, 60, 0));
+    }
+
+    #[test]
+    fn retry_budget_positive_wait_limit_stops_early() {
+        assert!(retry_budget_allows(2, 1_000, 20, 10, 30));
+        assert!(!retry_budget_allows(3, 1_000, 30, 10, 30));
+    }
+
+    #[test]
+    fn capacity_event_preserves_retry_counts_above_u8_range() {
+        let state = test_state(Vec::new());
+        initialize_test_settings(&state);
+        let provider = test_provider("primary", "http://127.0.0.1:1".to_string(), 1);
+        let attempts = (0..=300)
+            .map(|retry_count| RoutingAttempt {
+                provider_id: provider.id.clone(),
+                provider_name: provider.name.clone(),
+                status_code: Some(StatusCode::TOO_MANY_REQUESTS.as_u16()),
+                error: Some("capacity".to_string()),
+                latency_ms: Some(1),
+                retry_count,
+                switched: false,
+            })
+            .collect();
+        let capacity = ModelTemporaryError {
+            code: Some("model_at_capacity".to_string()),
+            message: "Selected model is at capacity".to_string(),
+        };
+
+        push_model_retry_event(
+            &state,
+            &provider,
+            Some("gpt-test"),
+            "/v1/responses",
+            128,
+            attempts,
+            &capacity,
+            false,
+            Some(StatusCode::TOO_MANY_REQUESTS.as_u16()),
+        );
+
+        let logs = state.logs.lock().unwrap();
+        let event = logs
+            .back()
+            .and_then(|entry| entry.routing_event.as_ref())
+            .expect("容量事件应写入路由日志");
+        assert_eq!(event.retry_count, 300);
+        assert_eq!(event.attempts.last().unwrap().retry_count, 300);
     }
 
     #[test]
@@ -7590,7 +8146,7 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .any(|entry| { entry.event_type.as_deref() == Some("capacity_recovered") }));
+            .any(|entry| { entry.event_type.as_deref() == Some("model_availability_recovered") }));
     }
 
     #[tokio::test]
@@ -8014,7 +8570,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_primary_circuit_returns_explicit_error_without_backup() {
+    async fn open_primary_circuit_is_bypassed_when_failover_is_disabled() {
         let (primary, primary_calls) = mock_counted_sequence(vec![(
             StatusCode::OK,
             r#"{"provider":"primary"}"#,
@@ -8040,14 +8596,173 @@ mod tests {
             },
         );
 
-        let response = call_test_gateway(state).await;
+        let response = call_test_gateway(state.clone()).await;
         let status = response.status();
         let body = response.into_body().collect().await.unwrap().to_bytes();
 
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(String::from_utf8_lossy(&body).contains("自动切换已关闭"));
-        assert_eq!(primary_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, Bytes::from_static(br#"{"provider":"primary"}"#));
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
         assert_eq!(backup_calls.load(Ordering::SeqCst), 0);
+        assert!(state.logs.lock().unwrap().iter().any(|entry| {
+            entry.event_type.as_deref() == Some("circuit_bypassed_failover_disabled")
+        }));
+    }
+
+    #[tokio::test]
+    async fn open_primary_circuit_is_skipped_when_failover_is_enabled() {
+        let (primary, primary_calls) = mock_counted_sequence(vec![(
+            StatusCode::OK,
+            r#"{"provider":"primary"}"#,
+            "application/json",
+        )])
+        .await;
+        let (backup, backup_calls) = mock_counted_sequence(vec![(
+            StatusCode::OK,
+            r#"{"provider":"backup"}"#,
+            "application/json",
+        )])
+        .await;
+        let state = test_state(vec![
+            test_provider("primary", primary, 1),
+            test_provider("backup", backup, 2),
+        ]);
+        state.policy.write().unwrap().allow_provider_failover = true;
+        state.health.lock().unwrap().insert(
+            "primary".to_string(),
+            HealthRecord {
+                state: HealthState::Open,
+                cooldown_until: Some(Utc::now() + Duration::minutes(5)),
+                last_issue_kind: HealthIssueKind::Transport,
+                ..HealthRecord::default()
+            },
+        );
+
+        let response = call_test_gateway(state).await;
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+
+        assert_eq!(body, Bytes::from_static(br#"{"provider":"backup"}"#));
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backup_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn unavailable_model_channel_retries_without_opening_provider_circuit() {
+        let body = r#"{"error":{"code":"no_available_channel","message":"No available channel for model gpt-test under group default"}}"#;
+        let (primary, primary_calls) = mock_counted_sequence(vec![(
+            StatusCode::SERVICE_UNAVAILABLE,
+            body,
+            "application/json",
+        )])
+        .await;
+        let (backup, backup_calls) = mock_counted_sequence(vec![(
+            StatusCode::OK,
+            r#"{"provider":"backup"}"#,
+            "application/json",
+        )])
+        .await;
+        let state = test_state(vec![
+            test_provider("primary", primary, 1),
+            test_provider("backup", backup, 2),
+        ]);
+        {
+            let mut policy = state.policy.write().unwrap();
+            policy.retry_count = 1;
+            policy.allow_provider_failover = true;
+            policy.circuit_failure_threshold = 1;
+        }
+
+        let response = call_test_gateway(state.clone()).await;
+        let response_body = response.into_body().collect().await.unwrap().to_bytes();
+
+        assert_eq!(response_body, Bytes::from_static(body.as_bytes()));
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(backup_calls.load(Ordering::SeqCst), 0);
+        let health = state.health.lock().unwrap();
+        let record = health.get("primary").unwrap();
+        assert_eq!(record.state, HealthState::Degraded);
+        assert_eq!(record.last_issue_kind, HealthIssueKind::Model);
+        assert_eq!(record.consecutive_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_does_not_open_provider_circuit() {
+        let upstream = mock_upstream(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"code":"rate_limit_exceeded","message":"slow down"}}"#,
+        )
+        .await;
+        let state = test_state(vec![test_provider("primary", upstream, 1)]);
+        {
+            let mut policy = state.policy.write().unwrap();
+            policy.retry_count = 0;
+            policy.circuit_failure_threshold = 1;
+        }
+
+        let response = call_test_gateway(state.clone()).await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let health = state.health.lock().unwrap();
+        let record = health.get("primary").unwrap();
+        assert_eq!(record.state, HealthState::Degraded);
+        assert_eq!(record.last_issue_kind, HealthIssueKind::RateLimit);
+        assert_eq!(record.consecutive_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn repeated_upstream_attempts_count_as_one_circuit_failure() {
+        let (upstream, calls) = mock_counted_sequence(vec![(
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":{"code":"service_unavailable","message":"temporary outage"}}"#,
+            "application/json",
+        )])
+        .await;
+        let state = test_state(vec![test_provider("primary", upstream, 1)]);
+        {
+            let mut policy = state.policy.write().unwrap();
+            policy.retry_count = 2;
+            policy.circuit_failure_threshold = 2;
+        }
+
+        let response = call_test_gateway(state.clone()).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let health = state.health.lock().unwrap();
+        let record = health.get("primary").unwrap();
+        assert_eq!(record.consecutive_failures, 1);
+        assert_eq!(record.state, HealthState::Degraded);
+        assert_eq!(record.last_issue_kind, HealthIssueKind::Upstream);
+    }
+
+    #[test]
+    fn probe_success_preserves_model_issue_and_expired_circuit_becomes_half_open() {
+        let state = test_state(Vec::new());
+        record_degraded_issue(
+            &state,
+            "provider",
+            "model unavailable",
+            10,
+            HealthIssueKind::Model,
+            None,
+        );
+
+        let probe_state = mark_probe_success(&state, "provider", 12);
+        assert_eq!(probe_state, HealthState::Degraded);
+        {
+            let health = state.health.lock().unwrap();
+            let record = health.get("provider").unwrap();
+            assert_eq!(record.last_issue_kind, HealthIssueKind::Model);
+        }
+
+        {
+            let mut health = state.health.lock().unwrap();
+            let record = health.get_mut("provider").unwrap();
+            record.state = HealthState::Open;
+            record.cooldown_until = Some(Utc::now() - Duration::seconds(1));
+            assert!(can_use(record));
+            assert_eq!(record.state, HealthState::HalfOpen);
+        }
     }
 
     #[tokio::test]

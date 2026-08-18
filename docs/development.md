@@ -132,8 +132,9 @@ cargo +stable-x86_64-pc-windows-gnu test --manifest-path src-tauri/Cargo.toml --
 网关集成测试应使用绑定到 `127.0.0.1:0` 的 Mock 上游，由系统分配临时端口。重点覆盖：
 
 - 408、429、5xx 和响应头超时。
-- 模型容量与账号并发错误只重试原中转。
-- 自动切换关闭时备用中转调用次数为零。
+- 模型、分组、容量与账号并发错误只重试原中转，且不累计线路熔断。
+- 自动切换关闭时，即使当前中转处于 `open` 也会真实访问当前线路，备用中转调用次数为零。
+- 自动切换开启时，线路级 `open` 中转被跳过，冷却到期后由真实请求完成半开试探。
 - 上游 413 和本地 200 MiB 限制的区别。
 - Responses SSE 分帧、合法终态、提前 EOF 和底层断流。
 - 输出前可重试、输出后不重放。
@@ -176,7 +177,7 @@ src-tauri/target/msvcrt-build/x86_64-pc-windows-gnu/release/bundle/nsis/
 便携版必须使用同一次 Release 的主程序和 `WebView2Loader.dll`：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File packaging/build-portable.ps1 -Version 0.3.5
+powershell -ExecutionPolicy Bypass -File packaging/build-portable.ps1 -Version 0.3.9
 ```
 
 脚本从以下目录读取文件：

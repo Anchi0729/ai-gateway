@@ -3,6 +3,16 @@ import { invoke } from "@tauri-apps/api/core";
 export type ProviderHealth =
   "healthy" | "degraded" | "open" | "half_open" | "unknown";
 
+export type HealthIssueKind =
+  | "none"
+  | "transport"
+  | "upstream"
+  | "model"
+  | "rate_limit"
+  | "stream"
+  | "payload"
+  | "configuration";
+
 export interface Provider {
   id: string;
   name: string;
@@ -29,6 +39,7 @@ export interface HealthSnapshot {
   latency_ms: number | null;
   consecutive_failures: number;
   last_error: string | null;
+  last_issue_kind: HealthIssueKind;
   cooldown_until: string | null;
   total_requests: number;
   successful_requests: number;
@@ -264,10 +275,18 @@ export interface CodexUsageSyncStatus {
   token_events_found: number;
   imported_count: number;
   matched_count: number;
+  official_events: number;
+  gateway_matched_events: number;
+  gateway_completed_events: number;
+  gateway_unmatched_ignored: number;
+  duplicate_events: number;
+  removed_stale_events: number;
+  unknown_mode_events: number;
   skipped_count: number;
   deferred_count: number;
   parser_version: number;
   rebuild_performed: boolean;
+  rebuild_status: "idle" | "pending" | "completed";
   warning_messages: string[];
 }
 

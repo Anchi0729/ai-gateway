@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useId, useState } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import {
@@ -16,6 +17,7 @@ import {
   Download,
   FileKey,
   Gauge,
+  Info,
   KeyRound,
   Minus,
   Pencil,
@@ -87,10 +89,22 @@ import { buildDemoData, buildDemoUsageStatistics } from "./demo";
 const statusLabels: Record<ProviderHealth, string> = {
   healthy: "运行正常",
   degraded: "性能下降",
-  open: "已熔断",
-  half_open: "恢复探测",
+  open: "近期不稳定",
+  half_open: "等待试探",
   unknown: "等待探测",
 };
+
+function monitorStatusLabel(
+  snapshot: HealthSnapshot | undefined,
+  failoverEnabled: boolean,
+) {
+  if (snapshot?.last_issue_kind === "model") return "模型暂不可用";
+  if (snapshot?.state === "open") {
+    return failoverEnabled ? "已熔断" : "近期不稳定";
+  }
+  if (snapshot?.state === "half_open") return "等待半开试探";
+  return statusLabels[snapshot?.state ?? "unknown"];
+}
 
 const MAX_HEALTH_PROBES = 24;
 const STATUS_REFRESH_MS = 15_000;
@@ -158,21 +172,23 @@ function configurationInputsEqual(
 }
 
 function validateConfigurationDraft(draft: ConfigurationInput) {
-  const checks: Array<[number, number, number, string]> = [
+  const checks: Array<[number, number, number | null, string]> = [
     [draft.port, 1024, 65535, "监听端口"],
     [draft.probe_interval_sec, 5, 3600, "健康探测间隔"],
     [draft.log_retention_days, 1, 365, "日志保留天数"],
     [draft.usage_retention_days, 30, 3650, "用量数据保留天数"],
-    [draft.routing_policy.retry_count, 0, 5, "重试次数"],
+    [draft.routing_policy.retry_count, 0, null, "重试次数"],
     [draft.routing_policy.retry_interval_sec, 1, 60, "重试间隔"],
-    [draft.routing_policy.max_retry_wait_sec, 1, 600, "最大累计等待"],
+    [draft.routing_policy.max_retry_wait_sec, 0, 600, "最大累计等待"],
     [draft.routing_policy.circuit_failure_threshold, 1, 10, "连续失败阈值"],
     [draft.routing_policy.circuit_cooldown_sec, 10, 3600, "熔断冷却时间"],
     [draft.routing_policy.payload_too_large_skip_sec, 0, 86400, "413 跳过时间"],
   ];
   for (const [value, min, max, label] of checks) {
-    if (!Number.isFinite(value) || value < min || value > max) {
-      return `${label}必须在 ${min} 到 ${max} 之间`;
+    if (!Number.isSafeInteger(value) || value < min || (max !== null && value > max)) {
+      return max === null
+        ? `${label}必须是大于等于 ${min} 的安全整数`
+        : `${label}必须在 ${min} 到 ${max} 之间`;
     }
   }
   return null;
@@ -399,22 +415,26 @@ function App() {
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    // 路由事件由 Rust 网关统一产生；容量重试只刷新日志，只有真实切换才显示 Toast。
+    // 路由事件由 Rust 网关统一产生；模型级重试只刷新日志，只有真实切换才显示 Toast。
     void listen<RoutingEvent>("routing-event", (event) => {
       const routingEvent = event.payload;
       const isAutoSwitch = routingEvent.event_type === "auto_switch";
-      const eventMessage = routingEvent.event_type === "capacity_recovered"
-        ? "模型容量恢复，同一中转重试成功"
-        : routingEvent.event_type === "capacity_exhausted"
-          ? "模型容量重试已耗尽"
+      const modelRecovered = routingEvent.event_type === "model_availability_recovered"
+        || routingEvent.event_type === "capacity_recovered";
+      const modelUnavailable = routingEvent.event_type === "model_temporarily_unavailable"
+        || routingEvent.event_type === "capacity_exhausted";
+      const eventMessage = modelRecovered
+        ? "模型或分组恢复，同一中转重试成功"
+        : modelUnavailable
+          ? "模型或分组暂不可用，重试已耗尽"
           : "主力中转不可用，已切换到备用中转";
       setLogs((current) => current.some((item) => item.routing_event?.id === routingEvent.id)
         ? current
         : [{
             timestamp: routingEvent.timestamp,
-            level: routingEvent.event_type === "capacity_recovered"
+            level: modelRecovered
               ? "info" as const
-              : routingEvent.event_type === "capacity_exhausted"
+              : modelUnavailable
                 ? "error" as const
                 : "warning" as const,
             message: eventMessage,
@@ -526,7 +546,7 @@ function App() {
     const result = await testProvider(provider.id);
     setNotice(
       result.ok
-        ? `${provider.name} 连接成功，延迟 ${result.latency_ms ?? "-"} ms`
+        ? `${provider.name} 基础连接正常，延迟 ${result.latency_ms ?? "-"} ms`
         : `${provider.name} 测试失败：${result.message}`,
     );
     await refresh();
@@ -874,7 +894,7 @@ function App() {
             <ShieldCheck size={16} />
             <span>仅本机访问</span>
           </div>
-          <span className="version">v0.3.4</span>
+          <span className="version">v0.3.8</span>
         </div>
       </aside>
       <main className="main-content">
@@ -925,6 +945,7 @@ function App() {
             routeGroup={routeGroup}
             runtime={runtime}
             logs={logs}
+            routingPolicy={routingPolicy}
             lastUpdatedAt={lastUpdatedAt}
             onOpenRoutingEvent={setRoutingDetail}
             onTest={(provider) => void handleTest(provider)}
@@ -1360,6 +1381,9 @@ function UsagePanel({
       ] as const
     : [];
   const syncStatus = statistics?.codex_sync_status;
+  const syncRebuilding = Boolean(
+    syncStatus?.state === "syncing" || syncStatus?.rebuild_status === "pending",
+  );
   const syncNeedsAttention = Boolean(
     syncError
     || syncStatus?.warning_messages.length,
@@ -1517,6 +1541,11 @@ function UsagePanel({
 
       {statistics ? (
         <>
+          {syncRebuilding && (
+            <section className="usage-sync-warning neutral">
+              <span>正在重新扫描 Codex 本地用量，旧解析器产生的记录暂不计入当前结果。</span>
+            </section>
+          )}
           {syncNeedsAttention && (
             <section className="usage-sync-warning">
               <span>{syncError ?? statistics.codex_sync_status.warning_messages[0] ?? "Codex 本地用量没有成功导入"}</span>
@@ -1528,9 +1557,19 @@ function UsagePanel({
             <span>
               Codex 本地同步：扫描 {statistics.codex_sync_status.files_scanned} 个文件，
               本轮发现 {statistics.codex_sync_status.token_events_found} 条用量，
-              新增 {statistics.codex_sync_status.imported_count} 条
-              {statistics.codex_sync_status.matched_count > 0
-                ? `，关联 ${statistics.codex_sync_status.matched_count} 条`
+              官方 {statistics.codex_sync_status.official_events} 条，
+              匹配网关 {statistics.codex_sync_status.gateway_matched_events} 条
+              {statistics.codex_sync_status.gateway_completed_events > 0
+                ? `（补全 ${statistics.codex_sync_status.gateway_completed_events} 条）`
+                : ""}
+              {statistics.codex_sync_status.gateway_unmatched_ignored > 0
+                ? `，未唯一匹配 ${statistics.codex_sync_status.gateway_unmatched_ignored} 条未计量`
+                : ""}
+              {statistics.codex_sync_status.duplicate_events > 0
+                ? `，去重 ${statistics.codex_sync_status.duplicate_events} 条`
+                : ""}
+              {statistics.codex_sync_status.removed_stale_events > 0
+                ? `，清理失效 ${statistics.codex_sync_status.removed_stale_events} 条`
                 : ""}
             </span>
             {statistics.codex_sync_status.rebuild_performed && <strong>已完成自动重建</strong>}
@@ -1662,6 +1701,7 @@ function MonitorPanel({
   routeGroup,
   runtime,
   logs,
+  routingPolicy,
   lastUpdatedAt,
   onOpenRoutingEvent,
   onTest,
@@ -1673,11 +1713,13 @@ function MonitorPanel({
   routeGroup: RouteGroup | null;
   runtime: RuntimeStats | null;
   logs: EventLog[];
+  routingPolicy: RoutingPolicy | null;
   lastUpdatedAt: Date | null;
   onOpenRoutingEvent: (event: RoutingEvent) => void;
   onTest: (provider: Provider) => void;
   onLock: (provider: Provider) => void;
 }) {
+  const failoverEnabled = routingPolicy?.allow_provider_failover === true;
   const enabledProviders = providers.filter((provider) => provider.enabled);
   const snapshots = new Map(
     health.map((snapshot) => [snapshot.provider_id, snapshot]),
@@ -1686,15 +1728,16 @@ function MonitorPanel({
     (provider) => snapshots.get(provider.id)?.state === "healthy",
   );
   const usableProviders = enabledProviders.filter(
-    (provider) => snapshots.get(provider.id)?.state !== "open",
+    (provider) =>
+      !failoverEnabled || snapshots.get(provider.id)?.state !== "open",
   );
   const lockedProvider = providers.find(
     (provider) => provider.id === routeGroup?.locked_provider_id,
   );
-  // 监控页按网关的实际候选规则展示当前路由：固定中转优先，否则选择首个未熔断的启用中转。
+  // 监控页与后端候选规则保持一致：关闭自动切换时，内部熔断不能改变用户当前选择。
   const activeProvider =
     (lockedProvider?.enabled &&
-    snapshots.get(lockedProvider.id)?.state !== "open"
+    (!failoverEnabled || snapshots.get(lockedProvider.id)?.state !== "open")
       ? lockedProvider
       : undefined) ?? usableProviders[0];
   const successRate = runtime?.total_requests
@@ -1721,11 +1764,15 @@ function MonitorPanel({
     overallTone = "checking";
   } else if (healthyProviders.length === enabledProviders.length) {
     overallTitle = "全部中转运行正常";
-    overallDescription = `${healthyProviders.length}/${enabledProviders.length} 个中转健康，自动故障转移已就绪`;
+    overallDescription = failoverEnabled
+      ? `${healthyProviders.length}/${enabledProviders.length} 个中转健康，自动故障转移已就绪`
+      : `${healthyProviders.length}/${enabledProviders.length} 个中转健康，自动切换当前关闭`;
     overallTone = "healthy";
   } else if (healthyProviders.length || usableProviders.length) {
     overallTitle = "路由可用，部分中转状态异常";
-    overallDescription = `${usableProviders.length}/${enabledProviders.length} 个中转仍可参与路由，异常中转将被自动跳过`;
+    overallDescription = failoverEnabled
+      ? `${usableProviders.length}/${enabledProviders.length} 个中转仍可参与路由，线路级异常中转将被自动跳过`
+      : "自动切换已关闭，新请求仍会继续尝试当前中转";
     overallTone = "degraded";
   } else {
     overallTitle = "所有中转当前不可用";
@@ -1848,9 +1895,13 @@ function MonitorPanel({
                           : "已停用"}
                     </span>
                   </div>
-                  <div className={`monitor-state ${state}`}>
+                  <div
+                    className={`monitor-state ${state === "open" && !failoverEnabled ? "degraded" : state}`}
+                  >
                     <span />
-                    {provider.enabled ? statusLabels[state] : "已停用"}
+                    {provider.enabled
+                      ? monitorStatusLabel(snapshot, failoverEnabled)
+                      : "已停用"}
                   </div>
                   <strong className="monitor-value">
                     {snapshot?.latency_ms ? `${snapshot.latency_ms} ms` : "--"}
@@ -1878,7 +1929,12 @@ function MonitorPanel({
                     </button>
                   </div>
                   {snapshot?.last_error && (
-                    <div className="monitor-row-error">{snapshot.last_error}</div>
+                    <div className="monitor-row-error">
+                      {snapshot.last_error}
+                      {!failoverEnabled && snapshot.state === "open"
+                        ? "。自动切换已关闭，新请求仍会继续尝试该中转"
+                        : ""}
+                    </div>
                   )}
                 </div>
               );
@@ -2577,7 +2633,156 @@ function ErrorHandlingMatrix() {
   );
 }
 
-function NumberStepper({ label, hint, value, min, max, onChange }: { label: string; hint?: string; value: number; min: number; max: number; onChange: (value: number) => void }) {
+function FieldHint({ label, hint }: { label: string; hint: string }) {
+  const tooltipId = useId();
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const tooltipRef = useRef<HTMLDivElement>(null);
+  const [open, setOpen] = useState(false);
+  const [pinned, setPinned] = useState(false);
+  const [position, setPosition] = useState<{ top: number; left: number; placement: "top" | "bottom" } | null>(null);
+
+  const updatePosition = useCallback(() => {
+    const trigger = triggerRef.current;
+    const tooltip = tooltipRef.current;
+    if (!trigger || !tooltip) return;
+
+    // Tooltip 通过 Portal 脱离面板裁剪，需要按视口空间决定上下方向并限制在窗口内。
+    const viewportPadding = 12;
+    const gap = 8;
+    const triggerRect = trigger.getBoundingClientRect();
+    const tooltipRect = tooltip.getBoundingClientRect();
+    const contentRect = trigger.closest(".main-content")?.getBoundingClientRect();
+    const preferredLeft = triggerRect.left + triggerRect.width / 2 - tooltipRect.width / 2;
+    const minLeft = Math.max(viewportPadding, (contentRect?.left ?? 0) + viewportPadding);
+    const contentRight = Math.min(window.innerWidth, contentRect?.right ?? window.innerWidth);
+    const maxLeft = Math.max(minLeft, contentRight - viewportPadding - tooltipRect.width);
+    const left = Math.min(Math.max(preferredLeft, minLeft), maxLeft);
+    const bottomTop = triggerRect.bottom + gap;
+    const hasRoomBelow = bottomTop + tooltipRect.height <= window.innerHeight - viewportPadding;
+    const placement = hasRoomBelow ? "bottom" : "top";
+    const top = placement === "bottom"
+      ? bottomTop
+      : Math.max(viewportPadding, triggerRect.top - gap - tooltipRect.height);
+
+    setPosition({ top, left, placement });
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!open) {
+      setPosition(null);
+      return;
+    }
+
+    updatePosition();
+    window.addEventListener("resize", updatePosition);
+    window.addEventListener("scroll", updatePosition, true);
+    return () => {
+      window.removeEventListener("resize", updatePosition);
+      window.removeEventListener("scroll", updatePosition, true);
+    };
+  }, [open, updatePosition]);
+
+  useEffect(() => {
+    if (!open) return;
+
+    function closeOnOutsidePointer(event: PointerEvent) {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (triggerRef.current?.contains(target) || tooltipRef.current?.contains(target)) return;
+      setPinned(false);
+      setOpen(false);
+    }
+
+    document.addEventListener("pointerdown", closeOnOutsidePointer, true);
+    return () => document.removeEventListener("pointerdown", closeOnOutsidePointer, true);
+  }, [open]);
+
+  const tooltip = open
+    ? createPortal(
+      <div
+        ref={tooltipRef}
+        id={tooltipId}
+        className="field-hint-tooltip"
+        role="tooltip"
+        data-placement={position?.placement ?? "bottom"}
+        style={{
+          top: position?.top ?? 0,
+          left: position?.left ?? 0,
+          visibility: position ? "visible" : "hidden",
+        }}
+      >
+        {hint}
+      </div>,
+      document.body,
+    )
+    : null;
+
+  return (
+    <>
+      <button
+        ref={triggerRef}
+        type="button"
+        className="field-hint-trigger"
+        aria-label={`${label}说明`}
+        aria-describedby={open ? tooltipId : undefined}
+        aria-expanded={open}
+        onPointerEnter={() => setOpen(true)}
+        onPointerLeave={() => {
+          if (!pinned && document.activeElement !== triggerRef.current) setOpen(false);
+        }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => {
+          setPinned(false);
+          setOpen(false);
+        }}
+        onClick={() => {
+          const nextPinned = !pinned;
+          setPinned(nextPinned);
+          setOpen(nextPinned);
+        }}
+        onKeyDown={(event) => {
+          if (event.key !== "Escape") return;
+          event.stopPropagation();
+          setPinned(false);
+          setOpen(false);
+        }}
+      >
+        <Info size={15} aria-hidden="true" />
+      </button>
+      {tooltip}
+    </>
+  );
+}
+
+function ConfigurationFieldRow({
+  label,
+  hint,
+  inputId,
+  children,
+  className = "",
+}: {
+  label: string;
+  hint?: string;
+  inputId?: string;
+  children: ReactNode;
+  className?: string;
+}) {
+  return (
+    <div className={`configuration-field-row ${className}`.trim()}>
+      <div className="configuration-field-copy">
+        <div className="configuration-field-label-line">
+          {inputId
+            ? <label className="field-label-text" htmlFor={inputId}>{label}</label>
+            : <span className="field-label-text">{label}</span>}
+          {hint && <FieldHint label={label} hint={hint} />}
+        </div>
+      </div>
+      <div className="configuration-field-control">{children}</div>
+    </div>
+  );
+}
+
+function NumberStepper({ label, hint, value, min, max, onChange }: { label: string; hint?: string; value: number; min: number; max?: number; onChange: (value: number) => void }) {
   const inputId = useId();
   const [draft, setDraft] = useState(String(value));
 
@@ -2585,8 +2790,12 @@ function NumberStepper({ label, hint, value, min, max, onChange }: { label: stri
     setDraft(String(value));
   }, [value]);
 
-  function clamp(next: number) {
-    return Math.min(max, Math.max(min, Math.round(next)));
+  function normalize(next: number) {
+    const rounded = Math.round(next);
+    if (!Number.isSafeInteger(rounded)) return null;
+    return max === undefined
+      ? Math.max(min, rounded)
+      : Math.min(max, Math.max(min, rounded));
   }
 
   function commitDraft() {
@@ -2596,11 +2805,11 @@ function NumberStepper({ label, hint, value, min, max, onChange }: { label: stri
       return;
     }
     const parsed = Number(draft);
-    if (!Number.isFinite(parsed)) {
+    const next = normalize(parsed);
+    if (next === null) {
       setDraft(String(value));
       return;
     }
-    const next = clamp(parsed);
     setDraft(String(next));
     if (next !== value) onChange(next);
   }
@@ -2608,7 +2817,8 @@ function NumberStepper({ label, hint, value, min, max, onChange }: { label: stri
   function stepBy(delta: number) {
     const parsed = Number(draft);
     const base = Number.isFinite(parsed) && draft.trim() ? parsed : value;
-    const next = clamp(base + delta);
+    const next = normalize(base + delta);
+    if (next === null) return;
     setDraft(String(next));
     if (next !== value) onChange(next);
   }
@@ -2617,8 +2827,7 @@ function NumberStepper({ label, hint, value, min, max, onChange }: { label: stri
   const current = Number.isFinite(numericDraft) && draft.trim() ? numericDraft : value;
 
   return (
-    <div className="field number-field">
-      <label className="field-label-text" htmlFor={inputId}>{label}</label>
+    <ConfigurationFieldRow label={label} hint={hint} inputId={inputId} className="number-field">
       <div className="number-stepper">
         <input
           id={inputId}
@@ -2631,7 +2840,13 @@ function NumberStepper({ label, hint, value, min, max, onChange }: { label: stri
             if (next === "" || /^\d+$/.test(next)) {
               setDraft(next);
               const parsed = Number(next);
-              if (next && parsed >= min && parsed <= max && parsed !== value) {
+              if (
+                next
+                && Number.isSafeInteger(parsed)
+                && parsed >= min
+                && (max === undefined || parsed <= max)
+                && parsed !== value
+              ) {
                 onChange(parsed);
               }
             }
@@ -2654,30 +2869,34 @@ function NumberStepper({ label, hint, value, min, max, onChange }: { label: stri
         <button type="button" title={`减少${label}`} aria-label={`减少${label}`} disabled={current <= min} onClick={() => stepBy(-1)}>
           <Minus size={14} />
         </button>
-        <button type="button" title={`增加${label}`} aria-label={`增加${label}`} disabled={current >= max} onClick={() => stepBy(1)}>
+        <button type="button" title={`增加${label}`} aria-label={`增加${label}`} disabled={max !== undefined && current >= max} onClick={() => stepBy(1)}>
           <Plus size={14} />
         </button>
       </div>
-      {hint && <small>{hint}</small>}
-    </div>
+    </ConfigurationFieldRow>
   );
 }
 
 function RoutingDetailModal({ event, onClose }: { event: RoutingEvent; onClose: () => void }) {
-  const isCapacityEvent = event.event_type === "capacity_recovered" || event.event_type === "capacity_exhausted";
+  const isModelRetryEvent = [
+    "model_availability_recovered",
+    "model_temporarily_unavailable",
+    "capacity_recovered",
+    "capacity_exhausted",
+  ].includes(event.event_type);
   const resultLabel = event.final_result === "switched"
     ? "已切换并成功"
-    : event.final_result === "capacity_recovered"
+    : event.final_result === "model_availability_recovered" || event.final_result === "capacity_recovered"
       ? "同一中转重试成功"
-      : event.final_result === "capacity_exhausted"
-        ? "容量重试已耗尽"
+      : event.final_result === "model_temporarily_unavailable" || event.final_result === "capacity_exhausted"
+        ? "模型级重试已耗尽"
         : event.final_result;
   return <div className="modal-backdrop" role="presentation" onClick={onClose}><div className="routing-modal panel" role="dialog" aria-modal="true" onClick={(click) => click.stopPropagation()}>
-    <div className="panel-heading"><div><p className="section-kicker">ROUTING DETAIL</p><h2>{isCapacityEvent ? "模型容量重试详情" : "自动切换处理详情"}</h2><p>{new Date(event.timestamp).toLocaleString("zh-CN")}</p></div><button className="icon-button" title="关闭详情" onClick={onClose}><X size={17} /></button></div>
+    <div className="panel-heading"><div><p className="section-kicker">ROUTING DETAIL</p><h2>{isModelRetryEvent ? "模型可用性重试详情" : "自动切换处理详情"}</h2><p>{new Date(event.timestamp).toLocaleString("zh-CN")}</p></div><button className="icon-button" title="关闭详情" onClick={onClose}><X size={17} /></button></div>
     <div className="routing-detail-body">
       <div className="routing-detail-grid"><DetailLine label="模型" value={event.model ?? "未提供"} /><DetailLine label="接口路径" value={event.request_path} /><DetailLine label="请求体大小" value={`${event.request_body_bytes.toLocaleString()} 字节`} /><DetailLine label="重试次数" value={String(event.retry_count)} /><DetailLine label="最终状态" value={event.status_code ? String(event.status_code) : "未收到响应"} /><DetailLine label="最终结果" value={resultLabel} /></div>
       <div className="routing-reason"><strong>处理原因</strong><span>{event.reason}</span></div>
-      <h3>{isCapacityEvent ? "同一中转重试过程" : "中转尝试过程"}</h3>
+      <h3>{isModelRetryEvent ? "同一中转重试过程" : "中转尝试过程"}</h3>
       <div className="attempt-list">{event.attempts.map((attempt, index) => <div className="attempt-row" key={`${attempt.provider_id}-${index}`}><span className="attempt-index">{index + 1}</span><div><strong>{attempt.provider_name}</strong><span>{attempt.error ?? `响应 ${attempt.status_code ?? "成功"}`} · {attempt.latency_ms ?? "--"} ms</span></div><b>{attempt.switched ? "已切换" : attempt.retry_count ? `重试 ${attempt.retry_count}` : "已尝试"}</b></div>)}</div>
     </div>
   </div></div>;
@@ -2967,6 +3186,12 @@ function ConfigurationCenter({
         : savedAt
           ? `已保存于 ${savedAt.toLocaleTimeString("zh-CN", { hour12: false })}`
           : "配置已同步";
+  const saveDetailText = saveError
+    ?? (policy.max_retry_wait_sec === 0 && policy.retry_count > 0
+      ? "当前重试不限制累计等待，将仅按配置的重试次数停止。"
+      : dirty
+        ? "离开配置中心前会提示保存或放弃修改。"
+        : "日志与用量保留期限立即生效，健康探测间隔在下一轮生效。");
 
   return (
     <form className="configuration-layout" onSubmit={submit} noValidate>
@@ -2979,12 +3204,14 @@ function ConfigurationCenter({
           </div>
         </div>
         <div className="configuration-body">
-          <div className="configuration-fields two-columns">
-            <label className="field">
-              <span>监听地址</span>
-              <input value="127.0.0.1" disabled />
-              <small>仅允许本机访问，不开放局域网监听。</small>
-            </label>
+          <div className="configuration-form-list">
+            <ConfigurationFieldRow
+              label="监听地址"
+              hint="仅允许本机访问，不开放局域网监听。"
+              inputId="gateway-bind-address"
+            >
+              <input id="gateway-bind-address" value="127.0.0.1" disabled />
+            </ConfigurationFieldRow>
             <NumberStepper
               label="监听端口"
               hint="允许 1024–65535，默认 8765；保存前会检查端口是否可用。"
@@ -3043,26 +3270,22 @@ function ConfigurationCenter({
               <p>探测间隔、日志和 Token 用量保留期限统一保存。</p>
             </div>
           </div>
-          <div className="configuration-body">
-          <NumberStepper label="健康探测间隔（秒）" hint="允许 5–3600 秒；正在等待的旧周期不会被强制中断。" value={draft.probe_interval_sec} min={5} max={3600} onChange={(value) => onChange({ ...draft, probe_interval_sec: value })} />
-          <NumberStepper label="运行日志保留天数" hint="允许 1–365 天，默认 7 天；缩短期限后立即清理超期日志。" value={draft.log_retention_days} min={1} max={365} onChange={(value) => onChange({ ...draft, log_retention_days: value })} />
-          <NumberStepper label="用量数据保留天数" hint="允许 30–3650 天，默认 365 天；仅保存 Token 数字，不保存请求正文。" value={draft.usage_retention_days} min={30} max={3650} onChange={(value) => onChange({ ...draft, usage_retention_days: value })} />
-          <div className="option-row">
-            <div>
-              <strong>开机自动启动</strong>
-              <span>登录 Windows 后自动在托盘运行本地网关</span>
-            </div>
-            <button
-              type="button"
-              className={`toggle ${draft.autostart_enabled ? "checked" : ""}`}
-              role="switch"
-              aria-checked={draft.autostart_enabled}
-              title={draft.autostart_enabled ? "关闭开机启动" : "开启开机启动"}
-              onClick={() => onChange({ ...draft, autostart_enabled: !draft.autostart_enabled })}
-            >
-              <span />
-            </button>
-          </div>
+          <div className="configuration-body configuration-form-list">
+            <NumberStepper label="健康探测间隔（秒）" hint="允许 5–3600 秒；正在等待的旧周期不会被强制中断。" value={draft.probe_interval_sec} min={5} max={3600} onChange={(value) => onChange({ ...draft, probe_interval_sec: value })} />
+            <NumberStepper label="运行日志保留天数" hint="允许 1–365 天，默认 7 天；缩短期限后立即清理超期日志。" value={draft.log_retention_days} min={1} max={365} onChange={(value) => onChange({ ...draft, log_retention_days: value })} />
+            <NumberStepper label="用量数据保留天数" hint="允许 30–3650 天，默认 365 天；仅保存 Token 数字，不保存请求正文。" value={draft.usage_retention_days} min={30} max={3650} onChange={(value) => onChange({ ...draft, usage_retention_days: value })} />
+            <ConfigurationFieldRow label="开机自动启动" hint="登录 Windows 后自动在托盘运行本地网关">
+              <button
+                type="button"
+                className={`toggle ${draft.autostart_enabled ? "checked" : ""}`}
+                role="switch"
+                aria-checked={draft.autostart_enabled}
+                title={draft.autostart_enabled ? "关闭开机启动" : "开启开机启动"}
+                onClick={() => onChange({ ...draft, autostart_enabled: !draft.autostart_enabled })}
+              >
+                <span />
+              </button>
+            </ConfigurationFieldRow>
           </div>
         </div>
 
@@ -3071,22 +3294,18 @@ function ConfigurationCenter({
             <div>
               <p className="section-kicker">RETRY</p>
               <h2>请求重试</h2>
-            <p>默认只在当前中转重试；只有开启自动切换后才会尝试备用中转。</p>
+              <p>默认只在当前中转重试；只有开启自动切换后才会尝试备用中转。</p>
             </div>
           </div>
-          <div className="configuration-body rules-fields">
-            <NumberStepper label="统一重试次数" hint="初始请求外最多再试 0–5 次；普通错误、容量和账号并发错误共用。" value={policy.retry_count} min={0} max={5} onChange={(value) => setPolicyNumber("retry_count", value)} />
+          <div className="configuration-body configuration-form-list">
+            <NumberStepper label="统一重试次数" hint="0 表示不重试，默认额外重试 5 次；不限制次数，较大的值会延长请求时间并产生更多日志。" value={policy.retry_count} min={0} onChange={(value) => setPolicyNumber("retry_count", value)} />
             <NumberStepper label="重试间隔（秒）" hint="429 和容量错误优先遵循 Retry-After。" value={policy.retry_interval_sec} min={1} max={60} onChange={(value) => setPolicyNumber("retry_interval_sec", value)} />
-            <NumberStepper label="最大累计等待（秒）" hint="超过该值停止重试；关闭自动切换时直接返回当前中转错误。" value={policy.max_retry_wait_sec} min={1} max={600} onChange={(value) => setPolicyNumber("max_retry_wait_sec", value)} />
-          </div>
-          <div className="option-row">
-            <div>
-              <strong>未识别临时错误兜底重试</strong>
-              <span>仅在尚未输出文本、推理或工具调用时生效。重试耗尽后是否尝试备用中转，服从“允许自动切换中转”总开关。</span>
-            </div>
-            <button type="button" className={`toggle ${policy.retry_unknown_transient_errors ? "checked" : ""}`} role="switch" aria-checked={policy.retry_unknown_transient_errors} title={policy.retry_unknown_transient_errors ? "关闭未知错误兜底重试" : "开启未知错误兜底重试"} onClick={() => onChange({ ...draft, routing_policy: { ...policy, retry_unknown_transient_errors: !policy.retry_unknown_transient_errors } })}>
-              <span />
-            </button>
+            <NumberStepper label="最大累计等待（秒）" hint="0 表示不限制累计等待；1–600 秒会在达到预算后提前停止重试。" value={policy.max_retry_wait_sec} min={0} max={600} onChange={(value) => setPolicyNumber("max_retry_wait_sec", value)} />
+            <ConfigurationFieldRow label="未识别临时错误兜底重试" hint="仅在尚未输出文本、推理或工具调用时生效；是否尝试备用中转仍服从自动切换总开关。">
+              <button type="button" className={`toggle ${policy.retry_unknown_transient_errors ? "checked" : ""}`} role="switch" aria-checked={policy.retry_unknown_transient_errors} title={policy.retry_unknown_transient_errors ? "关闭未知错误兜底重试" : "开启未知错误兜底重试"} onClick={() => onChange({ ...draft, routing_policy: { ...policy, retry_unknown_transient_errors: !policy.retry_unknown_transient_errors } })}>
+                <span />
+              </button>
+            </ConfigurationFieldRow>
           </div>
         </div>
       </div>
@@ -3099,29 +3318,21 @@ function ConfigurationCenter({
             <p>新请求立即使用保存后的规则，正在处理的请求保持旧策略。</p>
           </div>
         </div>
-        <div className="configuration-body">
-          <div className="configuration-fields three-columns">
-            <NumberStepper label="连续失败熔断阈值" value={policy.circuit_failure_threshold} min={1} max={10} onChange={(value) => setPolicyNumber("circuit_failure_threshold", value)} />
-            <NumberStepper label="熔断冷却时间（秒）" value={policy.circuit_cooldown_sec} min={10} max={3600} onChange={(value) => setPolicyNumber("circuit_cooldown_sec", value)} />
-            <NumberStepper label="413 相同/更大请求跳过（秒）" hint="更小请求仍会继续尝试该中转。" value={policy.payload_too_large_skip_sec} min={0} max={86400} onChange={(value) => setPolicyNumber("payload_too_large_skip_sec", value)} />
-          </div>
-          <div className="field segmented-field">
-            <span className="field-label-text">413 处理策略</span>
+        <div className="configuration-body configuration-form-list">
+          <NumberStepper label="连续失败熔断阈值" value={policy.circuit_failure_threshold} min={1} max={10} onChange={(value) => setPolicyNumber("circuit_failure_threshold", value)} />
+          <NumberStepper label="熔断冷却时间（秒）" value={policy.circuit_cooldown_sec} min={10} max={3600} onChange={(value) => setPolicyNumber("circuit_cooldown_sec", value)} />
+          <NumberStepper label="413 相同/更大请求跳过（秒）" hint="更小请求仍会继续尝试该中转。" value={policy.payload_too_large_skip_sec} min={0} max={86400} onChange={(value) => setPolicyNumber("payload_too_large_skip_sec", value)} />
+          <ConfigurationFieldRow label="413 处理策略" hint="只有打开“允许自动切换中转”且选择切换策略时，413 才会尝试备用中转。">
             <div className="segmented-control" role="group" aria-label="413 处理策略">
               <button type="button" aria-pressed={policy.payload_too_large_action === "failover"} className={policy.payload_too_large_action === "failover" ? "selected" : ""} onClick={() => onChange({ ...draft, routing_policy: { ...policy, payload_too_large_action: "failover" } })}>立即切换备用中转</button>
               <button type="button" aria-pressed={policy.payload_too_large_action === "return"} className={policy.payload_too_large_action === "return" ? "selected" : ""} onClick={() => onChange({ ...draft, routing_policy: { ...policy, payload_too_large_action: "return" } })}>直接返回 413</button>
             </div>
-            <small>只有打开“允许自动切换中转”且选择此项时，413 才会尝试备用中转。</small>
-          </div>
-          <div className="option-row">
-            <div>
-              <strong>允许自动切换中转</strong>
-              <span>默认关闭。关闭后始终坚持当前中转，熔断或重试耗尽也不会改走备用线路。</span>
-            </div>
+          </ConfigurationFieldRow>
+          <ConfigurationFieldRow label="允许自动切换中转" hint="默认关闭；关闭后熔断或重试耗尽也不会改走备用线路。">
             <button type="button" className={`toggle ${policy.allow_provider_failover ? "checked" : ""}`} role="switch" aria-checked={policy.allow_provider_failover} title={policy.allow_provider_failover ? "关闭自动切换中转" : "开启自动切换中转"} onClick={() => onChange({ ...draft, routing_policy: { ...policy, allow_provider_failover: !policy.allow_provider_failover } })}>
               <span />
             </button>
-          </div>
+          </ConfigurationFieldRow>
         </div>
       </div>
 
@@ -3130,7 +3341,7 @@ function ConfigurationCenter({
       <div className={`configuration-save-bar ${dirty ? "dirty" : ""} ${saveStatus === "error" ? "error" : ""}`}>
         <div>
           <strong>{statusText}</strong>
-          <span>{saveError ?? (dirty ? "离开配置中心前会提示保存或放弃修改。" : "日志与用量保留期限立即生效，健康探测间隔在下一轮生效。")}</span>
+          <span>{saveDetailText}</span>
         </div>
         <button className="primary-button" disabled={!dirty || saveStatus === "saving"}>
           <Save size={15} />
