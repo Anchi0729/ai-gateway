@@ -1,6 +1,6 @@
 [package]
 name = "ai-gateway"
-version = "0.3.9"
+version = "0.3.10"
 description = "Local failover gateway for OpenAI-compatible providers"
 authors = ["AI Gateway"]
 edition = "2021"

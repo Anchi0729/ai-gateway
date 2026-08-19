@@ -177,7 +177,7 @@ src-tauri/target/msvcrt-build/x86_64-pc-windows-gnu/release/bundle/nsis/
 便携版必须使用同一次 Release 的主程序和 `WebView2Loader.dll`：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File packaging/build-portable.ps1 -Version 0.3.9
+powershell -ExecutionPolicy Bypass -File packaging/build-portable.ps1 -Version 0.3.10
 ```
 
 脚本从以下目录读取文件：

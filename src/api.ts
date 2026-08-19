@@ -99,6 +99,7 @@ export interface RoutingPolicy {
   retry_count: number;
   retry_interval_sec: number;
   max_retry_wait_sec: number;
+  codex_stream_max_retries: number;
   retry_unknown_transient_errors: boolean;
   allow_provider_failover: boolean;
   capacity_retry_count: number;
@@ -143,6 +144,7 @@ export interface ConfigurationSnapshot {
   router_settings: RouterSettings;
   routing_policy: RoutingPolicy;
   autostart_enabled: boolean;
+  codex_restart_required: boolean;
 }
 
 export interface ConfigurationInput {

@@ -198,6 +198,7 @@ export function buildDemoData(): DemoData {
     retry_count: 5,
     retry_interval_sec: 1,
     max_retry_wait_sec: 30,
+    codex_stream_max_retries: 5,
     retry_unknown_transient_errors: true,
     allow_provider_failover: false,
     capacity_retry_count: 5,

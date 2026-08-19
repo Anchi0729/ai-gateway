@@ -161,6 +161,7 @@ pub struct ConfigurationSnapshot {
     pub router_settings: RouterSettings,
     pub routing_policy: RoutingPolicy,
     pub autostart_enabled: bool,
+    pub codex_restart_required: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -317,6 +318,8 @@ pub struct RoutingPolicy {
     pub retry_count: u64,
     pub retry_interval_sec: u64,
     pub max_retry_wait_sec: u64,
+    /// Codex 已收到业务输出后，由客户端自行恢复 SSE 的次数；不参与网关请求重试。
+    pub codex_stream_max_retries: u64,
     pub retry_unknown_transient_errors: bool,
     pub allow_provider_failover: bool,
     // 旧版备份仍包含容量专用字段；保存时与统一重试配置同步，避免破坏格式版本 1。
@@ -336,6 +339,7 @@ impl Default for RoutingPolicy {
             retry_count: 5,
             retry_interval_sec: 1,
             max_retry_wait_sec: 30,
+            codex_stream_max_retries: 5,
             retry_unknown_transient_errors: true,
             allow_provider_failover: false,
             capacity_retry_count: 5,
@@ -796,9 +800,31 @@ impl AppState {
             gateway_listening: false,
             gateway_error: None,
         };
+        let managed_hash = setting(&store, "codex_managed_config_hash")?;
+        let codex_configuration = gateway_codex_configuration(&settings, &policy);
+        if let Some(updated_hash) = codex_integration::migrate_legacy_stream_retries(
+            &codex_configuration,
+            managed_hash.as_deref(),
+        )? {
+            let persist_result = persist_codex_retry_migration_metadata(&store, &updated_hash);
+            if let Err(error) = persist_result {
+                let mut legacy_configuration = codex_configuration.clone();
+                legacy_configuration.stream_max_retries = 2;
+                codex_integration::update_managed_gateway_configuration(
+                    &codex_configuration,
+                    &legacy_configuration,
+                )
+                .map_err(|rollback_error| {
+                    format!(
+                        "Codex 流恢复配置升级元数据保存失败：{error}；配置回滚也失败：{rollback_error}"
+                    )
+                })?;
+                warn!(%error, "Codex stream retry migration rolled back");
+            }
+        }
         if setting(&store, "codex_mode_history_initialized")?.is_none() {
             // 升级后的第一条模式基线来自当前 config.toml；无法检测时保持为空，避免猜错旧历史来源。
-            let configuration = gateway_codex_configuration(&settings);
+            let configuration = gateway_codex_configuration(&settings, &policy);
             let mode = codex_integration::integration_state(
                 &configuration,
                 codex_integration::CodexEnvironmentStatus {
@@ -983,6 +1009,38 @@ fn save_setting(store: &Store, key: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn persist_codex_retry_migration_metadata(store: &Store, hash: &str) -> Result<(), String> {
+    let mut connection = store
+        .connection
+        .lock()
+        .map_err(|_| "数据库锁已损坏".to_string())?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    // 指纹和一次性提醒必须同时提交，否则下一次启动无法可靠判断自动升级是否完成。
+    for (key, value) in [
+        ("codex_managed_config_hash", hash),
+        ("codex_restart_notice_pending", "true"),
+    ] {
+        transaction
+            .execute(
+                "INSERT INTO settings(key,value) VALUES(?1,?2)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![key, value],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn take_codex_restart_notice(store: &Store) -> Result<bool, String> {
+    let pending = setting(store, "codex_restart_notice_pending")?.as_deref() == Some("true");
+    if pending {
+        save_setting(store, "codex_restart_notice_pending", "false")?;
+    }
+    Ok(pending)
+}
+
 fn migrate_unified_retry_policy(store: &Store) -> Result<(), String> {
     if setting(store, "unified_retry_policy_v1")?.is_some() {
         return Ok(());
@@ -1003,6 +1061,10 @@ fn migrate_unified_retry_policy(store: &Store) -> Result<(), String> {
         (
             "max_retry_wait_sec",
             defaults.max_retry_wait_sec.to_string(),
+        ),
+        (
+            "codex_stream_max_retries",
+            defaults.codex_stream_max_retries.to_string(),
         ),
         (
             "allow_provider_failover",
@@ -1049,6 +1111,9 @@ fn load_routing_policy(store: &Store) -> Result<RoutingPolicy, String> {
         max_retry_wait_sec: value("max_retry_wait_sec")?
             .and_then(|item| item.parse().ok())
             .unwrap_or(defaults.max_retry_wait_sec),
+        codex_stream_max_retries: value("codex_stream_max_retries")?
+            .and_then(|item| item.parse().ok())
+            .unwrap_or(defaults.codex_stream_max_retries),
         retry_unknown_transient_errors: value("retry_unknown_transient_errors")?
             .and_then(|item| item.parse().ok())
             .unwrap_or(defaults.retry_unknown_transient_errors),
@@ -1105,6 +1170,9 @@ fn validate_routing_policy(policy: &RoutingPolicy) -> Result<(), String> {
     }
     if policy.max_retry_wait_sec > 600 {
         return Err("单次请求最大重试等待必须在 0 到 600 秒之间".to_string());
+    }
+    if policy.codex_stream_max_retries > MAX_SAFE_CONFIG_INTEGER {
+        return Err("Codex 流恢复次数超出可安全保存的整数范围".to_string());
     }
     if policy.capacity_retry_count > MAX_SAFE_CONFIG_INTEGER {
         return Err("模型容量重试次数超出可安全保存的整数范围".to_string());
@@ -1167,6 +1235,10 @@ fn routing_policy_values(policy: &RoutingPolicy) -> Vec<(&'static str, String)> 
         ("retry_count", policy.retry_count.to_string()),
         ("retry_interval_sec", policy.retry_interval_sec.to_string()),
         ("max_retry_wait_sec", policy.max_retry_wait_sec.to_string()),
+        (
+            "codex_stream_max_retries",
+            policy.codex_stream_max_retries.to_string(),
+        ),
         (
             "retry_unknown_transient_errors",
             policy.retry_unknown_transient_errors.to_string(),
@@ -5565,20 +5637,27 @@ fn get_routing_policy(state: TauriState<'_, AppState>) -> Result<RoutingPolicy, 
     Ok(state.policy.read().unwrap().clone())
 }
 
-fn configuration_snapshot(state: &AppState, autostart_enabled: bool) -> ConfigurationSnapshot {
+fn configuration_snapshot(
+    state: &AppState,
+    autostart_enabled: bool,
+    codex_restart_required: bool,
+) -> ConfigurationSnapshot {
     ConfigurationSnapshot {
         router_settings: state.settings.read().unwrap().clone(),
         routing_policy: state.policy.read().unwrap().clone(),
         autostart_enabled,
+        codex_restart_required,
     }
 }
 
 fn gateway_codex_configuration(
     settings: &RouterSettings,
+    policy: &RoutingPolicy,
 ) -> codex_integration::GatewayCodexConfiguration {
     codex_integration::GatewayCodexConfiguration {
         port: settings.port,
         local_token: settings.local_token.clone(),
+        stream_max_retries: policy.codex_stream_max_retries,
     }
 }
 
@@ -5624,7 +5703,10 @@ fn persist_codex_management_metadata(
 fn get_codex_integration_state(
     state: TauriState<'_, AppState>,
 ) -> codex_integration::CodexIntegrationState {
-    let configuration = gateway_codex_configuration(&state.settings.read().unwrap());
+    let configuration = gateway_codex_configuration(
+        &state.settings.read().unwrap(),
+        &state.policy.read().unwrap(),
+    );
     let environment = state.codex_environment_status.lock().unwrap().clone();
     codex_integration::integration_state(&configuration, environment)
 }
@@ -5633,7 +5715,10 @@ fn get_codex_integration_state(
 fn refresh_codex_login_status(
     state: TauriState<'_, AppState>,
 ) -> codex_integration::CodexIntegrationState {
-    let configuration = gateway_codex_configuration(&state.settings.read().unwrap());
+    let configuration = gateway_codex_configuration(
+        &state.settings.read().unwrap(),
+        &state.policy.read().unwrap(),
+    );
     let environment = codex_integration::environment_status();
     *state.codex_environment_status.lock().unwrap() = environment.clone();
     codex_integration::integration_state(&configuration, environment)
@@ -5693,7 +5778,10 @@ fn switch_codex_connection_mode(
     mode: codex_integration::CodexConnectionMode,
     state: TauriState<'_, AppState>,
 ) -> Result<codex_integration::SwitchCodexModeResult, String> {
-    let configuration = gateway_codex_configuration(&state.settings.read().unwrap());
+    let configuration = gateway_codex_configuration(
+        &state.settings.read().unwrap(),
+        &state.policy.read().unwrap(),
+    );
     let mut result = codex_integration::switch_mode(mode, &configuration)?;
     if result.changed {
         if let Err(error) = persist_codex_management_metadata(&state, true) {
@@ -5737,7 +5825,10 @@ fn switch_codex_connection_mode(
 fn repair_codex_gateway_configuration(
     state: TauriState<'_, AppState>,
 ) -> Result<codex_integration::SwitchCodexModeResult, String> {
-    let configuration = gateway_codex_configuration(&state.settings.read().unwrap());
+    let configuration = gateway_codex_configuration(
+        &state.settings.read().unwrap(),
+        &state.policy.read().unwrap(),
+    );
     let mut result = codex_integration::repair_gateway_configuration(&configuration)?;
     if result.changed {
         if let Err(error) = persist_codex_management_metadata(&state, true) {
@@ -5798,7 +5889,12 @@ fn get_configuration(
         .autolaunch()
         .is_enabled()
         .map_err(|error| format!("无法读取开机启动状态：{error}"))?;
-    Ok(configuration_snapshot(&state, autostart_enabled))
+    let codex_restart_required = take_codex_restart_notice(&state.store)?;
+    Ok(configuration_snapshot(
+        &state,
+        autostart_enabled,
+        codex_restart_required,
+    ))
 }
 
 async fn apply_configuration(
@@ -5815,11 +5911,14 @@ async fn apply_configuration(
     // 新端口必须在任何持久化之前完成预绑定；失败时旧监听和全部配置保持不变。
     let listener = prepare_gateway_listener(state, input.port).await?;
     let previous_settings = state.settings.read().unwrap().clone();
+    let previous_policy = state.policy.read().unwrap().clone();
+    let next_policy = normalized_routing_policy(&input.routing_policy);
     let previous_port = previous_settings.port;
-    let previous_codex = gateway_codex_configuration(&previous_settings);
+    let previous_codex = gateway_codex_configuration(&previous_settings, &previous_policy);
     let next_codex = codex_integration::GatewayCodexConfiguration {
         port: input.port,
         local_token: previous_settings.local_token.clone(),
+        stream_max_retries: next_policy.codex_stream_max_retries,
     };
     let autolaunch = app.autolaunch();
     let current_autostart = autolaunch
@@ -5844,9 +5943,9 @@ async fn apply_configuration(
         return Err("开机启动状态未按预期生效，未保存其他配置".to_string());
     }
 
-    // 第三方接管时，Codex Provider 与监听端口是一份配置。所有外部状态都先保留旧值，
-    // 后续任一步失败都会补偿恢复，确保旧监听、SQLite 与 Codex 配置仍指向同一端口。
-    let codex_configuration_changed = if previous_codex.port != next_codex.port {
+    // 第三方接管时，端口、令牌和流恢复次数共同构成受管 Provider。
+    // 所有外部状态先保留旧值，后续任一步失败都会补偿恢复。
+    let codex_configuration_changed = if previous_codex != next_codex {
         match codex_integration::update_managed_gateway_configuration(&previous_codex, &next_codex)
         {
             Ok(result) => result.is_some(),
@@ -5861,14 +5960,19 @@ async fn apply_configuration(
         false
     };
     if let Err(error) = save_configuration_state(state, &input) {
-        if codex_configuration_changed {
-            let _ = codex_integration::update_managed_gateway_configuration(
-                &next_codex,
-                &previous_codex,
-            );
-        }
+        let codex_rollback_error = if codex_configuration_changed {
+            codex_integration::update_managed_gateway_configuration(&next_codex, &previous_codex)
+                .err()
+        } else {
+            None
+        };
         if current_autostart != input.autostart_enabled {
             let _ = set_autostart(current_autostart);
+        }
+        if let Some(rollback_error) = codex_rollback_error {
+            return Err(format!(
+                "配置保存失败：{error}；Codex 配置回滚也失败：{rollback_error}"
+            ));
         }
         return Err(error);
     }
@@ -5895,7 +5999,11 @@ async fn apply_configuration(
     } else {
         push_log(state, "info", "配置中心设置已更新", None);
     }
-    Ok(configuration_snapshot(state, actual_autostart))
+    Ok(configuration_snapshot(
+        state,
+        actual_autostart,
+        codex_configuration_changed,
+    ))
 }
 
 #[tauri::command]
@@ -5914,8 +6022,38 @@ fn save_routing_policy(
 ) -> Result<RoutingPolicy, String> {
     let policy = normalized_routing_policy(&policy);
     validate_routing_policy(&policy)?;
-    persist_routing_policy(&state.store, &policy)?;
+    let previous_policy = state.policy.read().unwrap().clone();
+    let settings = state.settings.read().unwrap().clone();
+    let previous_codex = gateway_codex_configuration(&settings, &previous_policy);
+    let next_codex = gateway_codex_configuration(&settings, &policy);
+    let codex_configuration_changed = if previous_codex != next_codex {
+        codex_integration::update_managed_gateway_configuration(&previous_codex, &next_codex)?
+            .is_some()
+    } else {
+        false
+    };
+    if let Err(error) = persist_routing_policy(&state.store, &policy) {
+        if codex_configuration_changed {
+            if let Err(rollback_error) = codex_integration::update_managed_gateway_configuration(
+                &next_codex,
+                &previous_codex,
+            ) {
+                return Err(format!(
+                    "路由配置保存失败：{error}；Codex 配置回滚也失败：{rollback_error}"
+                ));
+            }
+        }
+        return Err(error);
+    }
     *state.policy.write().unwrap() = policy.clone();
+    if codex_configuration_changed {
+        if let Err(error) = persist_codex_management_metadata(&state, false) {
+            warn!(%error, "Codex managed configuration metadata update failed");
+        }
+        if let Err(error) = save_setting(&state.store, "codex_restart_notice_pending", "true") {
+            warn!(%error, "Codex restart notice persistence failed");
+        }
+    }
     push_log(&state, "info", "路由错误处理规则已更新", None);
     Ok(policy)
 }
@@ -7475,6 +7613,7 @@ mod tests {
         let mut policy: RoutingPolicy = serde_json::from_value(old).unwrap();
         synchronize_legacy_retry_fields(&mut policy);
         assert_eq!(policy.capacity_retry_count, policy.retry_count);
+        assert_eq!(policy.codex_stream_max_retries, 5);
         assert!(policy.retry_unknown_transient_errors);
         assert_eq!(
             policy.capacity_retry_interval_sec,
@@ -7594,6 +7733,7 @@ mod tests {
     fn routing_policy_accepts_large_retry_count_and_unlimited_wait() {
         let policy = RoutingPolicy {
             retry_count: 1_000,
+            codex_stream_max_retries: 1_000,
             max_retry_wait_sec: 0,
             capacity_retry_count: 1_000,
             capacity_max_retry_wait_sec: 0,

@@ -131,6 +131,7 @@ const DEFAULT_ROUTING_POLICY: RoutingPolicy = {
   retry_count: 5,
   retry_interval_sec: 1,
   max_retry_wait_sec: 30,
+  codex_stream_max_retries: 5,
   retry_unknown_transient_errors: true,
   allow_provider_failover: false,
   capacity_retry_count: 5,
@@ -180,6 +181,7 @@ function validateConfigurationDraft(draft: ConfigurationInput) {
     [draft.routing_policy.retry_count, 0, null, "重试次数"],
     [draft.routing_policy.retry_interval_sec, 1, 60, "重试间隔"],
     [draft.routing_policy.max_retry_wait_sec, 0, 600, "最大累计等待"],
+    [draft.routing_policy.codex_stream_max_retries, 0, null, "Codex 流恢复次数"],
     [draft.routing_policy.circuit_failure_threshold, 1, 10, "连续失败阈值"],
     [draft.routing_policy.circuit_cooldown_sec, 10, 3600, "熔断冷却时间"],
     [draft.routing_policy.payload_too_large_skip_sec, 0, 86400, "413 跳过时间"],
@@ -327,6 +329,13 @@ function App() {
       setLogs(events);
       setCodexState(nextCodexState);
       setLastUpdatedAt(new Date());
+      if (nextConfiguration.codex_restart_required) {
+        setNotice({
+          level: "warning",
+          title: "Codex 流恢复配置已升级",
+          message: "配置已修改，请完全退出并重新启动 Codex。",
+        });
+      }
     } catch {
       // demo 查询参数只用于普通浏览器视觉验收，打包后的桌面应用不会使用演示数据。
       if (import.meta.env.DEV && location.search.includes("demo=1")) {
@@ -339,6 +348,7 @@ function App() {
           router_settings: demo.settings,
           routing_policy: demo.routingPolicy,
           autostart_enabled: false,
+          codex_restart_required: false,
         });
         setRouteGroup(demo.routeGroup);
         setRuntime(demo.runtime);
@@ -721,13 +731,21 @@ function App() {
       setRoutingPolicy(next.routing_policy);
       setConfigurationSaveStatus("saved");
       setConfigurationSavedAt(new Date());
-      setNotice(previousPort !== next.router_settings.port
+      setNotice(next.codex_restart_required
         ? {
+            level: "warning",
+            title: "Codex 流恢复配置已修改",
+            message: previousPort !== next.router_settings.port
+              ? `配置已修改，请完全退出并重新启动 Codex；本地网关已切换至 127.0.0.1:${next.router_settings.port}，同时更新 cc-switch 的 Base URL。`
+              : "配置已修改，请完全退出并重新启动 Codex。",
+          }
+        : previousPort !== next.router_settings.port
+          ? {
             level: "warning",
             title: "本地网关端口已切换",
             message: `已切换至 127.0.0.1:${next.router_settings.port}，请将 cc-switch 的 Base URL 更新为 http://127.0.0.1:${next.router_settings.port}/v1。API Key 保持不变。`,
           }
-        : "配置中心已保存，日志与用量保留期限已立即生效");
+          : "配置中心已保存，日志与用量保留期限已立即生效");
       return true;
     } catch (error) {
       if (import.meta.env.DEV && location.search.includes("demo=1") && settings) {
@@ -741,6 +759,7 @@ function App() {
           },
           routing_policy: { ...configurationDraft.routing_policy },
           autostart_enabled: configurationDraft.autostart_enabled,
+          codex_restart_required: false,
         };
         setConfigurationSnapshot(next);
         setConfigurationDraft(configurationInputFromSnapshot(next));
@@ -894,7 +913,7 @@ function App() {
             <ShieldCheck size={16} />
             <span>仅本机访问</span>
           </div>
-          <span className="version">v0.3.8</span>
+          <span className="version">v0.3.10</span>
         </div>
       </aside>
       <main className="main-content">
@@ -3301,6 +3320,7 @@ function ConfigurationCenter({
             <NumberStepper label="统一重试次数" hint="0 表示不重试，默认额外重试 5 次；不限制次数，较大的值会延长请求时间并产生更多日志。" value={policy.retry_count} min={0} onChange={(value) => setPolicyNumber("retry_count", value)} />
             <NumberStepper label="重试间隔（秒）" hint="429 和容量错误优先遵循 Retry-After。" value={policy.retry_interval_sec} min={1} max={60} onChange={(value) => setPolicyNumber("retry_interval_sec", value)} />
             <NumberStepper label="最大累计等待（秒）" hint="0 表示不限制累计等待；1–600 秒会在达到预算后提前停止重试。" value={policy.max_retry_wait_sec} min={0} max={600} onChange={(value) => setPolicyNumber("max_retry_wait_sec", value)} />
+            <NumberStepper label="Codex 流恢复次数" hint="用于已经开始输出后的 SSE 断流恢复，默认 5 次；修改后需要完全退出并重新启动 Codex。普通请求仍由 AI Gateway 重试。" value={policy.codex_stream_max_retries} min={0} onChange={(value) => setPolicyNumber("codex_stream_max_retries", value)} />
             <ConfigurationFieldRow label="未识别临时错误兜底重试" hint="仅在尚未输出文本、推理或工具调用时生效；是否尝试备用中转仍服从自动切换总开关。">
               <button type="button" className={`toggle ${policy.retry_unknown_transient_errors ? "checked" : ""}`} role="switch" aria-checked={policy.retry_unknown_transient_errors} title={policy.retry_unknown_transient_errors ? "关闭未知错误兜底重试" : "开启未知错误兜底重试"} onClick={() => onChange({ ...draft, routing_policy: { ...policy, retry_unknown_transient_errors: !policy.retry_unknown_transient_errors } })}>
                 <span />

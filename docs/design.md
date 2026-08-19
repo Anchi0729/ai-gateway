@@ -67,7 +67,7 @@ Responses SSE 需要观察合法终态：
 
 Chat Completions 继续遵循自身的 `[DONE]` 结束语义。SSE 事件达到语义观察上限时会降级为原始透传，不让诊断缓冲影响响应内容或内存使用。
 
-输出前只暂存生命周期事件，尚未产生文本、推理或工具调用时可以安全重试。输出开始后不再重放当前请求；底层断流只影响当前响应和后续健康状态，Codex 可使用有限的 `stream_max_retries` 尝试恢复。
+输出前只暂存生命周期事件，尚未产生文本、推理或工具调用时可以安全重试。输出开始后不再重放当前请求；底层断流只影响当前响应和后续健康状态，Codex 按独立的 `stream_max_retries`配置尝试恢复，默认 5 次。
 
 ## 路由、重试和故障转移
 
@@ -118,8 +118,10 @@ requires_openai_auth = true
 ```toml
 base_url = "http://127.0.0.1:<port>/v1"
 request_max_retries = 0
-stream_max_retries = 2
+stream_max_retries = <配置中心保存值，默认 5>
 ```
+
+`request_max_retries`固定为 0，避免 Codex 与网关对普通请求形成双层重试。`codex_stream_max_retries`只负责已经产生业务输出后的 SSE 恢复，`0`表示关闭，不参与网关的次数和等待预算。旧版受管 Provider 只有在配置指纹仍匹配时才会自动从 2 升级；无法证明归属时保持只读并提示修复。
 
 模式切换需要重启 Codex，但第三方中转池内部切换只改变网关的内存路由快照，不修改 `config.toml`，因此不需要重启 Codex。
 

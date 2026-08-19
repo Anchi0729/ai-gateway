@@ -35,7 +35,7 @@ Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8765/healthz
 - 是否已经产生业务输出。
 - 当前尝试次数和处理结果。
 
-输出前的可重试错误会按配置重试当前中转；输出已经开始后，网关不会重放请求，以避免重复工具调用和重复计费。Codex 侧可以进行最多 2 次有限流恢复。
+输出前的可重试错误会按配置重试当前中转；输出已经开始后，网关不会重放请求，以避免重复工具调用和重复计费。Codex 侧按“Codex 流恢复次数”继续处理，默认最多恢复 5 次；修改该值后需要完全退出并重新启动 Codex。
 
 ## `stream closed before response.completed`
 

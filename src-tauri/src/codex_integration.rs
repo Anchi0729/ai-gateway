@@ -107,10 +107,11 @@ pub struct SwitchCodexModeResult {
     pub warning_messages: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GatewayCodexConfiguration {
     pub port: u16,
     pub local_token: String,
+    pub stream_max_retries: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -256,9 +257,21 @@ fn is_gateway_provider_shape(table: &Table) -> bool {
         && base_url_is_local_gateway
         && table.get("wire_api").and_then(Item::as_str) == Some("responses")
         && table.get("requires_openai_auth").and_then(Item::as_bool) == Some(true)
-        && table.get("request_max_retries").and_then(Item::as_integer) == Some(0)
-        && table.get("stream_max_retries").and_then(Item::as_integer) == Some(2)
         && header_token(table).is_some_and(|token| !token.is_empty())
+}
+
+fn expected_stream_max_retries(configuration: &GatewayCodexConfiguration) -> Option<i64> {
+    i64::try_from(configuration.stream_max_retries).ok()
+}
+
+fn gateway_endpoint_and_token_current(
+    table: &Table,
+    configuration: &GatewayCodexConfiguration,
+) -> bool {
+    is_gateway_provider_shape(table)
+        && table.get("base_url").and_then(Item::as_str)
+            == Some(format!("http://127.0.0.1:{}/v1", configuration.port).as_str())
+        && header_token(table) == Some(configuration.local_token.as_str())
 }
 
 fn is_official_provider_shape(table: &Table) -> bool {
@@ -275,17 +288,15 @@ fn gateway_configuration_current(
     let Some(table) = managed_provider_table(document) else {
         return false;
     };
-    table.get("name").and_then(Item::as_str) == Some("AI Gateway")
-        && table.get("base_url").and_then(Item::as_str)
-            == Some(format!("http://127.0.0.1:{}/v1", configuration.port).as_str())
-        && table.get("wire_api").and_then(Item::as_str) == Some("responses")
-        && table.get("requires_openai_auth").and_then(Item::as_bool) == Some(true)
+    gateway_endpoint_and_token_current(table, configuration)
         && table.get("request_max_retries").and_then(Item::as_integer) == Some(0)
-        && table.get("stream_max_retries").and_then(Item::as_integer) == Some(2)
-        && header_token(table) == Some(configuration.local_token.as_str())
+        && table.get("stream_max_retries").and_then(Item::as_integer)
+            == expected_stream_max_retries(configuration)
 }
 
-fn build_managed_provider(configuration: &GatewayCodexConfiguration) -> Table {
+fn build_managed_provider(configuration: &GatewayCodexConfiguration) -> Result<Table, String> {
+    let stream_max_retries = i64::try_from(configuration.stream_max_retries)
+        .map_err(|_| "Codex 流恢复次数超出 TOML 可表示范围".to_string())?;
     let mut provider = Table::new();
     provider["name"] = value("AI Gateway");
     provider["base_url"] = value(format!("http://127.0.0.1:{}/v1", configuration.port));
@@ -294,14 +305,14 @@ fn build_managed_provider(configuration: &GatewayCodexConfiguration) -> Table {
     provider["requires_openai_auth"] = value(true);
     provider["request_max_retries"] = value(0);
     // 网关只重试尚未输出的请求；输出后的 SSE 恢复交给了解会话状态的 Codex。
-    provider["stream_max_retries"] = value(2);
+    provider["stream_max_retries"] = value(stream_max_retries);
     let mut headers = InlineTable::new();
     headers.insert(
         "X-AI-Gateway-Token",
         configuration.local_token.clone().into(),
     );
     provider["http_headers"] = Item::Value(headers.into());
-    provider
+    Ok(provider)
 }
 
 fn build_official_provider() -> Table {
@@ -322,7 +333,7 @@ fn apply_gateway(
     let providers = document["model_providers"]
         .as_table_mut()
         .ok_or_else(|| "Codex 配置中的 model_providers 不是有效表结构".to_string())?;
-    providers[MANAGED_PROVIDER_ID] = Item::Table(build_managed_provider(configuration));
+    providers[MANAGED_PROVIDER_ID] = Item::Table(build_managed_provider(configuration)?);
     document["model_provider"] = value(MANAGED_PROVIDER_ID);
     Ok(())
 }
@@ -1320,13 +1331,54 @@ pub fn update_managed_gateway_configuration(
     }
     if !gateway_configuration_current(&parsed.document, old_configuration) {
         return Err(
-            "Codex 的 AI Gateway 配置已被外部修改；端口保存已取消，请先在“Codex 接入”页面修复配置"
+            "Codex 的 AI Gateway 配置已被外部修改；配置保存已取消，请先在“Codex 接入”页面修复配置"
                 .to_string(),
         );
     }
     apply_gateway(&mut parsed.document, new_configuration)?;
     let hash = write_config(&path, &parsed.hash, &parsed.document)?;
     Ok(Some(hash))
+}
+
+/// 仅升级 AI Gateway 旧版本明确受管且未被外部修改的 Provider。
+/// 指纹不匹配时保持只读，让用户通过“修复配置”明确接管。
+pub fn migrate_legacy_stream_retries(
+    configuration: &GatewayCodexConfiguration,
+    managed_hash: Option<&str>,
+) -> Result<Option<String>, String> {
+    if configuration.stream_max_retries == 2 {
+        return Ok(None);
+    }
+    let Some(managed_hash) = managed_hash else {
+        return Ok(None);
+    };
+    let _guard = CONFIG_WRITE_LOCK
+        .lock()
+        .map_err(|_| "Codex 配置写入锁已损坏".to_string())?;
+    let Ok(path) = config_path() else {
+        return Ok(None);
+    };
+    // 自动迁移必须建立在配置可读取、可解析的前提上；无法证明归属时保持只读，
+    // 避免一个损坏或被外部工具改写的 Codex 配置阻止 AI Gateway 启动。
+    let Ok(mut parsed) = read_config(&path) else {
+        return Ok(None);
+    };
+    if parsed.hash != managed_hash
+        || current_provider(&parsed.document).as_deref() != Some(MANAGED_PROVIDER_ID)
+    {
+        return Ok(None);
+    }
+    let Some(table) = managed_provider_table(&parsed.document) else {
+        return Ok(None);
+    };
+    let is_legacy_configuration = gateway_endpoint_and_token_current(table, configuration)
+        && table.get("request_max_retries").and_then(Item::as_integer) == Some(0)
+        && table.get("stream_max_retries").and_then(Item::as_integer) == Some(2);
+    if !is_legacy_configuration {
+        return Ok(None);
+    }
+    apply_gateway(&mut parsed.document, configuration)?;
+    write_config(&path, &parsed.hash, &parsed.document).map(Some)
 }
 
 #[cfg(test)]
@@ -1357,6 +1409,7 @@ mod tests {
         GatewayCodexConfiguration {
             port,
             local_token: token.to_string(),
+            stream_max_retries: 5,
         }
     }
 
@@ -1370,6 +1423,8 @@ mod tests {
             assert!(managed.contains("X-AI-Gateway-Token"));
             assert!(managed.contains("model_provider = \"custom\""));
             assert!(managed.contains("requires_openai_auth = true"));
+            assert!(managed.contains("request_max_retries = 0"));
+            assert!(managed.contains("stream_max_retries = 5"));
 
             switch_mode(
                 CodexConnectionMode::Official,
@@ -1404,6 +1459,83 @@ mod tests {
             switch_mode(CodexConnectionMode::Gateway, &gateway(8765, "token")).unwrap();
             let updated = fs::read_to_string(home.join("config.toml")).unwrap();
             assert!(updated.contains("name = \"AI Gateway\""));
+        });
+    }
+
+    #[test]
+    fn gateway_identity_survives_retry_setting_mismatch() {
+        with_temp_codex_home(|home| {
+            let mut legacy = gateway(8765, "token");
+            legacy.stream_max_retries = 2;
+            switch_mode(CodexConnectionMode::Gateway, &legacy).unwrap();
+
+            let state = integration_state(
+                &gateway(8765, "token"),
+                CodexEnvironmentStatus {
+                    desktop_status: CodexApplicationStatus::NotInstalled,
+                    cli_status: CodexApplicationStatus::NotInstalled,
+                    login_status: CodexLoginStatus::Unknown,
+                },
+            );
+
+            assert_eq!(state.current_mode, CodexConnectionMode::Gateway);
+            assert!(!state.gateway_configured);
+            assert!(fs::read_to_string(home.join("config.toml"))
+                .unwrap()
+                .contains("stream_max_retries = 2"));
+        });
+    }
+
+    #[test]
+    fn legacy_managed_stream_retries_upgrade_when_fingerprint_matches() {
+        with_temp_codex_home(|home| {
+            let mut legacy = gateway(8765, "token");
+            legacy.stream_max_retries = 2;
+            switch_mode(CodexConnectionMode::Gateway, &legacy).unwrap();
+            let managed_hash = config_fingerprint().unwrap();
+
+            let updated_hash =
+                migrate_legacy_stream_retries(&gateway(8765, "token"), Some(&managed_hash))
+                    .unwrap();
+            let updated = fs::read_to_string(home.join("config.toml")).unwrap();
+            let current_hash = config_fingerprint().unwrap();
+
+            assert!(updated_hash.is_some());
+            assert!(updated.contains("request_max_retries = 0"));
+            assert!(updated.contains("stream_max_retries = 5"));
+            assert_eq!(updated_hash.as_deref(), Some(current_hash.as_str()));
+        });
+    }
+
+    #[test]
+    fn legacy_stream_retry_upgrade_preserves_external_edits() {
+        with_temp_codex_home(|home| {
+            let mut legacy = gateway(8765, "token");
+            legacy.stream_max_retries = 2;
+            switch_mode(CodexConnectionMode::Gateway, &legacy).unwrap();
+            let managed_hash = config_fingerprint().unwrap();
+            let path = home.join("config.toml");
+            let mut externally_modified = fs::read_to_string(&path).unwrap();
+            externally_modified.push_str("\n# external change\n");
+            fs::write(&path, &externally_modified).unwrap();
+
+            let result =
+                migrate_legacy_stream_retries(&gateway(8765, "token"), Some(&managed_hash))
+                    .unwrap();
+
+            assert!(result.is_none());
+            assert_eq!(fs::read_to_string(path).unwrap(), externally_modified);
+        });
+    }
+
+    #[test]
+    fn legacy_stream_retry_upgrade_ignores_unreadable_configuration() {
+        with_temp_codex_home(|home| {
+            fs::write(home.join("config.toml"), "model_provider = [broken").unwrap();
+
+            let result = migrate_legacy_stream_retries(&gateway(8765, "token"), Some("stale-hash"));
+
+            assert!(matches!(result, Ok(None)));
         });
     }
 

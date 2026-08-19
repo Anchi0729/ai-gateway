@@ -751,7 +751,10 @@ pub(crate) async fn import_configuration_backup(
     })
     .await
     .map_err(|error| format!("备份导入任务异常结束：{error}"))??;
-    let old_codex = gateway_codex_configuration(&state.settings.read().unwrap());
+    let old_codex = gateway_codex_configuration(
+        &state.settings.read().unwrap(),
+        &state.policy.read().unwrap(),
+    );
     let next_codex = codex_integration::GatewayCodexConfiguration {
         port: old_codex.port,
         local_token: if matches!(mode, BackupImportMode::Replace) {
@@ -759,10 +762,15 @@ pub(crate) async fn import_configuration_backup(
         } else {
             old_codex.local_token.clone()
         },
+        stream_max_retries: if matches!(mode, BackupImportMode::Replace) {
+            payload.routing_policy.codex_stream_max_retries
+        } else {
+            old_codex.stream_max_retries
+        },
     };
-    // 完整覆盖会恢复本地令牌；若 Codex 当前由网关接管，必须同步请求头。
-    // 先更新可补偿的 config.toml，导入失败时再恢复旧令牌配置。
-    let codex_changed = if old_codex.local_token != next_codex.local_token {
+    // 完整覆盖会恢复本地令牌和 Codex 流恢复次数；合并模式保持目标电脑的全局设置。
+    // 先更新可补偿的 config.toml，导入失败时再恢复旧受管配置。
+    let codex_changed = if old_codex != next_codex {
         codex_integration::update_managed_gateway_configuration(&old_codex, &next_codex)?.is_some()
     } else {
         false
@@ -775,15 +783,21 @@ pub(crate) async fn import_configuration_backup(
                         "Codex 接入配置已同步，但本地管理元数据保存失败：{error}"
                     ));
                 }
+                result
+                    .warning_messages
+                    .push("Codex 配置已修改，请完全退出并重新启动 Codex".to_string());
             }
             Ok(result)
         }
         Err(error) => {
             if codex_changed {
-                let _ = codex_integration::update_managed_gateway_configuration(
-                    &next_codex,
-                    &old_codex,
-                );
+                if let Err(rollback_error) =
+                    codex_integration::update_managed_gateway_configuration(&next_codex, &old_codex)
+                {
+                    return Err(format!(
+                        "备份导入失败：{error}；Codex 配置回滚也失败：{rollback_error}"
+                    ));
+                }
             }
             Err(error)
         }
@@ -953,6 +967,19 @@ mod tests {
         let restored = decrypt_payload(&encrypted, "correct-password").unwrap();
         assert_eq!(restored.providers[0].api_key, "secret-provider-key");
         assert_eq!(restored.local_token, "local-access-token-123456");
+    }
+
+    #[test]
+    fn old_backup_without_codex_stream_retries_uses_default() {
+        let mut payload = serde_json::to_value(sample_payload()).unwrap();
+        payload["routing_policy"]
+            .as_object_mut()
+            .unwrap()
+            .remove("codex_stream_max_retries");
+
+        let restored: BackupPayloadData = serde_json::from_value(payload).unwrap();
+
+        assert_eq!(restored.routing_policy.codex_stream_max_retries, 5);
     }
 
     #[test]
