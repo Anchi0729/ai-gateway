@@ -514,8 +514,8 @@ h3 {
 }
 .health-strip {
   display: grid;
-  grid-template-columns: repeat(24, minmax(2px, 1fr));
-  gap: 2px;
+  grid-template-columns: repeat(16, minmax(5px, 1fr));
+  gap: 3px;
   width: 100%;
 }
 .health-strip > span {
@@ -1115,12 +1115,6 @@ h3 {
   font-size: 12px;
   font-weight: 650;
 }
-.token-block p {
-  margin: 5px 0 0;
-  color: #85948c;
-  font-size: 11px;
-  line-height: 1.55;
-}
 .token-block code {
   overflow: hidden;
   padding: 9px;
@@ -1181,7 +1175,11 @@ h3 {
   align-items: start;
 }
 .log-panel {
+  display: flex;
+  height: calc(100vh - 170px);
   min-height: 470px;
+  flex-direction: column;
+  overflow: hidden;
 }
 .page-size-control {
   display: flex;
@@ -1213,6 +1211,9 @@ h3 {
 }
 .log-row.clickable { padding-left: 7px; padding-right: 7px; border-radius: 5px; }
 .log-table-header {
+  position: sticky;
+  z-index: 2;
+  top: 0;
   min-height: 37px;
   padding: 0 20px;
   border-bottom: 1px solid #e8edf0;
@@ -1220,6 +1221,13 @@ h3 {
   background: #fafbfc;
   font-size: 10px;
   font-weight: 650;
+}
+.log-table-scroll {
+  min-height: 0;
+  flex: 1;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 .log-list {
   padding: 0 20px;
@@ -1267,20 +1275,66 @@ h3 {
 }
 .log-pagination {
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
   justify-content: space-between;
   min-height: 52px;
   padding: 8px 20px;
+  border-top: 1px solid #e8edf0;
   color: #88949c;
   font-size: 10px;
 }
-.log-pagination > div {
+.log-pagination-controls {
   display: flex;
+  align-items: center;
   gap: 6px;
 }
 .log-pagination .icon-button {
   width: 28px;
   height: 28px;
+}
+.log-page-nav {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.log-page-button {
+  display: inline-flex;
+  width: 28px;
+  height: 28px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: #6f7d85;
+  background: transparent;
+  font-size: 11px;
+  line-height: 1;
+}
+.log-page-button:hover:not(.active) {
+  border-color: #d6e3dc;
+  color: #286c52;
+  background: #f2f8f4;
+}
+.log-page-button.active {
+  border-color: #62a68a;
+  color: #fff;
+  background: #28785d;
+  font-weight: 650;
+}
+.log-page-button:focus-visible {
+  outline: 2px solid #75ae96;
+  outline-offset: 1px;
+}
+.log-page-ellipsis {
+  display: inline-flex;
+  width: 18px;
+  height: 28px;
+  align-items: center;
+  justify-content: center;
+  color: #9aa5ac;
+  font-size: 12px;
 }
 .runtime-panel {
   padding: 21px;
@@ -1766,27 +1820,27 @@ h3 {
 }
 .usage-filter-controls {
   display: flex;
-  align-items: flex-end;
-  gap: 14px;
-  padding: 17px 20px 18px;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 20px 10px;
 }
 .usage-source-row {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 0 20px 16px;
+  gap: 10px;
+  padding: 0 20px 12px;
   color: #89959d;
-  font-size: 10px;
+  font-size: 12px;
 }
 .usage-source-switch { display: flex; flex-wrap: wrap; gap: 5px; }
 .usage-source-switch button {
-  min-height: 30px;
+  min-height: 28px;
   padding: 0 10px;
   border: 1px solid #dce3e7;
   border-radius: 6px;
   color: #72808a;
   background: #fff;
-  font-size: 11px;
+  font-size: 12px;
 }
 .usage-source-switch button.active { border-color: #62a68a; color: #1e6e54; background: #f0f8f3; font-weight: 650; }
 .usage-sync-warning {
@@ -1831,21 +1885,21 @@ h3 {
 .danger-button { min-height: 34px; padding: 0 12px; border: 0; border-radius: 6px; color: #fff; background: #a45454; font-size: 11px; }
 .usage-mode-switch {
   display: grid;
-  grid-template-columns: repeat(3, minmax(72px, 1fr));
-  height: 42px;
+  grid-template-columns: repeat(3, minmax(68px, 1fr));
+  height: 36px;
   padding: 3px;
   border: 1px solid #dce3e7;
   border-radius: 7px;
   background: #f5f7f8;
 }
 .usage-mode-switch button {
-  min-width: 72px;
+  min-width: 68px;
   padding: 0 10px;
   border: 0;
   border-radius: 5px;
   color: #72808a;
   background: transparent;
-  font-size: 12px;
+  font-size: 13px;
 }
 .usage-mode-switch button.active {
   color: #1e6e54;
@@ -1855,26 +1909,29 @@ h3 {
 }
 .usage-date-fields {
   display: flex;
-  align-items: flex-end;
+  flex: 1 1 auto;
+  align-items: center;
   min-width: 260px;
-  gap: 9px;
+  gap: 8px;
 }
 .usage-date-fields label {
-  display: grid;
-  flex: 1;
-  gap: 5px;
+  display: flex;
+  flex: 0 1 auto;
+  align-items: center;
+  gap: 7px;
   color: #71808a;
-  font-size: 10px;
+  font-size: 12px;
+  white-space: nowrap;
 }
 .usage-date-fields input {
-  width: 100%;
-  height: 42px;
-  padding: 0 11px;
+  width: clamp(156px, 12vw, 190px);
+  height: 36px;
+  padding: 0 9px;
   border: 1px solid #dce3e7;
   border-radius: 7px;
   color: #34434d;
   background: #fff;
-  font-size: 12px;
+  font-size: 13px;
   outline: none;
 }
 .usage-date-fields input:focus {
@@ -1882,36 +1939,40 @@ h3 {
   box-shadow: 0 0 0 3px rgba(54, 139, 104, 0.1);
 }
 .usage-date-separator {
-  padding-bottom: 13px;
+  padding: 0 1px;
   color: #9aa4ab;
-  font-size: 11px;
+  font-size: 12px;
 }
 .usage-today-value {
-  display: grid;
-  min-width: 180px;
-  height: 42px;
-  align-content: center;
-  padding: 0 12px;
+  display: flex;
+  min-width: 165px;
+  height: 36px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 10px;
   border: 1px solid #dce3e7;
   border-radius: 7px;
   background: #f8faf9;
 }
 .usage-today-value span {
   color: #929ca3;
-  font-size: 9px;
+  font-size: 11px;
 }
 .usage-today-value strong {
   color: #3e4c55;
-  font-size: 12px;
+  font-size: 13px;
 }
 .usage-query-button {
-  min-width: 88px;
-  height: 42px;
+  margin-left: auto;
+  min-width: 82px;
+  height: 36px;
+  font-size: 13px;
 }
-.usage-refresh-button { width: 42px; height: 42px; flex: 0 0 42px; }
+.usage-refresh-button { width: 36px; height: 36px; flex: 0 0 36px; }
 .usage-range-hint,
 .usage-query-error {
-  margin: -7px 20px 16px;
+  margin: -4px 20px 12px;
   font-size: 10px;
 }
 .usage-range-hint {

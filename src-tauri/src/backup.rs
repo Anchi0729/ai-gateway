@@ -842,12 +842,12 @@ mod tests {
                 priority: 1,
                 enabled: true,
                 timeout_ms: 120_000,
-                api_key: "secret-provider-key".to_string(),
+                api_key: "sample-provider-key".to_string(),
             }],
             probe_interval_sec: 60,
             routing_policy: RoutingPolicy::default(),
             locked_provider_id: Some("provider-1".to_string()),
-            local_token: "local-access-token-123456".to_string(),
+            local_token: "sample-local-token".to_string(),
         }
     }
 
@@ -907,7 +907,7 @@ mod tests {
             settings: Arc::new(RwLock::new(RouterSettings {
                 bind_address: "127.0.0.1".to_string(),
                 port: 8765,
-                local_token: "target-local-token-123456".to_string(),
+                local_token: "sample-target-local-token".to_string(),
                 probe_interval_sec: 30,
                 log_retention_days: 7,
                 usage_retention_days: 365,
@@ -958,15 +958,15 @@ mod tests {
     #[test]
     fn encrypted_backup_round_trips_without_plaintext_secrets() {
         let payload = sample_payload();
-        let encrypted = encrypt_payload(&payload, "correct-password").unwrap();
+        let encrypted = encrypt_payload(&payload, "sample-correct-password").unwrap();
         let serialized = String::from_utf8(encrypted.clone()).unwrap();
-        assert!(!serialized.contains("secret-provider-key"));
-        assert!(!serialized.contains("local-access-token-123456"));
+        assert!(!serialized.contains("sample-provider-key"));
+        assert!(!serialized.contains("sample-local-token"));
         assert!(!serialized.contains("https://example.com/v1"));
 
-        let restored = decrypt_payload(&encrypted, "correct-password").unwrap();
-        assert_eq!(restored.providers[0].api_key, "secret-provider-key");
-        assert_eq!(restored.local_token, "local-access-token-123456");
+        let restored = decrypt_payload(&encrypted, "sample-correct-password").unwrap();
+        assert_eq!(restored.providers[0].api_key, "sample-provider-key");
+        assert_eq!(restored.local_token, "sample-local-token");
     }
 
     #[test]
@@ -1030,22 +1030,22 @@ mod tests {
 
     #[test]
     fn wrong_password_and_tampered_ciphertext_are_rejected() {
-        let encrypted = encrypt_payload(&sample_payload(), "correct-password").unwrap();
-        assert!(decrypt_payload(&encrypted, "wrong-password").is_err());
+        let encrypted = encrypt_payload(&sample_payload(), "sample-correct-password").unwrap();
+        assert!(decrypt_payload(&encrypted, "sample-wrong-password").is_err());
 
         let mut envelope: BackupEnvelope = serde_json::from_slice(&encrypted).unwrap();
         envelope.cipher.ciphertext.push('A');
         let tampered = serde_json::to_vec(&envelope).unwrap();
-        assert!(decrypt_payload(&tampered, "correct-password").is_err());
+        assert!(decrypt_payload(&tampered, "sample-correct-password").is_err());
     }
 
     #[test]
     fn unsupported_version_is_rejected_before_decryption() {
-        let encrypted = encrypt_payload(&sample_payload(), "correct-password").unwrap();
+        let encrypted = encrypt_payload(&sample_payload(), "sample-correct-password").unwrap();
         let mut envelope: BackupEnvelope = serde_json::from_slice(&encrypted).unwrap();
         envelope.version = 99;
         let unsupported = serde_json::to_vec(&envelope).unwrap();
-        let error = match decrypt_payload(&unsupported, "correct-password") {
+        let error = match decrypt_payload(&unsupported, "sample-correct-password") {
             Ok(_) => panic!("未知备份版本不应成功解密"),
             Err(error) => error,
         };
@@ -1063,18 +1063,18 @@ mod tests {
         let providers = state.config.read().unwrap();
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].id, "provider-1");
-        assert_eq!(providers[0].api_key, "secret-provider-key");
+        assert_eq!(providers[0].api_key, "sample-provider-key");
         drop(providers);
         assert_eq!(
             secrets.get("provider-1").unwrap().as_deref(),
-            Some("secret-provider-key")
+            Some("sample-provider-key")
         );
         assert!(secrets.get("old").unwrap().is_none());
         assert_eq!(state.settings.read().unwrap().probe_interval_sec, 60);
         assert_eq!(state.settings.read().unwrap().port, 8765);
         assert_eq!(
             state.settings.read().unwrap().local_token,
-            "local-access-token-123456"
+            "sample-local-token"
         );
         assert_eq!(
             state.locked_provider_id.read().unwrap().as_deref(),
@@ -1126,7 +1126,7 @@ mod tests {
         assert_eq!(state.settings.read().unwrap().port, 8765);
         assert_eq!(
             state.settings.read().unwrap().local_token,
-            "target-local-token-123456"
+            "sample-target-local-token"
         );
         assert_eq!(
             state.locked_provider_id.read().unwrap().as_deref(),
@@ -1134,7 +1134,7 @@ mod tests {
         );
         assert_eq!(
             secrets.get("provider-1").unwrap().as_deref(),
-            Some("secret-provider-key")
+            Some("sample-provider-key")
         );
     }
 

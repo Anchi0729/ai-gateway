@@ -106,7 +106,8 @@ function monitorStatusLabel(
   return statusLabels[snapshot?.state ?? "unknown"];
 }
 
-const MAX_HEALTH_PROBES = 24;
+// 与后端保留上限一致，空白占位和真实状态始终组成固定的 16 格。
+const MAX_HEALTH_PROBES = 16;
 const STATUS_REFRESH_MS = 15_000;
 
 type AppNotice = {
@@ -2481,6 +2482,20 @@ function LogsPanel({
   const totalPages = Math.max(1, Math.ceil(logs.length / pageSize));
   const pageLogs = logs.slice((page - 1) * pageSize, page * pageSize);
 
+  // 页数较多时保留首尾和当前页邻近页，避免分页栏被完整页码撑开。
+  const pageItems: Array<number | "ellipsis"> = totalPages <= 7
+    ? Array.from({ length: totalPages }, (_, index) => index + 1)
+    : [
+        1,
+        ...(page > 3 ? ["ellipsis" as const] : []),
+        ...Array.from(
+          { length: 5 },
+          (_, index) => Math.min(Math.max(page - 2 + index, 2), totalPages - 1),
+        ).filter((item, index, items) => items.indexOf(item) === index),
+        ...(page < totalPages - 2 ? ["ellipsis" as const] : []),
+        totalPages,
+      ];
+
   useEffect(() => {
     setPage((current) => Math.min(current, totalPages));
   }, [totalPages]);
@@ -2489,87 +2504,101 @@ function LogsPanel({
     <section className="logs-layout">
       <div className="panel log-panel">
         <div className="panel-heading">
-          <div>
-            <h2>最近事件</h2>
-            <p>记录模型、状态、延迟和错误类型，不保存请求正文</p>
-          </div>
-          <label className="page-size-control">
-            <span>每页</span>
-            <select
-              value={pageSize}
-              onChange={(event) => {
-                setPageSize(Number(event.target.value) as 50 | 100 | 150);
-                setPage(1);
-              }}
-            >
-              <option value={50}>50 条</option>
-              <option value={100}>100 条</option>
-              <option value={150}>150 条</option>
-            </select>
-          </label>
+          <h2>最近事件</h2>
         </div>
         {logs.length ? (
           <>
-            <div className="log-table-header">
-              <span />
-              <span>时间</span>
-              <span>中转</span>
-              <span>模型</span>
-              <span>事件</span>
-            </div>
-            <div className="log-list">
-              {pageLogs.map((entry, index) => (
-                <div
-                  className={`log-row ${entry.routing_event || entry.diagnostic_detail ? "clickable" : ""}`}
-                  key={`${entry.timestamp}-${index}`}
-                  onClick={() => {
-                    if (entry.routing_event) onOpenRoutingEvent(entry.routing_event);
-                    else if (entry.diagnostic_detail) onOpenDiagnostic(entry.diagnostic_detail);
-                  }}
-                >
-                  <span className={`log-level ${entry.level}`} />
-                  <time>
-                    {new Date(entry.timestamp).toLocaleTimeString("zh-CN", {
-                      hour12: false,
-                    })}
-                  </time>
-                  <strong>
-                    {entry.routing_event
-                      ? entry.routing_event.event_type === "auto_switch"
-                        ? `${providerNames.get(entry.routing_event.source_provider_id ?? "") ?? "原中转"} → ${providerNames.get(entry.routing_event.target_provider_id ?? "") ?? "备用中转"}`
-                        : providerNames.get(entry.routing_event.source_provider_id ?? "") ?? "未知中转"
-                      : entry.provider_id
-                        ? (providerNames.get(entry.provider_id) ?? "未知中转")
-                        : "本地网关"}
-                  </strong>
-                  <code className="log-model">{entry.model ?? "--"}</code>
-                  <span className="log-message">{entry.message}</span>
-                </div>
-              ))}
+            <div className="log-table-scroll">
+              <div className="log-table-header">
+                <span />
+                <span>时间</span>
+                <span>中转</span>
+                <span>模型</span>
+                <span>事件</span>
+              </div>
+              <div className="log-list">
+                {pageLogs.map((entry, index) => (
+                  <div
+                    className={`log-row ${entry.routing_event || entry.diagnostic_detail ? "clickable" : ""}`}
+                    key={`${entry.timestamp}-${index}`}
+                    onClick={() => {
+                      if (entry.routing_event) onOpenRoutingEvent(entry.routing_event);
+                      else if (entry.diagnostic_detail) onOpenDiagnostic(entry.diagnostic_detail);
+                    }}
+                  >
+                    <span className={`log-level ${entry.level}`} />
+                    <time>
+                      {new Date(entry.timestamp).toLocaleTimeString("zh-CN", {
+                        hour12: false,
+                      })}
+                    </time>
+                    <strong>
+                      {entry.routing_event
+                        ? entry.routing_event.event_type === "auto_switch"
+                          ? `${providerNames.get(entry.routing_event.source_provider_id ?? "") ?? "原中转"} → ${providerNames.get(entry.routing_event.target_provider_id ?? "") ?? "备用中转"}`
+                          : providerNames.get(entry.routing_event.source_provider_id ?? "") ?? "未知中转"
+                        : entry.provider_id
+                          ? (providerNames.get(entry.provider_id) ?? "未知中转")
+                          : "本地网关"}
+                    </strong>
+                    <code className="log-model">{entry.model ?? "--"}</code>
+                    <span className="log-message">{entry.message}</span>
+                  </div>
+                ))}
+              </div>
             </div>
             <div className="log-pagination">
               <span>
                 共 {logs.length} 条，第 {page} / {totalPages} 页
               </span>
-              <div>
+              <div className="log-pagination-controls">
                 <button
                   className="icon-button"
+                  aria-label="上一页"
                   title="上一页"
                   disabled={page === 1}
                   onClick={() => setPage((current) => Math.max(1, current - 1))}
                 >
                   <ChevronLeft size={15} />
                 </button>
+                <nav className="log-page-nav" aria-label="日志分页">
+                  {pageItems.map((item, index) => item === "ellipsis" ? (
+                    <span className="log-page-ellipsis" key={`ellipsis-${index}`} aria-hidden="true">…</span>
+                  ) : (
+                    <button
+                      className={`log-page-button ${item === page ? "active" : ""}`}
+                      aria-current={item === page ? "page" : undefined}
+                      aria-label={`第 ${item} 页`}
+                      key={item}
+                      onClick={() => setPage(item)}
+                    >
+                      {item}
+                    </button>
+                  ))}
+                </nav>
                 <button
                   className="icon-button"
+                  aria-label="下一页"
                   title="下一页"
                   disabled={page === totalPages}
-                  onClick={() =>
-                    setPage((current) => Math.min(totalPages, current + 1))
-                  }
+                  onClick={() => setPage((current) => Math.min(totalPages, current + 1))}
                 >
                   <ChevronRight size={15} />
                 </button>
+                <label className="page-size-control">
+                  <span>每页</span>
+                  <select
+                    value={pageSize}
+                    onChange={(event) => {
+                      setPageSize(Number(event.target.value) as 50 | 100 | 150);
+                      setPage(1);
+                    }}
+                  >
+                    <option value={50}>50 条</option>
+                    <option value={100}>100 条</option>
+                    <option value={150}>150 条</option>
+                  </select>
+                </label>
               </div>
             </div>
           </>
@@ -3219,7 +3248,7 @@ function ConfigurationCenter({
           <div>
             <p className="section-kicker">GATEWAY</p>
             <h2>基础网关</h2>
-            <p>本地监听地址、cc-switch 接入信息和运行自检。</p>
+            <p>本地监听、客户端接入和运行自检。</p>
           </div>
         </div>
         <div className="configuration-body">
@@ -3242,8 +3271,7 @@ function ConfigurationCenter({
           </div>
           <div className="token-block">
             <div>
-              <span className="field-label">cc-switch 接入信息</span>
-              <p>两项都需要填写。此令牌只用于访问本机网关，不是真实中转的 API Key。</p>
+              <span className="field-label">客户端接入信息</span>
             </div>
             <div className="connection-field">
               <span>Base URL</span>

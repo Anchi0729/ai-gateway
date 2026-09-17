@@ -84,7 +84,7 @@ API Key: 配置中心显示的本地访问令牌
 - 第三方 API Key 保存到 Windows Credential Manager，不写入普通日志。
 - 转发第三方请求前会删除官方 Authorization、Cookie、账号、组织、项目和 `X-OpenAI-*` 身份头。
 - 日志和用量记录不保存 prompt、响应正文或完整鉴权头。
-- 官方用量来自 Codex Desktop 本地 `token_count`，升级到 `0.3.5` 后会自动重建一次保留期内的历史。输入 Token 已包含缓存命中，总 Token 等于输入加输出，不等同于 OpenAI 账单。
+- 官方用量来自 Codex Desktop 本地 `token_count`。解析器 v3 会在首次升级后自动重建一次保留期内的历史；输入 Token 已包含缓存命中，总 Token 等于输入加输出，不等同于 OpenAI 账单。Gateway 模式下无法唯一对账的本地事件只保留诊断，不计入汇总。
 - 第三方用量优先采用上游 `usage`；缺失时使用 `tiktoken` 本地估算并明确标记，不等同于中转账单。
 - 重试和自动切换产生的每次实际上游调用分别计入对应线路。
 - 第三方模式下请求内容会发送给用户配置的中转服务，请只使用可信服务商。
@@ -100,6 +100,10 @@ API Key: 配置中心显示的本地访问令牌
 - [安全说明](SECURITY.md)：密钥、隐私边界和漏洞反馈。
 - [贡献指南](CONTRIBUTING.md)：代码规范和提交前检查。
 - [更新日志](CHANGELOG.md)：版本变化记录。
+
+## 开源发布检查
+
+发布到 GitHub 前请确认仓库中没有 `auth.json`、数据库、`.aigateway` 备份、日志、安装包、用户截图或任何真实 API Key、令牌和请求内容。测试代码中的凭据只能使用明确的 `sample-*` 占位符。
 
 ## 开发预览
 

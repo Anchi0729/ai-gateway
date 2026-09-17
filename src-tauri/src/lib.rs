@@ -59,7 +59,8 @@ const MAX_USAGE_RETENTION_DAYS: u16 = 3_650;
 // usage 解析与 tokenizer 输出观察共用 8 MiB 上限；超限只停止统计，响应仍原样透传。
 const MAX_USAGE_CAPTURE_BYTES: usize = usage_estimation::MAX_ESTIMATION_TEXT_BYTES;
 const MAX_LOCAL_REQUEST_BODY_BYTES: usize = 200 * 1024 * 1024;
-const MAX_HEALTH_PROBES: usize = 24;
+// 监控表只展示最近 16 次健康探测，避免状态块过密并限制会话内存占用。
+const MAX_HEALTH_PROBES: usize = 16;
 const MAX_ERROR_BODY_BYTES: usize = 1024 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 256 * 1024;
 const MAX_SSE_PREFLIGHT_BYTES: usize = 1024 * 1024;
@@ -6897,7 +6898,8 @@ mod tests {
     impl ProviderSecretStore for OneTimeUnreadableSecretStore {
         fn get(&self, _id: &str) -> Result<Option<String>, String> {
             let value = self.value.lock().unwrap().clone();
-            if value.as_deref() == Some("new-secret") && !self.rejected.swap(true, Ordering::SeqCst)
+            if value.as_deref() == Some("sample-new-secret")
+                && !self.rejected.swap(true, Ordering::SeqCst)
             {
                 return Ok(None);
             }
@@ -6924,7 +6926,7 @@ mod tests {
             priority,
             enabled: true,
             timeout_ms: 2_000,
-            api_key: "test-key".to_string(),
+            api_key: "sample-provider-key".to_string(),
             api_key_error: None,
         }
     }
@@ -6937,7 +6939,7 @@ mod tests {
             settings: Arc::new(RwLock::new(RouterSettings {
                 bind_address: DEFAULT_BIND.to_string(),
                 port: DEFAULT_PORT,
-                local_token: "local-test-token".to_string(),
+                local_token: "sample-local-token".to_string(),
                 probe_interval_sec: 30,
                 log_retention_days: DEFAULT_LOG_RETENTION_DAYS,
                 usage_retention_days: DEFAULT_USAGE_RETENTION_DAYS,
@@ -7051,11 +7053,11 @@ mod tests {
     #[test]
     fn restoring_provider_secret_reinstates_previous_value_or_deletes_new_entry() {
         let secrets = MemoryProviderSecretStore::default();
-        secrets.set("provider", "new-secret").unwrap();
-        restore_provider_secret(&secrets, "provider", Some("old-secret")).unwrap();
+        secrets.set("provider", "sample-new-secret").unwrap();
+        restore_provider_secret(&secrets, "provider", Some("sample-old-secret")).unwrap();
         assert_eq!(
             secrets.get("provider").unwrap().as_deref(),
-            Some("old-secret")
+            Some("sample-old-secret")
         );
 
         restore_provider_secret(&secrets, "provider", None).unwrap();
@@ -7067,7 +7069,7 @@ mod tests {
         let provider = test_provider("provider", "https://example.com/v1".to_string(), 1);
         let mut state = test_state(vec![provider]);
         let secrets = Arc::new(OneTimeUnreadableSecretStore {
-            value: Mutex::new(Some("old-secret".to_string())),
+            value: Mutex::new(Some("sample-old-secret".to_string())),
             rejected: AtomicBool::new(false),
         });
         state.secrets = secrets.clone();
@@ -7081,7 +7083,7 @@ mod tests {
                 priority: Some(1),
                 enabled: Some(true),
                 timeout_ms: Some(120_000),
-                api_key: Some("new-secret".to_string()),
+                api_key: Some("sample-new-secret".to_string()),
             },
             &state,
         )
@@ -7090,7 +7092,7 @@ mod tests {
         assert!(error.contains("原密钥已恢复"));
         assert_eq!(
             secrets.get("provider").unwrap().as_deref(),
-            Some("old-secret")
+            Some("sample-old-secret")
         );
         assert_eq!(state.config.read().unwrap()[0].name, "provider");
     }
@@ -7100,7 +7102,7 @@ mod tests {
         let provider = test_provider("provider", "https://example.com/v1".to_string(), 1);
         let mut state = test_state(vec![provider]);
         let secrets = Arc::new(MemoryProviderSecretStore::default());
-        secrets.set("provider", "old-secret").unwrap();
+        secrets.set("provider", "sample-old-secret").unwrap();
         state.secrets = secrets.clone();
 
         let error = save_provider_inner(
@@ -7112,7 +7114,7 @@ mod tests {
                 priority: Some(1),
                 enabled: Some(true),
                 timeout_ms: Some(120_000),
-                api_key: Some("new-secret".to_string()),
+                api_key: Some("sample-new-secret".to_string()),
             },
             &state,
         )
@@ -7121,7 +7123,7 @@ mod tests {
         assert!(error.contains("API Key 已恢复"));
         assert_eq!(
             secrets.get("provider").unwrap().as_deref(),
-            Some("old-secret")
+            Some("sample-old-secret")
         );
         assert_eq!(state.config.read().unwrap()[0].name, "provider");
     }
@@ -7141,7 +7143,7 @@ mod tests {
                 priority: Some(1),
                 enabled: Some(true),
                 timeout_ms: Some(120_000),
-                api_key: Some("new-secret".to_string()),
+                api_key: Some("sample-new-secret".to_string()),
             },
             &state,
         )
@@ -7156,7 +7158,7 @@ mod tests {
     #[test]
     fn windows_credential_manager_round_trips_across_new_entries() {
         let id = format!("ai-gateway-test-{}", Uuid::new_v4());
-        let secret = format!("test-secret-{}", Uuid::new_v4());
+        let secret = format!("sample-test-secret-{}", Uuid::new_v4());
         let store = SystemProviderSecretStore;
 
         save_and_verify_provider_secret(&store, &id, &secret)
@@ -7365,7 +7367,7 @@ mod tests {
                 Request::builder()
                     .method(Method::POST)
                     .uri(path)
-                    .header(header::AUTHORIZATION, "Bearer local-test-token")
+                    .header(header::AUTHORIZATION, "Bearer sample-local-token")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(r#"{"model":"gpt-test","messages":[]}"#))
                     .unwrap(),
@@ -7378,7 +7380,7 @@ mod tests {
         call_test_gateway_request(
             state,
             Body::from(r#"{"model":"gpt-test","input":"hello"}"#),
-            "Bearer local-test-token",
+            "Bearer sample-local-token",
             None,
             &[],
         )
@@ -7392,7 +7394,7 @@ mod tests {
         call_test_gateway_request(
             state,
             Body::from(r#"{"model":"gpt-test","input":"hello"}"#),
-            "Bearer local-test-token",
+            "Bearer sample-local-token",
             None,
             extra_headers,
         )
@@ -7460,7 +7462,7 @@ mod tests {
         let response = call_test_gateway_request(
             state,
             Body::from(expected.clone()),
-            "Bearer local-test-token",
+            "Bearer sample-local-token",
             Some(expected.len() as u64),
             &[],
         )
@@ -7482,7 +7484,7 @@ mod tests {
         let response = call_test_gateway_request(
             state.clone(),
             Body::from(r#"{"model":"gpt-test"}"#),
-            "Bearer local-test-token",
+            "Bearer sample-local-token",
             Some(MAX_LOCAL_REQUEST_BODY_BYTES as u64 + 1),
             &[],
         )
@@ -7649,7 +7651,7 @@ mod tests {
             priority: 1,
             enabled: true,
             timeout_ms: 1000,
-            api_key: "key".into(),
+            api_key: "sample-key".into(),
             api_key_error: None,
         };
         assert!(matches_model(&provider, Some("gpt-5")));
@@ -7714,7 +7716,7 @@ mod tests {
         let probes = &health.get("provider").unwrap().recent_probes;
         assert_eq!(probes.len(), MAX_HEALTH_PROBES);
         assert_eq!(probes.front().unwrap().sequence, 4);
-        assert_eq!(probes.back().unwrap().sequence, 27);
+        assert_eq!(probes.back().unwrap().sequence, 19);
     }
 
     #[test]
@@ -7977,7 +7979,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
-            "Bearer official-token".parse().unwrap(),
+            "Bearer sample-official-token".parse().unwrap(),
         );
         headers.insert(header::COOKIE, "session=official".parse().unwrap());
         headers.insert("chatgpt-account-id", "account-1".parse().unwrap());
@@ -7998,7 +8000,10 @@ mod tests {
         .build()
         .unwrap();
 
-        assert_eq!(request.headers()[header::AUTHORIZATION], "Bearer test-key");
+        assert_eq!(
+            request.headers()[header::AUTHORIZATION],
+            "Bearer sample-provider-key"
+        );
         assert!(!request.headers().contains_key(header::COOKIE));
         assert!(!request.headers().contains_key("chatgpt-account-id"));
         assert!(!request.headers().contains_key("openai-organization"));
@@ -8011,9 +8016,9 @@ mod tests {
     #[test]
     fn gateway_token_header_authenticates_without_bearer_token() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-ai-gateway-token", "local-test-token".parse().unwrap());
-        assert!(auth_valid(&headers, "local-test-token"));
-        assert!(!auth_valid(&headers, "different-token"));
+        headers.insert("x-ai-gateway-token", "sample-local-token".parse().unwrap());
+        assert!(auth_valid(&headers, "sample-local-token"));
+        assert!(!auth_valid(&headers, "sample-different-token"));
     }
 
     #[test]
@@ -8021,7 +8026,7 @@ mod tests {
         let state = test_state(Vec::new());
         let provider = test_provider("provider-a", "http://127.0.0.1:9999".to_string(), 1);
         let mut headers = HeaderMap::new();
-        headers.insert("x-ai-gateway-token", "local-test-token".parse().unwrap());
+        headers.insert("x-ai-gateway-token", "sample-local-token".parse().unwrap());
         headers.insert("x-request-id", "request-1".parse().unwrap());
         let request = upstream_request(
             &state,

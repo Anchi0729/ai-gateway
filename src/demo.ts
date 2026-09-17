@@ -64,9 +64,9 @@ export function buildDemoData(): DemoData {
     latencyMs: number | null,
     error: string | null = null,
   ): HealthSnapshot["recent_probes"] =>
-    Array.from({ length: 12 }, (_, index) => ({
+    Array.from({ length: 16 }, (_, index) => ({
       sequence: index + 1,
-      timestamp: new Date(Date.now() - (11 - index) * 60_000).toISOString(),
+      timestamp: new Date(Date.now() - (15 - index) * 60_000).toISOString(),
       state,
       latency_ms: latencyMs,
       error,
