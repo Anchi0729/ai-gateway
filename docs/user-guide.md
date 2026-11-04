@@ -110,21 +110,22 @@ Codex 配置路径优先使用 `CODEX_HOME`；未设置时使用：
 - 网关内部选择第三方中转并处理重试、熔断和用量。
 - 切换第三方中转不需要重启 Codex，新请求立即生效。
 
-官方和第三方都使用共享的 `custom` Provider。两种模式互相切换后，需要完全退出并重新启动 Codex。AI Gateway 只管理 `config.toml` 中属于自身的 Provider 配置；状态页只读检查 `auth.json` 中是否存在本地登录凭据，不会修改、备份或展示文件内容。
+官方模式使用 `openai` Provider，第三方模式使用 `ai_gateway` Provider。两个受管 Provider 会同时保留，切换只改变 `model_provider`，需要完全退出并重新启动 Codex。旧版或外部工具的 `custom` Provider 不会被新逻辑主动覆盖；AI Gateway 只管理能够确认属于自身的配置。状态页只读检查 `auth.json` 中是否存在本地登录凭据，不会修改、备份或展示文件内容。
 
 接入页只显示 Codex 桌面端、Codex CLI 和 ChatGPT 登录三项状态。ChatGPT“已登录”表示本机存在可识别凭据，不代表 AI Gateway 已联网验证凭据有效性。
 
-如果检测到 CC-Switch 或其他工具正在管理 `custom` Provider，AI Gateway 会显示外部配置状态。不要让两个工具同时接管同一配置。
+如果检测到 CC-Switch 或其他工具正在管理 `custom` Provider，AI Gateway 会显示外部配置状态，并保留该配置。不要让两个工具同时接管同一配置。
 
-### 统一会话历史
+### 会话历史兼容
 
-“统一会话历史”用于把本地普通会话的 Provider 元数据统一为 `custom`，避免因 Provider 不同而从历史列表隐藏。
+新版 Codex 原生支持跨 Provider 列出本地线程，AI Gateway 正常不会改写会话文件。只有探测到旧版 Codex 不支持该能力时，Codex 接入页才会显示“旧版会话兼容迁移”。
 
 - 迁移前必须完全退出 Codex。
 - 先扫描并查看预览，再由用户确认执行。
 - 只修改 JSONL 第一条 `session_meta` 和本地线程索引。
 - 不修改聊天正文；归档会话仍保持归档。
 - 迁移前创建备份，并提供恢复最近一次迁移的操作。
+- 迁移只在用户明确执行时发生，目标 Provider 为旧版兼容值 `custom`。
 - 包含 `encrypted_content` 的旧会话不保证可以跨供应商继续推理。
 
 ## cc-switch 接入
@@ -143,7 +144,7 @@ API Key: AI Gateway 配置中心显示的本地访问令牌
 - Base URL 通常应以 `/v1` 结尾，不要形成 `/v1/v1`。
 - 修改 AI Gateway 端口后必须同步修改 cc-switch。
 
-如果已经使用 AI Gateway 的“Codex 接入”管理 `custom` Provider，通常不需要再让 CC-Switch 接管 Codex 路由。
+如果已经使用 AI Gateway 的“Codex 接入”管理 `ai_gateway` Provider，通常不需要再让 CC-Switch 接管 Codex 路由。
 
 ## 重试、熔断和自动切换
 

@@ -304,7 +304,12 @@ export interface CodexIntegrationState {
   cli_status: CodexApplicationStatus;
   login_status: CodexLoginStatus;
   current_mode: CodexConnectionMode;
+  current_provider_id: string | null;
   gateway_configured: boolean;
+  history_native_supported: boolean;
+  history_probe_error: string | null;
+  history_migration_required: boolean;
+  history_provider_counts: HistoryProviderCount[];
 }
 
 export interface HistoryProviderCount {
@@ -336,6 +341,17 @@ export interface CodexHistoryRestoreResult {
   restored_session_count: number;
   restored_index_count: number;
   warning_messages: string[];
+}
+
+export interface CodexHistoryCompatibilityState {
+  native_supported: boolean;
+  probe_error: string | null;
+  migration_required: boolean;
+  normal_session_count: number;
+  archived_session_count: number;
+  encrypted_content_session_count: number;
+  provider_counts: HistoryProviderCount[];
+  can_restore_latest: boolean;
 }
 
 export interface SwitchCodexModeResult {
@@ -397,6 +413,10 @@ export async function getConfiguration() {
 
 export async function getCodexIntegrationState() {
   return invoke<CodexIntegrationState>("get_codex_integration_state");
+}
+
+export async function getCodexHistoryCompatibility() {
+  return invoke<CodexHistoryCompatibilityState>("get_codex_history_compatibility");
 }
 
 export async function switchCodexConnectionMode(mode: "official" | "gateway") {

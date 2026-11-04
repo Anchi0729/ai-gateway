@@ -15,7 +15,7 @@ Codex -> OpenAI 官方
 Codex -> AI Gateway -> 第三方中转
 ```
 
-官方和第三方模式使用同一个 Codex `custom` Provider，并保持 `requires_openai_auth = true`。AI Gateway 只读检查 `auth.json` 中是否存在可识别的本地登录凭据，不会修改、备份或展示其中内容；官方登录仍由 Codex 自己管理。
+官方模式使用 `openai` Provider，第三方模式使用 `ai_gateway` Provider；两个受管配置会同时保留，切换只改变 `model_provider`。旧版或外部工具使用的 `custom` 会被保留，不会被新逻辑主动覆盖。AI Gateway 只读检查 `auth.json` 中是否存在可识别的本地登录凭据，不会修改、备份或展示其中内容；官方登录仍由 Codex 自己管理。
 
 ## 核心功能
 
@@ -27,6 +27,7 @@ Codex -> AI Gateway -> 第三方中转
 - 统计第三方返回的 `usage`，并同步 Codex 本地记录的官方 Token 用量。
 - 使用 Windows Credential Manager 保存第三方 API Key。
 - 使用密码加密的 `.aigateway` 文件备份中转、密钥和路由配置。
+- 优先使用 Codex 原生的跨 Provider 会话列表；旧版 Codex 不支持时提供手动兼容迁移。
 - 同时提供 Windows NSIS 安装版和免安装便携版。
 
 ## 快速开始

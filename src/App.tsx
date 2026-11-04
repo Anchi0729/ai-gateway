@@ -76,11 +76,17 @@ import {
   UsageStatistics,
   TokenMetric,
   CodexIntegrationState,
+  CodexHistoryCompatibilityState,
+  CodexHistoryMigrationPreview,
   CodexConnectionMode,
   getCodexIntegrationState,
+  getCodexHistoryCompatibility,
   switchCodexConnectionMode,
   refreshCodexLoginStatus,
   repairCodexGatewayConfiguration,
+  previewCodexHistoryMigration,
+  applyCodexHistoryMigration,
+  restoreCodexHistoryMigration,
   syncCodexUsage,
   rebuildCodexUsage,
 } from "./api";
@@ -270,6 +276,8 @@ function App() {
   const [usageError, setUsageError] = useState<string | null>(null);
   const [routingPolicy, setRoutingPolicy] = useState<RoutingPolicy | null>(null);
   const [codexState, setCodexState] = useState<CodexIntegrationState | null>(null);
+  const [codexHistoryCompatibility, setCodexHistoryCompatibility] =
+    useState<CodexHistoryCompatibilityState | null>(null);
   const [codexBusy, setCodexBusy] = useState(false);
   const [codexError, setCodexError] = useState<string | null>(null);
   const [configurationSnapshot, setConfigurationSnapshot] =
@@ -359,7 +367,12 @@ function App() {
           cli_status: "installed_stopped",
           login_status: "logged_in",
           current_mode: "gateway",
+          current_provider_id: "ai_gateway",
           gateway_configured: true,
+          history_native_supported: true,
+          history_probe_error: null,
+          history_migration_required: false,
+          history_provider_counts: [],
         });
         setLastUpdatedAt(new Date());
       }
@@ -397,6 +410,24 @@ function App() {
     );
     return () => window.clearInterval(timer);
   }, [refreshUsage, usageQuery, view]);
+
+  useEffect(() => {
+    if (view !== "codex") return;
+    void getCodexHistoryCompatibility()
+      .then(setCodexHistoryCompatibility)
+      .catch((error) => {
+        setCodexHistoryCompatibility({
+          native_supported: false,
+          probe_error: String(error),
+          migration_required: false,
+          normal_session_count: 0,
+          archived_session_count: 0,
+          encrypted_content_session_count: 0,
+          provider_counts: [],
+          can_restore_latest: false,
+        });
+      });
+  }, [view]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -1089,6 +1120,8 @@ function App() {
         ) : view === "codex" ? (
           <CodexIntegrationPanel
             state={codexState}
+            historyCompatibility={codexHistoryCompatibility}
+            onHistoryCompatibilityChanged={setCodexHistoryCompatibility}
             busy={codexBusy}
             error={codexError}
             onSwitch={handleSwitchCodexMode}
@@ -1261,6 +1294,8 @@ function usageQualityLabel(quality: "exact" | "mixed" | "estimated" | "unknown")
 
 function CodexIntegrationPanel({
   state,
+  historyCompatibility,
+  onHistoryCompatibilityChanged,
   busy,
   error,
   onSwitch,
@@ -1268,12 +1303,18 @@ function CodexIntegrationPanel({
   onRepair,
 }: {
   state: CodexIntegrationState | null;
+  historyCompatibility: CodexHistoryCompatibilityState | null;
+  onHistoryCompatibilityChanged: (value: CodexHistoryCompatibilityState) => void;
   busy: boolean;
   error: string | null;
   onSwitch: (mode: "official" | "gateway") => Promise<void>;
   onRefreshLogin: () => void;
   onRepair: () => void;
 }) {
+  const [historyPreview, setHistoryPreview] =
+    useState<CodexHistoryMigrationPreview | null>(null);
+  const [historyBusy, setHistoryBusy] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
   const loginLabel = state?.login_status === "logged_in"
     ? "已登录"
     : state?.login_status === "logged_out"
@@ -1295,7 +1336,8 @@ function CodexIntegrationPanel({
         <div className="codex-status-list">
           <div><span>Codex 桌面端</span><strong>{applicationLabel(state?.desktop_status)}</strong></div>
           <div><span>Codex CLI</span><strong>{applicationLabel(state?.cli_status)}</strong></div>
-          <div><span>ChatGPT 登录</span><strong>{loginLabel}</strong></div>
+            <div><span>ChatGPT 登录</span><strong>{loginLabel}</strong></div>
+            <div><span>当前 Provider</span><strong>{state?.current_provider_id ?? "未识别"}</strong></div>
         </div>
         <button className="secondary-button" disabled={busy} onClick={onRefreshLogin}>
           <RefreshCw size={15} />重新检测
@@ -1359,6 +1401,97 @@ function CodexIntegrationPanel({
           </div>
         </article>
       </section>
+
+      {historyCompatibility?.native_supported && (
+        <section className="panel codex-history-panel">
+          <div>
+            <p className="section-kicker">SESSION HISTORY</p>
+            <h2>Codex 原生管理跨 Provider 会话</h2>
+            <p>当前 Codex 支持按 Provider 之外的统一线程列表查看历史，AI Gateway 不会改写会话文件。</p>
+          </div>
+          {historyCompatibility.provider_counts.length > 0 && (
+            <span className="codex-history-counts">
+              {historyCompatibility.provider_counts.map((item) => `${item.provider} ${item.count}`).join(" · ")}
+            </span>
+          )}
+        </section>
+      )}
+
+      {historyCompatibility && !historyCompatibility.native_supported && historyCompatibility.migration_required && (
+        <section className="panel codex-history-panel legacy">
+          <div>
+            <p className="section-kicker">LEGACY COMPATIBILITY</p>
+            <h2>旧版会话兼容迁移</h2>
+            <p>当前 Codex 未确认支持跨 Provider 会话列表。此操作只修改会话首行 Provider 元数据，不修改聊天正文，并会先创建备份。</p>
+            <span className="codex-history-counts">
+              普通 {historyCompatibility.normal_session_count} · 归档 {historyCompatibility.archived_session_count} · 含加密内容 {historyCompatibility.encrypted_content_session_count}
+            </span>
+            {historyCompatibility.probe_error && <small>{historyCompatibility.probe_error}</small>}
+            {historyError && <small className="form-error">{historyError}</small>}
+          </div>
+          <div className="codex-mode-actions">
+            <button
+              className="secondary-button"
+              disabled={historyBusy}
+              onClick={async () => {
+                setHistoryBusy(true);
+                setHistoryError(null);
+                try {
+                  setHistoryPreview(await previewCodexHistoryMigration());
+                } catch (error) {
+                  setHistoryError(String(error));
+                } finally {
+                  setHistoryBusy(false);
+                }
+              }}
+            >
+              {historyBusy ? "扫描中…" : "扫描并预览"}
+            </button>
+            {historyPreview && (
+              <button
+                className="primary-button"
+                disabled={historyBusy || historyPreview.migration_required_count === 0}
+                onClick={async () => {
+                  if (!window.confirm(`将迁移 ${historyPreview.migration_required_count} 个会话的 Provider 元数据，是否继续？`)) return;
+                  setHistoryBusy(true);
+                  setHistoryError(null);
+                  try {
+                    await applyCodexHistoryMigration(historyPreview.preview_id);
+                    setHistoryPreview(null);
+                    onHistoryCompatibilityChanged(await getCodexHistoryCompatibility());
+                  } catch (error) {
+                    setHistoryError(String(error));
+                  } finally {
+                    setHistoryBusy(false);
+                  }
+                }}
+              >
+                执行旧版迁移
+              </button>
+            )}
+            {historyCompatibility.can_restore_latest && (
+              <button
+                className="secondary-button"
+                disabled={historyBusy}
+                onClick={async () => {
+                  setHistoryBusy(true);
+                  setHistoryError(null);
+                  try {
+                    await restoreCodexHistoryMigration();
+                    onHistoryCompatibilityChanged(await getCodexHistoryCompatibility());
+                  } catch (error) {
+                    setHistoryError(String(error));
+                  } finally {
+                    setHistoryBusy(false);
+                  }
+                }}
+              >
+                恢复最近一次备份
+              </button>
+            )}
+          </div>
+        </section>
+      )}
 
     </div>
   );

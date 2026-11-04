@@ -7,15 +7,18 @@ use std::{
     env, fs,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::Command,
-    sync::Mutex,
+    process::{Command, Stdio},
+    sync::{mpsc, Mutex},
+    time::Duration,
 };
 use sysinfo::{Pid, System};
 use toml_edit::{value, DocumentMut, InlineTable, Item, Table};
 use uuid::Uuid;
 use zeroize::Zeroize;
 
-const MANAGED_PROVIDER_ID: &str = "custom";
+const OFFICIAL_PROVIDER_ID: &str = "openai";
+const GATEWAY_PROVIDER_ID: &str = "ai_gateway";
+const LEGACY_PROVIDER_ID: &str = "custom";
 const CONFIG_BACKUP_LIMIT: usize = 10;
 const HISTORY_BACKUP_LIMIT: usize = 3;
 const HISTORY_BACKUP_DIR: &str = "ai-gateway-history-backups";
@@ -60,7 +63,24 @@ pub struct CodexIntegrationState {
     pub cli_status: CodexApplicationStatus,
     pub login_status: CodexLoginStatus,
     pub current_mode: CodexConnectionMode,
+    pub current_provider_id: Option<String>,
     pub gateway_configured: bool,
+    pub history_native_supported: bool,
+    pub history_probe_error: Option<String>,
+    pub history_migration_required: bool,
+    pub history_provider_counts: Vec<HistoryProviderCount>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CodexHistoryCompatibilityState {
+    pub native_supported: bool,
+    pub probe_error: Option<String>,
+    pub migration_required: bool,
+    pub normal_session_count: usize,
+    pub archived_session_count: usize,
+    pub encrypted_content_session_count: usize,
+    pub provider_counts: Vec<HistoryProviderCount>,
+    pub can_restore_latest: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -211,29 +231,73 @@ fn current_provider(document: &DocumentMut) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn detected_mode(document: &DocumentMut) -> (CodexConnectionMode, Option<String>) {
+pub fn active_provider_id() -> Result<Option<String>, String> {
+    let path = config_path()?;
+    let parsed = read_config(&path)?;
+    Ok(current_provider(&parsed.document))
+}
+
+fn detected_mode(
+    document: &DocumentMut,
+    legacy_managed: bool,
+) -> (CodexConnectionMode, Option<String>) {
     let current = current_provider(document);
-    if current.as_deref() != Some(MANAGED_PROVIDER_ID) {
-        return match current {
-            None => (CodexConnectionMode::External, None),
-            Some(provider) => (CodexConnectionMode::External, Some(provider)),
-        };
-    }
-    match managed_provider_table(document) {
-        Some(table) if is_official_provider_shape(table) => (CodexConnectionMode::Official, None),
-        Some(table) if is_gateway_provider_shape(table) => (CodexConnectionMode::Gateway, None),
-        _ => (
-            CodexConnectionMode::External,
-            Some(MANAGED_PROVIDER_ID.to_string()),
-        ),
+    match current.as_deref() {
+        Some(OFFICIAL_PROVIDER_ID) => {
+            if provider_table(document, OFFICIAL_PROVIDER_ID)
+                .is_some_and(is_official_provider_shape)
+            {
+                (
+                    CodexConnectionMode::Official,
+                    Some(OFFICIAL_PROVIDER_ID.to_string()),
+                )
+            } else {
+                (
+                    CodexConnectionMode::External,
+                    Some(OFFICIAL_PROVIDER_ID.to_string()),
+                )
+            }
+        }
+        Some(GATEWAY_PROVIDER_ID) => {
+            if provider_table(document, GATEWAY_PROVIDER_ID).is_some_and(is_gateway_provider_shape)
+            {
+                (
+                    CodexConnectionMode::Gateway,
+                    Some(GATEWAY_PROVIDER_ID.to_string()),
+                )
+            } else {
+                (
+                    CodexConnectionMode::External,
+                    Some(GATEWAY_PROVIDER_ID.to_string()),
+                )
+            }
+        }
+        Some(LEGACY_PROVIDER_ID) if legacy_managed => {
+            match provider_table(document, LEGACY_PROVIDER_ID) {
+                Some(table) if is_official_provider_shape(table) => (
+                    CodexConnectionMode::Official,
+                    Some(LEGACY_PROVIDER_ID.to_string()),
+                ),
+                Some(table) if is_gateway_provider_shape(table) => (
+                    CodexConnectionMode::Gateway,
+                    Some(LEGACY_PROVIDER_ID.to_string()),
+                ),
+                _ => (
+                    CodexConnectionMode::External,
+                    Some(LEGACY_PROVIDER_ID.to_string()),
+                ),
+            }
+        }
+        None => (CodexConnectionMode::External, None),
+        Some(provider) => (CodexConnectionMode::External, Some(provider.to_string())),
     }
 }
 
-fn managed_provider_table(document: &DocumentMut) -> Option<&Table> {
+fn provider_table<'a>(document: &'a DocumentMut, provider_id: &str) -> Option<&'a Table> {
     document
         .get("model_providers")
         .and_then(Item::as_table)
-        .and_then(|providers| providers.get(MANAGED_PROVIDER_ID))
+        .and_then(|providers| providers.get(provider_id))
         .and_then(Item::as_table)
 }
 
@@ -285,7 +349,9 @@ fn gateway_configuration_current(
     document: &DocumentMut,
     configuration: &GatewayCodexConfiguration,
 ) -> bool {
-    let Some(table) = managed_provider_table(document) else {
+    let Some(table) = provider_table(document, GATEWAY_PROVIDER_ID)
+        .or_else(|| provider_table(document, LEGACY_PROVIDER_ID))
+    else {
         return false;
     };
     gateway_endpoint_and_token_current(table, configuration)
@@ -326,6 +392,7 @@ fn build_official_provider() -> Table {
 fn apply_gateway(
     document: &mut DocumentMut,
     configuration: &GatewayCodexConfiguration,
+    remove_legacy_provider: bool,
 ) -> Result<(), String> {
     if !document.contains_key("model_providers") {
         document["model_providers"] = Item::Table(Table::new());
@@ -333,20 +400,33 @@ fn apply_gateway(
     let providers = document["model_providers"]
         .as_table_mut()
         .ok_or_else(|| "Codex 配置中的 model_providers 不是有效表结构".to_string())?;
-    providers[MANAGED_PROVIDER_ID] = Item::Table(build_managed_provider(configuration)?);
-    document["model_provider"] = value(MANAGED_PROVIDER_ID);
+    providers[GATEWAY_PROVIDER_ID] = Item::Table(build_managed_provider(configuration)?);
+    providers[OFFICIAL_PROVIDER_ID] = Item::Table(build_official_provider());
+    if remove_legacy_provider {
+        providers.remove(LEGACY_PROVIDER_ID);
+    }
+    document["model_provider"] = value(GATEWAY_PROVIDER_ID);
     Ok(())
 }
 
-fn apply_official(document: &mut DocumentMut) -> Result<(), String> {
+fn apply_official(
+    document: &mut DocumentMut,
+    configuration: &GatewayCodexConfiguration,
+    remove_legacy_provider: bool,
+) -> Result<(), String> {
     if !document.contains_key("model_providers") {
         document["model_providers"] = Item::Table(Table::new());
     }
     let providers = document["model_providers"]
         .as_table_mut()
         .ok_or_else(|| "Codex 配置中的 model_providers 不是有效表结构".to_string())?;
-    providers[MANAGED_PROVIDER_ID] = Item::Table(build_official_provider());
-    document["model_provider"] = value(MANAGED_PROVIDER_ID);
+    providers[OFFICIAL_PROVIDER_ID] = Item::Table(build_official_provider());
+    providers[GATEWAY_PROVIDER_ID] = Item::Table(build_managed_provider(configuration)?);
+    // 官方模式下仍保留 ai_gateway 配置定义，切回第三方时无需重新生成临时配置。
+    if remove_legacy_provider {
+        providers.remove(LEGACY_PROVIDER_ID);
+    }
+    document["model_provider"] = value(OFFICIAL_PROVIDER_ID);
     Ok(())
 }
 
@@ -650,7 +730,7 @@ pub fn scan_history() -> Result<HistoryPreviewSnapshot, String> {
         .count();
     let migration_required_count = sessions
         .iter()
-        .filter(|session| session.provider != MANAGED_PROVIDER_ID)
+        .filter(|session| session.provider != LEGACY_PROVIDER_ID)
         .count();
     let mut warning_messages = vec![
         "迁移只统一本地会话可见性，不保证第三方中转能继续处理官方 encrypted_content".to_string(),
@@ -790,7 +870,7 @@ fn create_history_backup(
     let changed_sessions = snapshot
         .sessions
         .iter()
-        .filter(|item| item.provider != MANAGED_PROVIDER_ID)
+        .filter(|item| item.provider != LEGACY_PROVIDER_ID)
         .cloned()
         .collect::<Vec<_>>();
     for session in &changed_sessions {
@@ -808,7 +888,7 @@ fn create_history_backup(
         index_entries: snapshot
             .index_entries
             .iter()
-            .filter(|entry| entry.provider != MANAGED_PROVIDER_ID)
+            .filter(|entry| entry.provider != LEGACY_PROVIDER_ID)
             .cloned()
             .collect(),
     };
@@ -877,7 +957,7 @@ fn restore_index_entries(db_path: &Path, entries: &[HistoryIndexEntry]) -> Resul
                     entry.provider,
                     entry.host_id,
                     entry.thread_id,
-                    MANAGED_PROVIDER_ID
+                    LEGACY_PROVIDER_ID
                 ],
             )
             .map_err(|error| format!("无法补偿 Codex 会话索引：{error}"))?;
@@ -911,7 +991,7 @@ pub fn apply_history_migration(
                 return Err(format!("无法读取待迁移会话：{error}"));
             }
         };
-        let rewritten = match rewrite_session_provider(&original, MANAGED_PROVIDER_ID) {
+        let rewritten = match rewrite_session_provider(&original, LEGACY_PROVIDER_ID) {
             Ok(bytes) => bytes,
             Err(error) => {
                 remove_prepared_temps(&prepared);
@@ -945,7 +1025,7 @@ pub fn apply_history_migration(
                     "UPDATE local_thread_catalog SET model_provider = ?1
                      WHERE host_id = ?2 AND thread_id = ?3 AND model_provider = ?4",
                     params![
-                        MANAGED_PROVIDER_ID,
+                        LEGACY_PROVIDER_ID,
                         entry.host_id,
                         entry.thread_id,
                         entry.provider
@@ -1028,7 +1108,7 @@ pub fn restore_latest_history_migration() -> Result<CodexHistoryRestoreResult, S
                 .and_then(serde_json::Value::as_str)
                 .map(ToOwned::to_owned)
         });
-        if current_provider.as_deref() != Some(MANAGED_PROVIDER_ID) {
+        if current_provider.as_deref() != Some(LEGACY_PROVIDER_ID) {
             warnings.push(format!(
                 "会话 Provider 已在迁移后被修改，已跳过：{}",
                 session.relative_path
@@ -1255,32 +1335,159 @@ pub fn environment_status() -> CodexEnvironmentStatus {
     }
 }
 
-pub fn integration_state(
+pub fn integration_state_with_hash(
     configuration: &GatewayCodexConfiguration,
     environment: CodexEnvironmentStatus,
+    managed_hash: Option<&str>,
 ) -> CodexIntegrationState {
+    let current_hash = config_fingerprint().ok();
+    let legacy_managed = managed_hash
+        .zip(current_hash.as_deref())
+        .is_some_and(|(expected, actual)| expected == actual);
     let (current_mode, gateway_configured) = config_path()
         .and_then(|path| read_config(&path))
         .map(|parsed| {
-            let (mode, _) = detected_mode(&parsed.document);
+            let (mode, _) = detected_mode(&parsed.document, legacy_managed);
             let gateway_current = mode == CodexConnectionMode::Gateway
                 && gateway_configuration_current(&parsed.document, configuration);
             (mode, gateway_current)
         })
         .unwrap_or((CodexConnectionMode::External, false));
 
+    let current_provider_id = config_path()
+        .and_then(|path| read_config(&path))
+        .ok()
+        .and_then(|parsed| current_provider(&parsed.document));
     CodexIntegrationState {
         desktop_status: environment.desktop_status,
         cli_status: environment.cli_status,
         login_status: environment.login_status,
         current_mode,
+        current_provider_id,
         gateway_configured,
+        // 会话能力探测由独立命令触发并缓存，避免状态轮询每 15 秒启动一次 Codex 子进程。
+        history_native_supported: false,
+        history_probe_error: None,
+        history_migration_required: false,
+        history_provider_counts: Vec::new(),
     }
 }
 
-pub fn switch_mode(
+pub fn integration_state(
+    configuration: &GatewayCodexConfiguration,
+    environment: CodexEnvironmentStatus,
+) -> CodexIntegrationState {
+    integration_state_with_hash(configuration, environment, None)
+}
+
+/// 只读取会话元数据并探测当前 Codex 是否提供跨 Provider 的线程列表能力。
+/// 探测失败时保留兼容迁移入口，但不会自动改写任何会话文件。
+pub fn history_compatibility_state() -> Result<CodexHistoryCompatibilityState, String> {
+    let native_probe = probe_native_history_support();
+    let snapshot = scan_history()?;
+    Ok(CodexHistoryCompatibilityState {
+        native_supported: native_probe.0,
+        probe_error: native_probe.1,
+        migration_required: !native_probe.0 && snapshot.preview.migration_required_count > 0,
+        normal_session_count: snapshot.preview.normal_session_count,
+        archived_session_count: snapshot.preview.archived_session_count,
+        encrypted_content_session_count: snapshot.preview.encrypted_content_session_count,
+        provider_counts: snapshot.preview.provider_counts,
+        can_restore_latest: snapshot.preview.can_restore_latest,
+    })
+}
+
+fn probe_native_history_support() -> (bool, Option<String>) {
+    let mut command = Command::new("codex");
+    command.args(["app-server", "--listen", "stdio://"]);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return (false, Some(format!("无法启动 Codex App Server：{error}"))),
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        return (false, Some("Codex App Server 未提供标准输入".to_string()));
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        return (false, Some("Codex App Server 未提供标准输出".to_string()));
+    };
+
+    let request = concat!(
+        "{\"method\":\"initialize\",\"id\":1,\"params\":{\"clientInfo\":{\"name\":\"ai-gateway\",\"title\":\"AI Gateway\",\"version\":\"",
+        env!("CARGO_PKG_VERSION"),
+        "\"}}}\n",
+        "{\"method\":\"initialized\",\"params\":{}}\n",
+        "{\"method\":\"thread/list\",\"id\":2,\"params\":{\"limit\":1,\"modelProviders\":[],\"sourceKinds\":[\"cli\",\"vscode\",\"appServer\",\"exec\",\"subAgent\",\"subAgentReview\",\"subAgentCompact\",\"subAgentThreadSpawn\",\"subAgentOther\",\"unknown\"],\"archived\":false}}\n"
+    );
+    if let Err(error) = stdin
+        .write_all(request.as_bytes())
+        .and_then(|_| stdin.flush())
+    {
+        let _ = child.kill();
+        return (false, Some(format!("无法请求 Codex 会话列表：{error}")));
+    }
+
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    let _ = sender.send(Err("Codex App Server 提前退出".to_string()));
+                    return;
+                }
+                Ok(_) => {
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                        continue;
+                    };
+                    if value.get("id").and_then(serde_json::Value::as_i64) != Some(2) {
+                        continue;
+                    }
+                    if value.get("result").is_some() {
+                        let _ = sender.send(Ok(()));
+                    } else {
+                        let message = value
+                            .pointer("/error/message")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("thread/list 不受当前 Codex 支持")
+                            .to_string();
+                        let _ = sender.send(Err(message));
+                    }
+                    return;
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(format!("读取 Codex App Server 响应失败：{error}")));
+                    return;
+                }
+            }
+        }
+    });
+
+    let result = receiver.recv_timeout(Duration::from_secs(5));
+    let _ = child.kill();
+    match result {
+        Ok(Ok(())) => (true, None),
+        Ok(Err(error)) => (false, Some(error)),
+        Err(_) => (false, Some("Codex App Server 会话列表探测超时".to_string())),
+    }
+}
+
+pub fn switch_mode_with_hash(
     requested: CodexConnectionMode,
     configuration: &GatewayCodexConfiguration,
+    managed_hash: Option<&str>,
 ) -> Result<SwitchCodexModeResult, String> {
     if requested == CodexConnectionMode::External {
         return Err("external 是检测状态，不能作为切换目标".to_string());
@@ -1291,10 +1498,16 @@ pub fn switch_mode(
     let path = config_path()?;
     let mut parsed = read_config(&path)?;
     let original_contents = parsed.document.to_string();
-    let (previous_mode, _) = detected_mode(&parsed.document);
+    let legacy_managed = managed_hash.is_some_and(|hash| hash == parsed.hash.as_str())
+        && current_provider(&parsed.document).as_deref() == Some(LEGACY_PROVIDER_ID);
+    let (previous_mode, _) = detected_mode(&parsed.document, legacy_managed);
     match requested {
-        CodexConnectionMode::Official => apply_official(&mut parsed.document)?,
-        CodexConnectionMode::Gateway => apply_gateway(&mut parsed.document, configuration)?,
+        CodexConnectionMode::Official => {
+            apply_official(&mut parsed.document, configuration, legacy_managed)?
+        }
+        CodexConnectionMode::Gateway => {
+            apply_gateway(&mut parsed.document, configuration, legacy_managed)?
+        }
         CodexConnectionMode::External => unreachable!(),
     }
     let changed = parsed.document.to_string() != original_contents;
@@ -1310,22 +1523,39 @@ pub fn switch_mode(
     })
 }
 
+pub fn switch_mode(
+    requested: CodexConnectionMode,
+    configuration: &GatewayCodexConfiguration,
+) -> Result<SwitchCodexModeResult, String> {
+    switch_mode_with_hash(requested, configuration, None)
+}
+
+pub fn repair_gateway_configuration_with_hash(
+    configuration: &GatewayCodexConfiguration,
+    managed_hash: Option<&str>,
+) -> Result<SwitchCodexModeResult, String> {
+    switch_mode_with_hash(CodexConnectionMode::Gateway, configuration, managed_hash)
+}
+
 pub fn repair_gateway_configuration(
     configuration: &GatewayCodexConfiguration,
 ) -> Result<SwitchCodexModeResult, String> {
-    switch_mode(CodexConnectionMode::Gateway, configuration)
+    repair_gateway_configuration_with_hash(configuration, None)
 }
 
-pub fn update_managed_gateway_configuration(
+pub fn update_managed_gateway_configuration_with_hash(
     old_configuration: &GatewayCodexConfiguration,
     new_configuration: &GatewayCodexConfiguration,
+    managed_hash: Option<&str>,
 ) -> Result<Option<String>, String> {
     let _guard = CONFIG_WRITE_LOCK
         .lock()
         .map_err(|_| "Codex 配置写入锁已损坏".to_string())?;
     let path = config_path()?;
     let mut parsed = read_config(&path)?;
-    let (mode, _) = detected_mode(&parsed.document);
+    let legacy_managed = managed_hash.is_some_and(|hash| hash == parsed.hash.as_str())
+        && current_provider(&parsed.document).as_deref() == Some(LEGACY_PROVIDER_ID);
+    let (mode, _) = detected_mode(&parsed.document, legacy_managed);
     if mode != CodexConnectionMode::Gateway {
         return Ok(None);
     }
@@ -1335,50 +1565,16 @@ pub fn update_managed_gateway_configuration(
                 .to_string(),
         );
     }
-    apply_gateway(&mut parsed.document, new_configuration)?;
+    apply_gateway(&mut parsed.document, new_configuration, legacy_managed)?;
     let hash = write_config(&path, &parsed.hash, &parsed.document)?;
     Ok(Some(hash))
 }
 
-/// 仅升级 AI Gateway 旧版本明确受管且未被外部修改的 Provider。
-/// 指纹不匹配时保持只读，让用户通过“修复配置”明确接管。
-pub fn migrate_legacy_stream_retries(
-    configuration: &GatewayCodexConfiguration,
-    managed_hash: Option<&str>,
+pub fn update_managed_gateway_configuration(
+    old_configuration: &GatewayCodexConfiguration,
+    new_configuration: &GatewayCodexConfiguration,
 ) -> Result<Option<String>, String> {
-    if configuration.stream_max_retries == 2 {
-        return Ok(None);
-    }
-    let Some(managed_hash) = managed_hash else {
-        return Ok(None);
-    };
-    let _guard = CONFIG_WRITE_LOCK
-        .lock()
-        .map_err(|_| "Codex 配置写入锁已损坏".to_string())?;
-    let Ok(path) = config_path() else {
-        return Ok(None);
-    };
-    // 自动迁移必须建立在配置可读取、可解析的前提上；无法证明归属时保持只读，
-    // 避免一个损坏或被外部工具改写的 Codex 配置阻止 AI Gateway 启动。
-    let Ok(mut parsed) = read_config(&path) else {
-        return Ok(None);
-    };
-    if parsed.hash != managed_hash
-        || current_provider(&parsed.document).as_deref() != Some(MANAGED_PROVIDER_ID)
-    {
-        return Ok(None);
-    }
-    let Some(table) = managed_provider_table(&parsed.document) else {
-        return Ok(None);
-    };
-    let is_legacy_configuration = gateway_endpoint_and_token_current(table, configuration)
-        && table.get("request_max_retries").and_then(Item::as_integer) == Some(0)
-        && table.get("stream_max_retries").and_then(Item::as_integer) == Some(2);
-    if !is_legacy_configuration {
-        return Ok(None);
-    }
-    apply_gateway(&mut parsed.document, configuration)?;
-    write_config(&path, &parsed.hash, &parsed.document).map(Some)
+    update_managed_gateway_configuration_with_hash(old_configuration, new_configuration, None)
 }
 
 #[cfg(test)]
@@ -1421,7 +1617,9 @@ mod tests {
             let managed = fs::read_to_string(home.join("config.toml")).unwrap();
             assert!(managed.contains("# keep"));
             assert!(managed.contains("X-AI-Gateway-Token"));
-            assert!(managed.contains("model_provider = \"custom\""));
+            assert!(managed.contains("model_provider = \"ai_gateway\""));
+            assert!(managed.contains("model_providers.openai"));
+            assert!(managed.contains("model_providers.ai_gateway"));
             assert!(managed.contains("requires_openai_auth = true"));
             assert!(managed.contains("request_max_retries = 0"));
             assert!(managed.contains("stream_max_retries = 5"));
@@ -1434,10 +1632,22 @@ mod tests {
             let official = fs::read_to_string(home.join("config.toml")).unwrap();
             assert!(official.contains("mcp_servers.demo"));
             assert!(official.contains("model_providers.other"));
-            assert!(official.contains("model_providers.custom"));
+            assert!(official.contains("model_provider = \"openai\""));
+            assert!(official.contains("model_providers.openai"));
+            assert!(official.contains("model_providers.ai_gateway"));
             assert!(official.contains("name = \"OpenAI\""));
             assert!(official.contains("requires_openai_auth = true"));
-            assert!(!official.contains("base_url"));
+            assert!(official.contains("http://127.0.0.1:9988/v1"));
+            let state = integration_state(
+                &gateway(9988, "local-secret"),
+                CodexEnvironmentStatus {
+                    desktop_status: CodexApplicationStatus::NotInstalled,
+                    cli_status: CodexApplicationStatus::NotInstalled,
+                    login_status: CodexLoginStatus::Unknown,
+                },
+            );
+            assert_eq!(state.current_mode, CodexConnectionMode::Official);
+            assert_eq!(state.current_provider_id.as_deref(), Some("openai"));
         });
     }
 
@@ -1455,10 +1665,33 @@ mod tests {
             );
             assert_eq!(state.current_mode, CodexConnectionMode::External);
 
-            // 用户点击模式按钮即构成明确接管，之后配置固定为共享 custom Provider。
+            // 外部 custom 不被覆盖；新模式写入独立的 ai_gateway Provider。
             switch_mode(CodexConnectionMode::Gateway, &gateway(8765, "token")).unwrap();
             let updated = fs::read_to_string(home.join("config.toml")).unwrap();
-            assert!(updated.contains("name = \"AI Gateway\""));
+            assert!(updated.contains("model_provider = \"ai_gateway\""));
+            assert!(updated.contains("name = \"CC-Switch\""));
+        });
+    }
+
+    #[test]
+    fn managed_legacy_custom_is_renamed_only_when_hash_matches() {
+        with_temp_codex_home(|home| {
+            fs::write(
+                home.join("config.toml"),
+                "model_provider = \"custom\"\n[model_providers.custom]\nname = \"OpenAI\"\nwire_api = \"responses\"\nrequires_openai_auth = true\n",
+            )
+            .unwrap();
+            let managed_hash = config_fingerprint().unwrap();
+            switch_mode_with_hash(
+                CodexConnectionMode::Gateway,
+                &gateway(8765, "token"),
+                Some(&managed_hash),
+            )
+            .unwrap();
+            let updated = fs::read_to_string(home.join("config.toml")).unwrap();
+            assert!(updated.contains("model_provider = \"ai_gateway\""));
+            assert!(updated.contains("model_providers.ai_gateway"));
+            assert!(!updated.contains("model_providers.custom"));
         });
     }
 
@@ -1483,59 +1716,6 @@ mod tests {
             assert!(fs::read_to_string(home.join("config.toml"))
                 .unwrap()
                 .contains("stream_max_retries = 2"));
-        });
-    }
-
-    #[test]
-    fn legacy_managed_stream_retries_upgrade_when_fingerprint_matches() {
-        with_temp_codex_home(|home| {
-            let mut legacy = gateway(8765, "token");
-            legacy.stream_max_retries = 2;
-            switch_mode(CodexConnectionMode::Gateway, &legacy).unwrap();
-            let managed_hash = config_fingerprint().unwrap();
-
-            let updated_hash =
-                migrate_legacy_stream_retries(&gateway(8765, "token"), Some(&managed_hash))
-                    .unwrap();
-            let updated = fs::read_to_string(home.join("config.toml")).unwrap();
-            let current_hash = config_fingerprint().unwrap();
-
-            assert!(updated_hash.is_some());
-            assert!(updated.contains("request_max_retries = 0"));
-            assert!(updated.contains("stream_max_retries = 5"));
-            assert_eq!(updated_hash.as_deref(), Some(current_hash.as_str()));
-        });
-    }
-
-    #[test]
-    fn legacy_stream_retry_upgrade_preserves_external_edits() {
-        with_temp_codex_home(|home| {
-            let mut legacy = gateway(8765, "token");
-            legacy.stream_max_retries = 2;
-            switch_mode(CodexConnectionMode::Gateway, &legacy).unwrap();
-            let managed_hash = config_fingerprint().unwrap();
-            let path = home.join("config.toml");
-            let mut externally_modified = fs::read_to_string(&path).unwrap();
-            externally_modified.push_str("\n# external change\n");
-            fs::write(&path, &externally_modified).unwrap();
-
-            let result =
-                migrate_legacy_stream_retries(&gateway(8765, "token"), Some(&managed_hash))
-                    .unwrap();
-
-            assert!(result.is_none());
-            assert_eq!(fs::read_to_string(path).unwrap(), externally_modified);
-        });
-    }
-
-    #[test]
-    fn legacy_stream_retry_upgrade_ignores_unreadable_configuration() {
-        with_temp_codex_home(|home| {
-            fs::write(home.join("config.toml"), "model_provider = [broken").unwrap();
-
-            let result = migrate_legacy_stream_retries(&gateway(8765, "token"), Some("stale-hash"));
-
-            assert!(matches!(result, Ok(None)));
         });
     }
 
@@ -1687,7 +1867,7 @@ mod tests {
     #[test]
     fn rewriting_session_changes_only_first_line_provider() {
         let original = b"{\"type\":\"session_meta\",\"payload\":{\"session_id\":\"thread-1\",\"model_provider\":\"openai\"}}\r\n{\"type\":\"response_item\",\"payload\":{\"text\":\"keep exactly\"}}\r\n";
-        let rewritten = rewrite_session_provider(original, MANAGED_PROVIDER_ID).unwrap();
+        let rewritten = rewrite_session_provider(original, LEGACY_PROVIDER_ID).unwrap();
         let original_tail =
             &original[original.iter().position(|byte| *byte == b'\n').unwrap() + 1..];
         let rewritten_tail =

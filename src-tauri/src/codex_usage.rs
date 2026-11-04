@@ -1143,7 +1143,7 @@ fn mode_at(
 fn classify_source(model_provider: Option<&str>, observed_mode: Option<&str>) -> &'static str {
     if model_provider == Some("openai") || observed_mode == Some("official") {
         "official"
-    } else if observed_mode == Some("gateway") {
+    } else if model_provider == Some("ai_gateway") || observed_mode == Some("gateway") {
         "gateway"
     } else {
         "unconfirmed"
@@ -1935,6 +1935,10 @@ mod tests {
         assert_eq!(
             classify_source(Some("custom"), Some("official")),
             "official"
+        );
+        assert_eq!(
+            classify_source(Some("ai_gateway"), Some("gateway")),
+            "gateway"
         );
         assert_eq!(classify_source(Some("openai"), Some("gateway")), "official");
         assert_eq!(classify_source(Some("custom"), None), "unconfirmed");

@@ -1,8 +1,8 @@
 use super::{
     codex_integration, gateway_codex_configuration, normalized_routing_policy,
     persist_codex_management_metadata, push_log, routing_policy_values, sanitize_base_url,
-    save_and_verify_provider_secret, validate_probe_interval, validate_routing_policy, AppState,
-    ProviderConfig, ProviderSecretStore, RoutingPolicy,
+    save_and_verify_provider_secret, setting, validate_probe_interval, validate_routing_policy,
+    AppState, ProviderConfig, ProviderSecretStore, RoutingPolicy,
 };
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -770,8 +770,14 @@ pub(crate) async fn import_configuration_backup(
     };
     // 完整覆盖会恢复本地令牌和 Codex 流恢复次数；合并模式保持目标电脑的全局设置。
     // 先更新可补偿的 config.toml，导入失败时再恢复旧受管配置。
+    let managed_hash = setting(&state.store, "codex_managed_config_hash")?;
     let codex_changed = if old_codex != next_codex {
-        codex_integration::update_managed_gateway_configuration(&old_codex, &next_codex)?.is_some()
+        codex_integration::update_managed_gateway_configuration_with_hash(
+            &old_codex,
+            &next_codex,
+            managed_hash.as_deref(),
+        )?
+        .is_some()
     } else {
         false
     };
@@ -792,7 +798,11 @@ pub(crate) async fn import_configuration_backup(
         Err(error) => {
             if codex_changed {
                 if let Err(rollback_error) =
-                    codex_integration::update_managed_gateway_configuration(&next_codex, &old_codex)
+                    codex_integration::update_managed_gateway_configuration_with_hash(
+                        &next_codex,
+                        &old_codex,
+                        managed_hash.as_deref(),
+                    )
                 {
                     return Err(format!(
                         "备份导入失败：{error}；Codex 配置回滚也失败：{rollback_error}"
@@ -927,6 +937,7 @@ mod tests {
             gateway: Arc::new(crate::GatewayController::default()),
             codex_config_fingerprint: Arc::new(Mutex::new(None)),
             codex_history_preview: Arc::new(Mutex::new(None)),
+            codex_history_compatibility: Arc::new(Mutex::new(None)),
             codex_environment_status: Arc::new(Mutex::new(
                 codex_integration::CodexEnvironmentStatus {
                     desktop_status: codex_integration::CodexApplicationStatus::NotInstalled,

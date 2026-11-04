@@ -1679,7 +1679,7 @@ h3 {
 
 .codex-page { display: grid; gap: 16px; }
 .codex-status-panel { display: flex; align-items: center; gap: 18px; padding: 0 18px; }
-.codex-status-list { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); flex: 1; min-width: 0; }
+.codex-status-list { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); flex: 1; min-width: 0; }
 .codex-status-list > div { display: grid; gap: 4px; padding: 14px 16px; border-right: 1px solid #edf0f2; }
 .codex-status-list > div:last-child { border-right: 0; }
 .codex-status-list span { color: #89959d; font-size: 10px; }

@@ -145,8 +145,8 @@ AI Gateway 只读检查 `auth.json` 中是否存在可识别凭据，不会修�
 
 检查：
 
-- `model_provider` 是否为共享 `custom`。
-- `model_providers.custom.requires_openai_auth` 是否为 `true`。
+- `model_provider` 是否为 `openai` 或 `ai_gateway`。
+- 当前 Provider 的 `requires_openai_auth` 是否为 `true`。
 - 是否在模式切换后完全退出并重启 Codex。
 - 是否有 CC-Switch 或其他工具覆盖 `config.toml`。
 - 接入页是否能识别本地 ChatGPT 登录凭据。
@@ -155,17 +155,18 @@ AI Gateway 只读检查 `auth.json` 中是否存在可识别凭据，不会修�
 
 ## 会话历史不完整
 
-Codex 可能按 Provider 元数据筛选本地历史。“统一会话历史”可以将普通和归档会话的 Provider 统一为 `custom`。
+新版 Codex 原生支持跨 Provider 列出本地线程。AI Gateway 正常不会改写会话文件；如果检测到旧版 Codex 不支持该能力，Codex 接入页会显示“旧版会话兼容迁移”。
 
 - 执行前完全退出 Codex。
 - 先扫描并核对预览。
+- 迁移只在用户明确确认后执行，目标 Provider 为旧版兼容值 `custom`。
 - 迁移不会解除归档状态。
 - 迁移只保证会话可见，不保证包含 `encrypted_content` 的旧会话能跨供应商继续推理。
 - 出现异常时使用“恢复最近一次迁移”。
 
 ## cc-switch 与 AI Gateway 配置冲突
 
-两个程序同时管理 Codex `custom` Provider 时，最后写入者会覆盖另一个工具的连接参数。建议选择一种接管方式：
+两个程序同时管理 Codex Provider 时，最后写入者可能覆盖另一个工具的连接参数。AI Gateway 新配置使用 `ai_gateway`，外部 `custom` 会保留。建议选择一种接管方式：
 
 - 让 AI Gateway 直接管理 Codex，退出 CC-Switch 的路由接管。
 - 或只把 AI Gateway 当作 cc-switch 的一个本地 OpenAI 兼容 Provider，不再使用 AI Gateway 的 Codex 配置切换。
@@ -181,7 +182,7 @@ Codex 可能按 Provider 元数据筛选本地历史。“统一会话历史”�
 - 缓存命中没有明确值时保持未上报，不参与估算。
 - 重试和自动切换的每次实际上游尝试分别计量，因此请求次数可能高于 Codex 中看到的轮次数。
 
-官方用量来自 Codex Desktop 本地 `token_count`。`0.3.10` 首次启动会使用解析器 v3 自动重建一次保留期内的会话，点击刷新按钮可以执行后续增量同步。共享 `custom` Provider 下即使事件带有 `rate_limits`，也不会因此归为官方；第三方模式无法唯一匹配网关请求的事件不会计入统计。
+官方用量来自 Codex Desktop 本地 `token_count`。`0.3.10` 首次启动会使用解析器 v3 自动重建一次保留期内的会话，点击刷新按钮可以执行后续增量同步。`openai` 或官方模式时间线归为官方；旧 `custom` 仍按模式时间线判断；第三方模式无法唯一匹配网关请求的事件不会计入统计。
 
 如果官方行仍显示“未统计”，先查看页面同步摘要：
 
@@ -212,7 +213,7 @@ Codex 可能按 Provider 元数据筛选本地历史。“统一会话历史”�
 - 官方 Token 来自 Codex 本地记录，不等同于 OpenAI 账单、订阅额度或重置时间。
 - 已经产生业务输出后的流断开不会由网关自动重放。
 - 第三方中转之间不保证支持相同模型、工具、加密上下文或响应扩展。
-- 统一会话可见性不代表旧会话能在任意第三方继续推理。
+- 原生跨 Provider 可见性不代表旧会话能在任意第三方继续推理。
 - 本地请求体固定上限为 200 MiB，目前不能在页面修改。
 - `.aigateway` 密码无法找回，忘记密码只能重新导出。
 - 安装版和便携版共享数据与监听端口，不能同时运行。

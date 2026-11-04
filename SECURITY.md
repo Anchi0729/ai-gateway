@@ -15,9 +15,9 @@ AI Gateway 是本地网关，但第三方模式下请求会被发送到用户配
 
 ## Codex 登录保护
 
-AI Gateway 会只读解析 Codex 的 `auth.json`，仅判断是否存在可识别的本地登录凭据。应用不会解码、展示、记录、修改、删除、复制或备份其中的 Token 和账号信息，也不会联网验证凭据是否有效。官方登录仍由 Codex 自己维护；第三方模式只管理 `config.toml` 中的共享 `custom` Provider 配置，不把官方身份凭据转发给第三方中转。
+AI Gateway 会只读解析 Codex 的 `auth.json`，仅判断是否存在可识别的本地登录凭据。应用不会解码、展示、记录、修改、删除、复制或备份其中的 Token 和账号信息，也不会联网验证凭据是否有效。官方登录仍由 Codex 自己维护；第三方模式只管理 `config.toml` 中的 `ai_gateway` Provider 配置，不把官方身份凭据转发给第三方中转。外部工具创建的 `custom` Provider 会保留。
 
-如果使用 CC-Switch 或其他配置工具，请避免同时接管同一个 `custom` Provider，防止配置互相覆盖。
+如果使用 CC-Switch 或其他配置工具，请避免同时接管同一个 `ai_gateway` 或 `custom` Provider，防止配置互相覆盖。AI Gateway 不会因为发现外部 `custom` 就自动覆盖它。
 
 ## 数据处理
 

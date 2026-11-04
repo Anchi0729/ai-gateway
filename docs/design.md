@@ -104,16 +104,24 @@ Chat Completions 继续遵循自身的 `[DONE]` 结束语义。SSE 事件达到�
 
 ## Codex 接入设计
 
-AI Gateway 不把 OpenAI 官方线路放入第三方 Provider 池。官方模式和第三方模式都使用共享 `custom` Provider：
+AI Gateway 不把 OpenAI 官方线路放入第三方 Provider 池。官方模式和第三方模式使用独立的受管 Provider：
 
 ```toml
-model_provider = "custom"
+model_provider = "openai"
 
-[model_providers.custom]
+[model_providers.openai]
+name = "OpenAI"
+wire_api = "responses"
+requires_openai_auth = true
+
+[model_providers.ai_gateway]
+name = "AI Gateway"
+base_url = "http://127.0.0.1:<port>/v1"
+wire_api = "responses"
 requires_openai_auth = true
 ```
 
-官方模式删除网关自己的 `base_url`，Codex 直连官方。第三方模式写入本地 Base URL、本地令牌和关闭 Codex 自身普通请求重试的配置：
+官方模式将 `model_provider` 指向 `openai`，Codex 直连官方；第三方模式将其指向 `ai_gateway`，写入本地 Base URL、本地令牌和关闭 Codex 自身普通请求重试的配置：
 
 ```toml
 base_url = "http://127.0.0.1:<port>/v1"
@@ -121,13 +129,15 @@ request_max_retries = 0
 stream_max_retries = <配置中心保存值，默认 5>
 ```
 
-`request_max_retries`固定为 0，避免 Codex 与网关对普通请求形成双层重试。`codex_stream_max_retries`只负责已经产生业务输出后的 SSE 恢复，`0`表示关闭，不参与网关的次数和等待预算。旧版受管 Provider 只有在配置指纹仍匹配时才会自动从 2 升级；无法证明归属时保持只读并提示修复。
+`request_max_retries`固定为 0，避免 Codex 与网关对普通请求形成双层重试。`codex_stream_max_retries`只负责已经产生业务输出后的 SSE 恢复，`0`表示关闭，不参与网关的次数和等待预算。旧版受管 `custom` 只有在管理指纹匹配且用户主动切换或修复时才会迁移；启动阶段不会静默改写重试字段，无法证明归属时保持只读并提示修复。
 
-模式切换需要重启 Codex，但第三方中转池内部切换只改变网关的内存路由快照，不修改 `config.toml`，因此不需要重启 Codex。
+模式切换需要重启 Codex，但第三方中转池内部切换只改变网关的内存路由快照，不修改 `config.toml`，因此不需要重启 Codex。旧版或外部工具的 `custom` Provider 不会被新逻辑主动覆盖。
 
 转发第三方前会移除官方 `Authorization`、`Cookie`、`ChatGPT-Account-ID`、组织/项目头和 `X-OpenAI-*` 身份头，再写入选定中转的 API Key。状态检测只读解析 `auth.json` 是否包含可识别凭据，不解码或输出 Token，也不修改、删除或备份该文件。
 
 Codex 接入页分别检测桌面端和 CLI 的安装、运行状态。桌面端内部的 `codex.exe` 通过安装路径和父进程关系排除，避免误报为独立 CLI；登录状态只代表本地凭据存在，不代表 Token 已通过在线校验。
+
+会话列表优先使用 Codex App Server 的原生能力。AI Gateway 启动短生命周期的 `codex app-server`，完成 `initialize` 后只调用 `thread/list` 读取线程元数据，并显式传入完整 `sourceKinds`、空的 `modelProviders` 和超时；探测过程不会读取消息正文、改写会话文件或更新本地线程索引。只有探测失败且扫描到多个 Provider 的本地会话时，页面才显示旧版兼容迁移；迁移必须由用户确认，目标值为 `custom`，只修改会话元数据并创建可恢复备份。
 
 ## 用量采集
 
@@ -151,7 +161,7 @@ Codex 接入页分别检测桌面端和 CLI 的安装、运行状态。桌面端
 
 只解析 `session_meta`、`turn_context` 和 `event_msg.token_count`，不保存聊天正文，也不调用官方接口或对官方数据使用 tokenizer 估算。解析器使用文件名 UUID 和多个元数据字段识别会话，完整但损坏的单行只会被跳过，不会阻断后续事件。
 
-Codex 的 `input_tokens` 采用包含缓存命中的 OpenAI 语义，`cached_input_tokens` 是输入细项，因此 `total_tokens = input_tokens + output_tokens`。同步游标包含来源目录指纹；解析器 v3 使用独立事件账本和文件来源关联，先解析全部文件，再在单个 SQLite 事务中替换 Codex 记录、游标和事件关联，失败时回滚。共享 `custom` Provider 下的 `rate_limits`只作诊断，不能证明官方来源。Gateway 模式的 Codex 事件只有在唯一匹配最终网关尝试时才关联或补全；无法唯一匹配的事件保留诊断但不计量。稳定事件键不包含 session ID、文件路径和行号，因此 fork、子任务和归档复制不会重复导入。
+Codex 的 `input_tokens` 采用包含缓存命中的 OpenAI 语义，`cached_input_tokens` 是输入细项，因此 `total_tokens = input_tokens + output_tokens`。同步游标包含来源目录指纹；解析器 v3 使用独立事件账本和文件来源关联，先解析全部文件，再在单个 SQLite 事务中替换 Codex 记录、游标和事件关联，失败时回滚。`openai` 和官方模式时间线归为官方，`ai_gateway` 和第三方模式时间线归为 Gateway，旧 `custom` 仍按模式时间线判断。Gateway 模式的 Codex 事件只有在唯一匹配最终网关尝试时才关联或补全；无法唯一匹配的事件保留诊断但不计量。稳定事件键不包含 session ID、文件路径和行号，因此 fork、子任务和归档复制不会重复导入。
 
 缓存命中和推理 Token 是输入/输出的细项，不再次加到总 Token。数据库保留完整细项，主页面只展示总量、输入、输出和缓存命中。
 

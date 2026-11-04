@@ -612,6 +612,9 @@ struct AppState {
     codex_history_preview: Arc<Mutex<Option<codex_integration::HistoryPreviewSnapshot>>>,
     // 桌面端、CLI 和本地登录凭据只在启动或用户手动刷新时检测，避免轮询反复查询系统进程。
     codex_environment_status: Arc<Mutex<codex_integration::CodexEnvironmentStatus>>,
+    // 会话兼容能力探测会启动短生命周期 App Server，结果缓存后供 Codex 页面复用。
+    codex_history_compatibility:
+        Arc<Mutex<Option<codex_integration::CodexHistoryCompatibilityState>>>,
     // 自动同步、手动同步和重建必须串行，避免重建清游标时另一轮正在回填。
     codex_usage_sync_lock: Arc<tokio::sync::Mutex<()>>,
     codex_usage_status: Arc<Mutex<codex_usage::CodexUsageSyncStatus>>,
@@ -803,36 +806,18 @@ impl AppState {
         };
         let managed_hash = setting(&store, "codex_managed_config_hash")?;
         let codex_configuration = gateway_codex_configuration(&settings, &policy);
-        if let Some(updated_hash) = codex_integration::migrate_legacy_stream_retries(
-            &codex_configuration,
-            managed_hash.as_deref(),
-        )? {
-            let persist_result = persist_codex_retry_migration_metadata(&store, &updated_hash);
-            if let Err(error) = persist_result {
-                let mut legacy_configuration = codex_configuration.clone();
-                legacy_configuration.stream_max_retries = 2;
-                codex_integration::update_managed_gateway_configuration(
-                    &codex_configuration,
-                    &legacy_configuration,
-                )
-                .map_err(|rollback_error| {
-                    format!(
-                        "Codex 流恢复配置升级元数据保存失败：{error}；配置回滚也失败：{rollback_error}"
-                    )
-                })?;
-                warn!(%error, "Codex stream retry migration rolled back");
-            }
-        }
+        // 旧版 custom 不在启动时静默迁移；用户主动切换或修复时才会更新 Provider 身份。
         if setting(&store, "codex_mode_history_initialized")?.is_none() {
             // 升级后的第一条模式基线来自当前 config.toml；无法检测时保持为空，避免猜错旧历史来源。
             let configuration = gateway_codex_configuration(&settings, &policy);
-            let mode = codex_integration::integration_state(
+            let mode = codex_integration::integration_state_with_hash(
                 &configuration,
                 codex_integration::CodexEnvironmentStatus {
                     desktop_status: codex_integration::CodexApplicationStatus::NotInstalled,
                     cli_status: codex_integration::CodexApplicationStatus::NotInstalled,
                     login_status: codex_integration::CodexLoginStatus::Unknown,
                 },
+                managed_hash.as_deref(),
             )
             .current_mode;
             match mode {
@@ -864,6 +849,7 @@ impl AppState {
             )),
             codex_history_preview: Arc::new(Mutex::new(None)),
             codex_environment_status: Arc::new(Mutex::new(codex_integration::environment_status())),
+            codex_history_compatibility: Arc::new(Mutex::new(None)),
             codex_usage_sync_lock: Arc::new(tokio::sync::Mutex::new(())),
             codex_usage_status: Arc::new(Mutex::new(codex_usage_status)),
             app_handle: Some(app.clone()),
@@ -1008,30 +994,6 @@ fn save_setting(store: &Store, key: &str, value: &str) -> Result<(), String> {
         .map_err(|_| "数据库锁已损坏".to_string())?;
     conn.execute("INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key, value]).map_err(|e| e.to_string())?;
     Ok(())
-}
-
-fn persist_codex_retry_migration_metadata(store: &Store, hash: &str) -> Result<(), String> {
-    let mut connection = store
-        .connection
-        .lock()
-        .map_err(|_| "数据库锁已损坏".to_string())?;
-    let transaction = connection
-        .transaction()
-        .map_err(|error| error.to_string())?;
-    // 指纹和一次性提醒必须同时提交，否则下一次启动无法可靠判断自动升级是否完成。
-    for (key, value) in [
-        ("codex_managed_config_hash", hash),
-        ("codex_restart_notice_pending", "true"),
-    ] {
-        transaction
-            .execute(
-                "INSERT INTO settings(key,value) VALUES(?1,?2)
-                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                params![key, value],
-            )
-            .map_err(|error| error.to_string())?;
-    }
-    transaction.commit().map_err(|error| error.to_string())
 }
 
 fn take_codex_restart_notice(store: &Store) -> Result<bool, String> {
@@ -5686,6 +5648,14 @@ fn persist_codex_management_metadata(
             params![fingerprint],
         )
         .map_err(|error| error.to_string())?;
+    let provider_id = codex_integration::active_provider_id()?.unwrap_or_default();
+    transaction
+        .execute(
+            "INSERT INTO settings(key,value) VALUES('codex_managed_provider_id',?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![provider_id],
+        )
+        .map_err(|error| error.to_string())?;
     if let Some(value) = switched_at.as_ref() {
         transaction
             .execute(
@@ -5709,7 +5679,21 @@ fn get_codex_integration_state(
         &state.policy.read().unwrap(),
     );
     let environment = state.codex_environment_status.lock().unwrap().clone();
-    codex_integration::integration_state(&configuration, environment)
+    let managed_hash = setting(&state.store, "codex_managed_config_hash")
+        .ok()
+        .flatten();
+    let mut result = codex_integration::integration_state_with_hash(
+        &configuration,
+        environment,
+        managed_hash.as_deref(),
+    );
+    if let Some(history) = state.codex_history_compatibility.lock().unwrap().clone() {
+        result.history_native_supported = history.native_supported;
+        result.history_probe_error = history.probe_error;
+        result.history_migration_required = history.migration_required;
+        result.history_provider_counts = history.provider_counts;
+    }
+    result
 }
 
 #[tauri::command]
@@ -5722,7 +5706,32 @@ fn refresh_codex_login_status(
     );
     let environment = codex_integration::environment_status();
     *state.codex_environment_status.lock().unwrap() = environment.clone();
-    codex_integration::integration_state(&configuration, environment)
+    let managed_hash = setting(&state.store, "codex_managed_config_hash")
+        .ok()
+        .flatten();
+    let mut result = codex_integration::integration_state_with_hash(
+        &configuration,
+        environment,
+        managed_hash.as_deref(),
+    );
+    if let Some(history) = state.codex_history_compatibility.lock().unwrap().clone() {
+        result.history_native_supported = history.native_supported;
+        result.history_probe_error = history.probe_error;
+        result.history_migration_required = history.migration_required;
+        result.history_provider_counts = history.provider_counts;
+    }
+    result
+}
+
+#[tauri::command]
+async fn get_codex_history_compatibility(
+    state: TauriState<'_, AppState>,
+) -> Result<codex_integration::CodexHistoryCompatibilityState, String> {
+    let result = tokio::task::spawn_blocking(codex_integration::history_compatibility_state)
+        .await
+        .map_err(|error| format!("Codex 会话兼容性探测任务异常结束：{error}"))??;
+    *state.codex_history_compatibility.lock().unwrap() = Some(result.clone());
+    Ok(result)
 }
 
 #[tauri::command]
@@ -5758,7 +5767,7 @@ fn apply_codex_history_migration(
     push_log(
         &state,
         "info",
-        "Codex 本地会话 Provider 已统一为 custom",
+        "已完成旧版 Codex 会话兼容迁移（Provider=custom）",
         None,
     );
     Ok(result)
@@ -5783,7 +5792,9 @@ fn switch_codex_connection_mode(
         &state.settings.read().unwrap(),
         &state.policy.read().unwrap(),
     );
-    let mut result = codex_integration::switch_mode(mode, &configuration)?;
+    let managed_hash = setting(&state.store, "codex_managed_config_hash")?;
+    let mut result =
+        codex_integration::switch_mode_with_hash(mode, &configuration, managed_hash.as_deref())?;
     if result.changed {
         if let Err(error) = persist_codex_management_metadata(&state, true) {
             // config.toml 已完成可靠替换时不谎报切换失败；元数据可在后续修复时重建。
@@ -5830,7 +5841,11 @@ fn repair_codex_gateway_configuration(
         &state.settings.read().unwrap(),
         &state.policy.read().unwrap(),
     );
-    let mut result = codex_integration::repair_gateway_configuration(&configuration)?;
+    let managed_hash = setting(&state.store, "codex_managed_config_hash")?;
+    let mut result = codex_integration::repair_gateway_configuration_with_hash(
+        &configuration,
+        managed_hash.as_deref(),
+    )?;
     if result.changed {
         if let Err(error) = persist_codex_management_metadata(&state, true) {
             result.warning_messages.push(format!(
@@ -5946,9 +5961,13 @@ async fn apply_configuration(
 
     // 第三方接管时，端口、令牌和流恢复次数共同构成受管 Provider。
     // 所有外部状态先保留旧值，后续任一步失败都会补偿恢复。
+    let managed_hash = setting(&state.store, "codex_managed_config_hash")?;
     let codex_configuration_changed = if previous_codex != next_codex {
-        match codex_integration::update_managed_gateway_configuration(&previous_codex, &next_codex)
-        {
+        match codex_integration::update_managed_gateway_configuration_with_hash(
+            &previous_codex,
+            &next_codex,
+            managed_hash.as_deref(),
+        ) {
             Ok(result) => result.is_some(),
             Err(error) => {
                 if current_autostart != input.autostart_enabled {
@@ -5962,8 +5981,12 @@ async fn apply_configuration(
     };
     if let Err(error) = save_configuration_state(state, &input) {
         let codex_rollback_error = if codex_configuration_changed {
-            codex_integration::update_managed_gateway_configuration(&next_codex, &previous_codex)
-                .err()
+            codex_integration::update_managed_gateway_configuration_with_hash(
+                &next_codex,
+                &previous_codex,
+                managed_hash.as_deref(),
+            )
+            .err()
         } else {
             None
         };
@@ -6027,18 +6050,26 @@ fn save_routing_policy(
     let settings = state.settings.read().unwrap().clone();
     let previous_codex = gateway_codex_configuration(&settings, &previous_policy);
     let next_codex = gateway_codex_configuration(&settings, &policy);
+    let managed_hash = setting(&state.store, "codex_managed_config_hash")?;
     let codex_configuration_changed = if previous_codex != next_codex {
-        codex_integration::update_managed_gateway_configuration(&previous_codex, &next_codex)?
-            .is_some()
+        codex_integration::update_managed_gateway_configuration_with_hash(
+            &previous_codex,
+            &next_codex,
+            managed_hash.as_deref(),
+        )?
+        .is_some()
     } else {
         false
     };
     if let Err(error) = persist_routing_policy(&state.store, &policy) {
         if codex_configuration_changed {
-            if let Err(rollback_error) = codex_integration::update_managed_gateway_configuration(
-                &next_codex,
-                &previous_codex,
-            ) {
+            if let Err(rollback_error) =
+                codex_integration::update_managed_gateway_configuration_with_hash(
+                    &next_codex,
+                    &previous_codex,
+                    managed_hash.as_deref(),
+                )
+            {
                 return Err(format!(
                     "路由配置保存失败：{error}；Codex 配置回滚也失败：{rollback_error}"
                 ));
@@ -6828,6 +6859,7 @@ pub fn run() {
             get_configuration,
             save_configuration,
             get_codex_integration_state,
+            get_codex_history_compatibility,
             switch_codex_connection_mode,
             refresh_codex_login_status,
             repair_codex_gateway_configuration,
@@ -6966,6 +6998,7 @@ mod tests {
                     login_status: codex_integration::CodexLoginStatus::Unknown,
                 },
             )),
+            codex_history_compatibility: Arc::new(Mutex::new(None)),
             codex_usage_sync_lock: Arc::new(tokio::sync::Mutex::new(())),
             codex_usage_status: Arc::new(Mutex::new(Default::default())),
             app_handle: None,
