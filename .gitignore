@@ -37,6 +37,17 @@ release/
 # Codex credentials and local configuration must never enter the repository.
 auth.json
 config.toml
+
+# Private keys, certificate bundles, and local credential exports
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.secret
+*.credentials
+
 .DS_Store
 Thumbs.db
 Desktop.ini
